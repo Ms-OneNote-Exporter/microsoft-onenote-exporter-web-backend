@@ -109,7 +109,9 @@ open.
 - **SQLite driver — decided: `node:sqlite`.** A native addon
   (`better-sqlite3`) would mean a compilation step and a prebuilt-binary
   supply chain in the component that holds the session secret. The cost is an
-  experimental API, which is why `api/package.json` pins `engines.node >=22.5`.
+  experimental API, which is why `api/package.json` pins `engines.node >=22.13.0`
+  (the version where `node:sqlite` stopped being flag-gated, not the version
+  where it was added).
 - **CSRF token delivery — decided: response body, not a readable cookie.**
   PLAN-v3 §3.3 originally specified a readable cookie, which is a
   single-origin assumption. Under the split it is unreachable: a cookie set by

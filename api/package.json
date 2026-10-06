@@ -6,8 +6,8 @@
   "license": "MIT",
   "type": "commonjs",
   "engines": {
-    "node": ">=22.5",
-    "comment": "22.5 is the floor for node:sqlite, which is the api's database driver. A native addon (better-sqlite3) would mean a compilation step and a prebuilt-binary supply chain in the component that must not have either."
+    "node": ">=22.13.0",
+    "comment": "22.13.0 is the floor for node:sqlite, which is the api's database driver. The module was added in 22.5.0 but stayed behind --experimental-sqlite until 22.13.0, so an earlier floor produces a runtime that cannot load its own database driver. A native addon (better-sqlite3) would instead mean a compilation step and a prebuilt-binary supply chain in the component that must not have either. CI asserts this with `node -e \"require('node:sqlite')\"`, which is how the 22.5.0 floor was caught being wrong."
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

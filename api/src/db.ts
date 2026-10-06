@@ -7,13 +7,20 @@
  * container label, and nothing the orchestrator writes can change what these
  * tables say.
  *
- * Uses `node:sqlite`, which ships with Node 22.5+. That is a deliberate choice
- * over `better-sqlite3`: a native addon means a compilation step and a
+ * Uses `node:sqlite`, which is unflagged from Node 22.13.0. That is a deliberate
+ * choice over `better-sqlite3`: a native addon means a compilation step and a
  * prebuilt-binary supply chain, in the one component that must not have either.
  * The trade is that the API is experimental and its surface may change between
- * Node releases, which is why `engines` in package.json pins `>=22.5` and why
+ * Node releases, which is why `engines` in package.json pins `>=22.13.0` and why
  * every call here goes through the small wrapper below rather than using the
  * DatabaseSync API directly at call sites.
+ *
+ * The 22.13.0 floor is not 22.5.0, where the module was added: it sat behind
+ * --experimental-sqlite until 22.13.0. This file previously claimed 22.5, which
+ * would have produced a runtime that could not load its own database driver.
+ * Nothing in the test suite could have caught that, because every test runs on a
+ * developer's Node rather than on the declared floor — CI's
+ * `node -e "require('node:sqlite')"` smoke test did.
  */
 
 import { DatabaseSync } from "node:sqlite";

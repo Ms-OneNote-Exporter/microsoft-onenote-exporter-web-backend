@@ -115,8 +115,38 @@ If that trade ever flips — if the orchestrator outgrows a fixed verb set and
 needs real request routing — Node becomes the better choice, because at that
 point schema validation is no longer the primary control.
 
+## Implemented
+
+PLAN-v3 §12 step 4. Built first, standalone, driven by `curl`, because it is the
+component with the most authority and `api` cannot be tested end-to-end without it.
+
+`make check` → vet + 92 tests, green under `-race`. `make deps-zero` fails the
+build if `go.mod` ever grows a `require` block or a `vendor/` directory appears,
+and `Dockerfile` re-checks the module graph so the property survives a container
+build.
+
+Three design decisions worth a reviewer's attention, because two of them are
+security choices rather than conveniences:
+
+- **An idle runner holds no vault mount** — a tmpfs at `/data`, not
+  `vault/<guid>`. An idle pool one claim away from `auth.json` is the wrong shape,
+  so a claim *creates* a bound container rather than relabelling an idle one.
+- **Recycle and claim replace the container** rather than mutating it: Docker fixes
+  mounts at create time, and a released container must not carry browser state
+  into the next session.
+- **Reconcile replaces an over-age container** rather than adopting it. The plan
+  names only the expired-session rule; the age bound is enforced alongside it,
+  because adopting one would attach a fresh 5-minute budget to a browser process
+  tree that has been running for days.
+
+Boot reconciliation is tested against an in-memory fake daemon rather than a mock
+with expectations: the property under test is the *decision* made about a given set
+of containers, which a fake models and a mock cannot. It was also smoke-tested
+against a real unix socket with real signatures, which caught `/containers/json`
+being modelled as a bare array when the Engine wraps it — the class of defect a
+mocked test cannot see.
+
 ## Not implemented yet
 
-This directory is a placeholder. See `PLANNING/PLAN-v3.md` §12 step 4 — it is
-built first, standalone, driven by `curl`, because it is the component with the
-most authority and `api` cannot be tested end-to-end without it.
+The compose service and Caddy config that give it a socket and a network
+(§12 step 6, `infra/`).

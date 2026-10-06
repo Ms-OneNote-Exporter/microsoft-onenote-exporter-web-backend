@@ -15,9 +15,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -28,7 +30,7 @@ import (
 )
 
 func main() {
-	if err := run(); err != nil {
+	if err := run(os.Args[1:]); err != nil {
 		// The process exits non-zero on any fatal condition. A container
 		// restart policy on the orchestrator would then surface as a crash loop
 		// rather than a silently degraded pool.
@@ -37,7 +39,27 @@ func main() {
 	}
 }
 
-func run() error {
+func run(args []string) error {
+	// The container healthcheck mode.
+	//
+	// It exists because the compose healthcheck referenced `-healthcheck` and
+	// `run()` ignored arguments entirely — so the probe started a whole second
+	// orchestrator, bound the same port, and never exited. The healthcheck failed
+	// forever while the real orchestrator was perfectly healthy. A config file
+	// naming a flag the binary does not implement is the same class of bug as a CMD
+	// pointing at a file that was never written, and it is invisible until
+	// something runs it.
+	//
+	// Liveness only, and deliberately not a /healthz call: every route is signed,
+	// so a probe would need the HMAC secret to answer. A TCP dial needs nothing and
+	// answers the only question Docker is actually asking — is this process still
+	// serving?
+	for _, arg := range args {
+		if arg == "-healthcheck" {
+			return healthcheck()
+		}
+	}
+
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
@@ -152,6 +174,38 @@ func run() error {
 		log.Error("graceful shutdown incomplete", "error", err)
 	}
 	log.Info("stopped")
+	return nil
+}
+
+// healthcheck reports whether the listener accepts connections.
+//
+// Exits 0 when it does, 1 when it does not. Anything it prints goes to the
+// container log, so the message names the address it tried — a bare non-zero exit
+// from a healthcheck is otherwise very hard to diagnose.
+//
+// The listen address is read with the same default as config.Load but without
+// validating the rest of the config, because a liveness probe should not fail
+// because the secret file is unreadable. Whether the orchestrator is correctly
+// configured is a start-up question, answered by it refusing to start.
+func healthcheck() error {
+	listen := os.Getenv("ORCH_LISTEN")
+	if listen == "" {
+		listen = ":9100"
+	}
+	// ":9100" is a wildcard bind; a probe must dial a concrete address, and
+	// 127.0.0.1 is where a listener bound to all interfaces is always reachable.
+	addr := listen
+	if strings.HasPrefix(addr, ":") {
+		addr = "127.0.0.1" + addr
+	} else if host, port, err := net.SplitHostPort(addr); err == nil && host == "" {
+		addr = "127.0.0.1:" + port
+	}
+
+	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+	if err != nil {
+		return fmt.Errorf("orchestrator is not accepting connections on %s: %w", addr, err)
+	}
+	_ = conn.Close()
 	return nil
 }
 

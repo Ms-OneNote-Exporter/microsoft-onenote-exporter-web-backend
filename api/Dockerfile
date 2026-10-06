@@ -62,16 +62,16 @@ COPY --from=build /app/dist ./dist
 # one (`fastify`). Both are asserted here as well as in CI, because a single
 # check is one merge away from being removed by someone who did not know what the
 # property was for.
-RUN npm ls --omit=dev --all >/dev/null \
- && node -e "
-      const pkg = require('./package.json');
-      const deps = Object.keys(pkg.dependencies ?? {});
-      if (deps.length !== 1 || deps[0] !== 'fastify') {
-        console.error('expected exactly one runtime dependency (fastify), found:', deps);
-        process.exit(1);
-      }
-      console.log('runtime dependency set is exactly {fastify}');
-    "
+#
+# Written with `node -p` one-liners rather than a multi-line `node -e "…"` string.
+# A quoted string does not continue across lines in a Dockerfile RUN — the parser
+# treats each line as a new instruction — so the earlier version failed to build
+# with "unknown instruction: const". Same class of mistake as the CMD naming a
+# file that did not exist: something that reads correctly and does not work.
+RUN npm ls --omit=dev --all > /dev/null \
+ && test "$(node -p "Object.keys(require('./package.json').dependencies).length")" = "1" \
+ && test "$(node -p "Object.keys(require('./package.json').dependencies)[0]")" = "fastify" \
+ && echo "runtime dependency set is exactly {fastify}"
 
 USER node
 

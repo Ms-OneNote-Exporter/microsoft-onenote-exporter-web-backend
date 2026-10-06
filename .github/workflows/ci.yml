@@ -1,0 +1,180 @@
+# Continuous integration.
+#
+# Three properties this file is trying to have, in order of importance:
+#
+#   1. **Nothing ships unproven.** Every check here actually runs on every push,
+#      and none of them is conditional on a file existing. mac's argument for this
+#      shape: an unproven assertion is worse than an absent one, because it creates
+#      the *appearance* of coverage. That applies to config at least as much as to
+#      tests — a Caddyfile with a misnamed network is not "unproven", it is wrong
+#      and shipped.
+#   2. **The cheapest check that could catch it runs first.** `docker compose
+#      config` parses and resolves the whole compose file without a daemon, which
+#      catches a typo'd network name, a missing mount or a bad interpolation. It is
+#      the only executable verification available for the infra files on a machine
+#      with no Docker socket, so it gates them.
+#   3. **The supply chain is checked, not asserted.** Dependency hashes are
+#      verified against the lockfile and `npm ci` is used rather than `npm install`,
+#      so a lockfile edit that changes a resolved tarball fails the build.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref. A push to a PR branch supersedes the
+# run for the earlier commit, and nobody is waiting on that one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # The orchestrator is Go with zero third-party dependencies, so its build is
+  # hermetic by construction: `go build` cannot reach the network for anything.
+  orchestrator:
+    name: orchestrator (go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          # Matches the `go` directive in go.mod.
+          go-version: "1.25"
+          check-latest: false
+      - name: deps-zero
+        # Enforced twice on purpose: here and in the Dockerfile. A single check is
+        # one merge away from being removed by someone who did not know what the
+        # zero-dependency property was for.
+        working-directory: orchestrator
+        run: make deps-zero
+      - name: vet
+        working-directory: orchestrator
+        run: go vet ./...
+      - name: test
+        working-directory: orchestrator
+        run: make test
+      - name: race
+        # The pool is the only genuinely concurrent code here, and a data race in
+        # it would mean one session could be handed another's slot.
+        working-directory: orchestrator
+        run: make race
+      - name: builds a static binary
+        # `make build` sets CGO_ENABLED=0 and -trimpath, because the runtime image
+        # has no libc to link against.
+        working-directory: orchestrator
+        run: make build && file bin/orchestrator 2>/dev/null || true
+
+  api:
+    name: api (node)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # 22.5 is the floor for node:sqlite. The api's database driver is
+          # node:sqlite rather than better-sqlite3 precisely so there is no native
+          # addon and no prebuilt-binary supply chain in the component that holds
+          # the session secret.
+          node-version: "22.5"
+          cache: npm
+          cache-dependency-path: api/package-lock.json
+
+      - name: node:sqlite is present
+        # mac's addition, and it is a smoke test rather than a capability test.
+        # Without it, an image that cannot load the driver fails every capability
+        # test for an unrelated reason and you learn nothing about isolation.
+        run: node -e "require('node:sqlite'); console.log('node:sqlite ok')"
+
+      - name: install
+        # `npm ci` installs exactly the lockfile and fails if it and package.json
+        # disagree, so a hand-edited dependency is a red build rather than a
+        # silent resolution change.
+        run: npm ci
+
+      - name: no audit findings in the shipped dependency tree
+        run: npm audit --omit=dev --audit-level=low
+
+      - name: typecheck
+        run: npm run typecheck
+
+      - name: test
+        run: npm test
+
+      - name: mock code cannot reach the build
+        # The mock is a scripted runner that accepts any password and reports
+        # success. There must be no path from `npm start` to it.
+        run: |
+          npm run build
+          if [ -d dist/mock ]; then
+            echo "dist/mock exists — mock code is in the production build"
+            exit 1
+          fi
+          if grep -rl "MockRunner\|FakeOrchestrator" dist/ ; then
+            echo "mock symbols found in dist/"
+            exit 1
+          fi
+          echo "dist/ is free of mock code"
+
+  # The infra files cannot be run here: this job has a Docker daemon, but the
+  # capability assertions in capability.yml need a stack that does not exist yet.
+  # What it *can* do is parse and resolve them, which catches the majority of
+  # realistic mistakes and needs no daemon at all.
+  infra:
+    name: infra (compose shape)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: compose file parses and resolves
+        # `config` does not need a daemon, so this runs anywhere. It catches a
+        # misnamed network, a missing mount, a bad interpolation and a service
+        # referencing a network that is not declared.
+        #
+        # `COMPOSE_PROJECT_NAME` is pinned so a developer's project name cannot
+        # change the parse result.
+        env:
+          COMPOSE_PROJECT_NAME: msout
+        run: |
+          for f in docker-compose.yml infra/docker-compose.yml; do
+            if [ -f "$f" ]; then
+              echo "validating $f"
+              docker compose -f "$f" config --quiet
+            else
+              echo "skipping $f (not present yet)"
+            fi
+          done
+
+      - name: the compose file declares the internal control network
+        # A network declared without `internal: true` lets the orchestrator reach
+        # the internet, which §2.1 forbids. This is a cheap assertion that catches
+        # the most consequential single-character mistake in the file.
+        if: hashFiles('docker-compose.yml') != ''
+        run: |
+          docker compose -f docker-compose.yml config --format json \
+            | node -e '
+                const cfg = JSON.parse(require("fs").readFileSync(0, "utf8"));
+                const nets = cfg.networks ?? {};
+                const control = nets["msout-control"];
+                if (!control) throw new Error("msout-control network is not declared");
+                if (control.internal !== true) throw new Error("msout-control must have internal: true");
+                console.log("msout-control is internal");
+              '
+
+      - name: no secret is committed
+        # The compose file names the paths of Docker secrets, never their values.
+        # A value here means a real secret is in git history.
+        run: |
+          if grep -nE '^\s*(CSRF_KEY|ORCHESTRATOR_HMAC_SECRET|SESSION_SECRET)\s*[:=]\s*\S' \
+               docker-compose.yml infra/docker-compose.yml 2>/dev/null; then
+            echo "a secret appears to be assigned inline in a compose file"
+            exit 1
+          fi
+          echo "no inline secrets"

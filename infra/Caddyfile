@@ -30,11 +30,19 @@
 	# is the api.
 	email {$ACME_EMAIL}
 
-	# TLS 1.2 floor. TLS 1.0/1.1 are refused rather than merely not requested,
-	# because a client that can be talked down to TLS 1.0 is a downgrade waiting for
-	# an attacker, and `Strict-Transport-Security` cannot undo a connection that was
-	# never secure.
-	protocols tls1.2 tls1.3
+	# The TLS floor is Go's default: 1.2 minimum, so TLS 1.0 and 1.1 are refused
+	# rather than merely not requested. A client that can be talked down to TLS 1.0
+	# is a downgrade waiting for an attacker, and Strict-Transport-Security cannot
+	# undo a connection that was never secure.
+	#
+	# There is deliberately no `protocols` directive here. It reads like the way to
+	# pin a floor, but Caddy 2.10 rejects it as an unrecognised global option, so
+	# the container crash-looped on a line that documented a good intention. The
+	# floor is already the default; stating it in prose is what keeps the knowledge
+	# without breaking the config.
+	#
+	# If a future Caddy needs this pinned explicitly, it belongs in a per-site
+	# `tls` block, not in the global options.
 }
 
 # The api's own origin. This is where `/files/*` is served — see the note in

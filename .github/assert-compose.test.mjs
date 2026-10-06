@@ -148,6 +148,19 @@ const cases = [
     expectMessage: /not a \/run\/secrets path/,
   },
   {
+    // The bug this assertion exists for, found on the first deploy: the
+    // orchestrator was given the api's secret variable name, so the secret never
+    // arrived and it refused to start. Docker reported "unhealthy"; the reason was
+    // in a log nobody was reading.
+    name: "gives the orchestrator the api's secret variable name",
+    mutate: (c) => {
+      c.services.orchestrator.environment.ORCHESTRATOR_HMAC_SECRET_FILE =
+        "/run/secrets/orchestrator_hmac_secret";
+      delete c.services.orchestrator.environment.ORCH_HMAC_SECRET_FILE;
+    },
+    expectMessage: /orchestrator does not set ORCH_HMAC_SECRET_FILE/,
+  },
+  {
     name: "stops dropping all capabilities on the api",
     mutate: (c) => {
       delete c.services.api.cap_drop;

@@ -119,6 +119,44 @@ function asString(value: unknown): string | undefined {
 }
 
 /**
+ * artifactIdFromHeader extracts an artifact id from an original-request URI.
+ *
+ * This is untrusted input. The header arrives from a proxy, but a proxy is not the
+ * only thing that can set a header — and the point of the endpoint is to decide
+ * whether bytes leave the disk, so a permissive parse here is the whole risk.
+ *
+ * Therefore: the path must be exactly `/files/<id>` with nothing else, and the id
+ * must be exactly the 43 base64url characters `generateArtifactId` produces. No
+ * prefix matching, no "take the last segment", no `decodeURIComponent` — a
+ * traversal survives all three and none of them is needed here.
+ *
+ * Returns null for anything else, and the caller denies.
+ */
+export function artifactIdFromHeader(originalUri: string | undefined): string | null {
+  if (originalUri === undefined) return null;
+
+  // Caddy may be configured to send an absolute URI rather than a path. The path
+  // is what matters, and reading it off a parsed URL is safer than slicing.
+  let path = originalUri;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(originalUri)) {
+    try {
+      path = new URL(originalUri).pathname;
+    } catch {
+      return null;
+    }
+  }
+
+  // A query string is not part of the identity and a fragment never is.
+  const queryAt = path.indexOf("?");
+  if (queryAt !== -1) path = path.slice(0, queryAt);
+  const hashAt = path.indexOf("#");
+  if (hashAt !== -1) path = path.slice(0, hashAt);
+
+  const match = /^\/files\/([A-Za-z0-9_-]{43})$/.exec(path);
+  return match?.[1] ?? null;
+}
+
+/**
  * classifyExportFailure maps a thrown error onto one of the classifications
  * `sanitiseExportError` knows.
  *
@@ -729,6 +767,87 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
     // is bounded by concurrency rather than by how long exports take.
     release();
     return reply.code(202).send({ id: exportId, state: "running" });
+  });
+
+  // ---- GET /internal/authorize-download -----------------------------------
+
+  /**
+   * The forward_auth endpoint Caddy calls before serving any artifact.
+   *
+   * ## What it is for
+   *
+   * Caddy serves `/files/*` itself, with sendfile, so a multi-gigabyte download
+   * never passes through Node. But something has to decide *whether* — and the
+   * something is this, reached only by Caddy on the internal network.
+   *
+   * ## How it is reached, and why that is the security
+   *
+   * Caddy calls it with `copy_headers Cookie` and `uri /internal/authorize-download`,
+   * passing the original path in a header. The request is a GET, so the auth hook
+   * in server.ts has already required a valid session cookie, and §3.3's CSRF
+   * layer correctly does not apply — there is no browser and no token here, only
+   * a proxy relaying a cookie it already holds.
+   *
+   * That means this route needed **no exemption at all**. It is worth saying
+   * plainly, because the obvious way to build it would have been to add
+   * `/internal/*` to a bypass list — which is precisely the shape of bug found in
+   * review, an auth bypass in the component that holds the session secret. The
+   * route is instead an ordinary authenticated read.
+   *
+   * It is not reachable from outside because Caddy never routes `/internal/*` to
+   * the api. A client that reaches the api another way can forge the header, and
+   * gains nothing: it still needs a session cookie, and it can only ever authorize
+   * an artifact that session already owns.
+   */
+  app.get("/internal/authorize-download", async (request, reply) => {
+    const session = request.ctx.session;
+    // The auth hook guarantees this, but a null here would mean the hook and this
+    // route disagree about what protects it. Denying is the only safe reading of
+    // that, and the log says so loudly.
+    if (session === null) {
+      request.log.error("authorize-download reached with no session — hook mismatch");
+      return reply.code(403).send({ error: "forbidden" });
+    }
+
+    const artifactId = artifactIdFromHeader(
+      headerValue(request, "x-original-uri") ?? headerValue(request, "x-forwarded-uri"),
+    );
+
+    if (artifactId === null) {
+      // A request with no parseable artifact id is not a request for a known
+      // artifact, so it is refused. Never "allowed because we could not tell".
+      request.log.warn(
+        { session: session.guid },
+        "authorize-download with no parseable artifact id",
+      );
+      return reply.code(403).send({ error: "forbidden" });
+    }
+
+    const owner = deps.db.findByArtifact(artifactId);
+
+    /**
+     * The one branch, deliberately.
+     *
+     * "No such artifact" and "not yours" must be indistinguishable from outside,
+     * or this endpoint becomes an oracle: anyone with a stolen or guessed id could
+     * learn whether an export exists, which is a fact about another user's data.
+     * Both answer 403 with the same body.
+     *
+     * The comparison is on the session guid rather than a count, so an artifact
+     * id cannot authorize a different session's download even if the id leaked
+     * through a Referer, a shared link or browser history.
+     */
+    if (owner === undefined || owner.guid !== session.guid) {
+      request.log.info(
+        { session: session.guid },
+        owner === undefined ? "authorize-download: unknown artifact" : "authorize-download: wrong session",
+      );
+      return reply.code(403).send({ error: "forbidden" });
+    }
+
+    // 204 rather than 200: Caddy only checks for a 2xx, and an empty body keeps
+    // this endpoint from ever becoming a place a response body could leak.
+    return reply.code(204).send();
   });
 
   // ---- POST /api/export/:id/abort ----------------------------------------

@@ -92,6 +92,28 @@ jobs:
           docker compose config --quiet
           docker compose config --format json | node .github/assert-compose.mjs
 
+      - name: throwaway secrets
+        # Generated here, never taken from the repository and never a real value.
+        # The api refuses to start without them, so the suite has to have some, and
+        # a test that reads a real secret would be a secret in CI's logs.
+        #
+        # 43 base64url characters is 32 bytes unpadded, which is the shape both
+        # components validate — the point being that the *shape* is what is being
+        # tested, not any particular value.
+        run: |
+          set -euo pipefail
+          mkdir -p secrets
+          chmod 700 secrets
+          umask 077
+          for f in csrf_key orchestrator_hmac_secret; do
+            head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n' | cut -c1-43 > "secrets/$f"
+            chmod 0444 "secrets/$f"
+          done
+          # 0444 inside a 0700 directory, matching the deployment: compose bind-mounts
+          # secret files as-is and cannot set uid/gid outside swarm, so a 0400
+          # root-owned file would be unreadable by a container running as another uid.
+          echo "generated $(ls secrets | wc -l) throwaway secret files"
+
       - name: build
         run: docker compose build
 
@@ -293,4 +315,6 @@ jobs:
           docker compose logs --tail 60
       - name: down
         if: always()
-        run: docker compose down -v
+        run: |
+          docker compose down -v
+          rm -rf secrets

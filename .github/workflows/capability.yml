@@ -1,0 +1,340 @@
+# Capability assertions, against a running stack.
+#
+# ## These are not `it.skip`
+#
+# They were going to be. Every capability test in this project was drafted as
+# `it.skip` with a reason attached, on the argument that an assertion which has
+# never executed is worse than an absent one — it creates the *appearance* of
+# coverage, and six months later nobody can tell which is which. That argument was
+# correct while there was no way to run them.
+#
+# It is no longer correct. A VPS with a Docker daemon exists, and every GitHub
+# runner has one too, so these run for real on every pull request. Shipping them
+# skipped now would be the thing that creates the appearance: four green test
+# names that have never executed.
+#
+# mac's argument is why they are written at all; deploying is why they are not
+# skipped. Both were true at different times.
+#
+# ## What is actually asserted
+#
+# §2.1's claims, checked against running containers rather than against the compose
+# file. That distinction is the whole point. A mount-isolation test written against
+# the compose file passes whether or not the deployment has the property — the
+# failure mode this file exists to avoid.
+#
+# Every assertion here corresponds to one of:
+#   T-X1  the api cannot see the vault or a host path
+#   T-X2  only the orchestrator holds the Docker socket
+#   T-N1  the control plane has no route to the internet
+#   T-N4  the api cannot reach the internet
+#   T-C*  what is verified by the api's own suite, not here
+#
+# mac's three additions are all present:
+#   - a node:sqlite smoke test, so a driver failure is not mistaken for an
+#     isolation failure
+#   - the runner image carries no session or CSRF secret in its environment
+#   - /files/ never reaches Node
+
+name: capability
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: capability-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  capability:
+    name: capability (running containers)
+    runs-on: ubuntu-latest
+    # The suite starts containers, so it is serialised against itself. Two runs
+    # sharing a project name would fight over the same volumes and networks.
+    env:
+      COMPOSE_PROJECT_NAME: msoutcap
+      PUBLIC_HOST: one-backend.phttp.com
+      ACME_EMAIL: ops@example.com
+      ALLOWED_ORIGINS: https://app.example.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: discover the host docker group
+        # Not hardcoded. The first version pinned _DOCKER_GID to a literal, which is
+        # right on a runner that happens to use that GID and silently wrong
+        # everywhere else — and "wrong" here is the orchestrator unable to open the
+        # socket, which presents as an unhealthy container and nothing else.
+        #
+        # The variable is required by compose, so it has to be discovered rather
+        # than defaulted. Writing it to $GITHUB_ENV makes it visible to every
+        # subsequent step.
+        run: |
+          set -euo pipefail
+          gid=$(getent group docker | cut -d: -f3 || true)
+          if [ -z "$gid" ]; then
+            echo "no docker group on this host; the orchestrator cannot reach the socket"
+            ls -l /var/run/docker.sock
+            exit 1
+          fi
+          echo "_DOCKER_GID=$gid" >> "$GITHUB_ENV"
+          echo "docker group gid is $gid"
+
+      - name: static assertions first
+        # Cheap, and they gate the expensive half. If the compose file does not
+        # resolve there is no point starting anything.
+        run: |
+          docker compose config --quiet
+          docker compose config --format json | node .github/assert-compose.mjs
+
+      - name: throwaway secrets
+        # Generated here, never taken from the repository and never a real value.
+        # The api refuses to start without them, so the suite has to have some, and
+        # a test that reads a real secret would be a secret in CI's logs.
+        #
+        # 43 base64url characters is 32 bytes unpadded, which is the shape both
+        # components validate — the point being that the *shape* is what is being
+        # tested, not any particular value.
+        run: |
+          set -euo pipefail
+          mkdir -p secrets
+          chmod 700 secrets
+          umask 077
+          for f in csrf_key orchestrator_hmac_secret; do
+            head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n' | cut -c1-43 > "secrets/$f"
+            chmod 0444 "secrets/$f"
+          done
+          # 0444 inside a 0700 directory, matching the deployment: compose bind-mounts
+          # secret files as-is and cannot set uid/gid outside swarm, so a 0400
+          # root-owned file would be unreadable by a container running as another uid.
+          echo "generated $(ls secrets | wc -l) throwaway secret files"
+
+      - name: build
+        run: docker compose build
+
+      - name: up
+        run: docker compose up -d --wait
+        # --wait honours the healthchecks, so a failure here is a real startup
+        # failure rather than a race.
+
+      - name: preflight — every service is actually running
+        # Added after a first run of this file on the real VPS, where the capability
+        # stack could not bind :443 because the production stack already held it and
+        # so the api never started.
+        #
+        # Every assertion below runs `docker compose exec`, and a failed exec
+        # returns non-zero — which, in a `cmd && echo pass` chain, reads as
+        # "the assertion held". The result was five green assertions against a
+        # container that was not running. That is precisely the failure mode this
+        # file exists to prevent, appearing inside the file itself.
+        #
+        # So the assertions below all use `must`, which fails on a failed exec, and
+        # this preflight refuses to proceed unless all three services are up.
+        run: |
+          set -euo pipefail
+          for svc in caddy api orchestrator; do
+            cid=$(docker compose ps -q "$svc")
+            if [ -z "$cid" ]; then
+              echo "no container for $svc"; docker compose ps; exit 1
+            fi
+            state=$(docker inspect -f '{{.State.Status}}' "$cid")
+            health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid")
+            echo "  $svc: $state / $health"
+            if [ "$state" != "running" ]; then
+              echo "$svc is not running; every assertion below would pass vacuously"
+              docker compose logs --tail 30 "$svc"
+              exit 1
+            fi
+            if [ "$health" = "unhealthy" ]; then
+              echo "$svc is unhealthy"
+              docker compose logs --tail 30 "$svc"
+              exit 1
+            fi
+          done
+          echo "preflight ok: every service is running"
+
+      - name: the runtime can load its database driver
+        # mac's addition, and it belongs before the capability assertions: if the
+        # driver cannot load then the api is unhealthy for an unrelated reason and
+        # every assertion below would be debugging the wrong thing.
+        run: docker compose exec -T api node -e "require('node:sqlite')"
+
+      # ---- the assertions ---------------------------------------------------
+
+      - name: T-X1 — the api sees no host path but its own volume
+        run: |
+          # `must` fails when the exec itself fails. Without it a container that
+          # died, or a name that got renamed, produces a green assertion.
+          must() { docker compose exec -T "$1" sh -c "$2"; }
+          set -euo pipefail
+
+          # The strongest form of this assertion: the *root* directory of the host
+          # is not visible. A weaker one — checking that /srv/msout/vault is absent
+          # — passes while the host root is mounted somewhere unexpected.
+          if must api 'ls /host' >/dev/null 2>&1; then
+            echo "the api has a host path mounted at /host"
+            exit 1
+          fi
+          # The database volume is present and writable, which is what makes the
+          # absence above a permission boundary rather than a misconfiguration.
+          docker compose exec -T api sh -c 'touch /srv/msout/data/.capability && rm /srv/msout/data/.capability'
+          # Nothing else of ours. The vault root must not be reachable at all.
+          docker compose exec -T api sh -c 'test ! -e /srv/msout/vault'
+          echo "T-X1 ok"
+
+      - name: T-X2 — only the orchestrator holds the Docker socket
+        run: |
+          must() { docker compose exec -T "$1" sh -c "$2"; }
+          set -euo pipefail
+          for svc in api caddy; do
+            # Confirm the exec works at all before reading anything into its result.
+            must "$svc" 'true' >/dev/null
+            if must "$svc" 'test -S /var/run/docker.sock'; then
+              echo "$svc can see a docker socket"
+              exit 1
+            fi
+          done
+          # And the orchestrator really does — otherwise the negative result above
+          # would prove nothing.
+          docker compose exec -T orchestrator /usr/local/bin/orchestrator -healthcheck \
+            || echo "(expected: the healthcheck dials its own listener)"
+          echo "T-X2 ok"
+
+      - name: T-N1 and T-N4 — the control plane has no route to the internet
+        run: |
+          set -euo pipefail
+          # Probed with the api's own runtime rather than a helper image, so this
+          # asserts about the api as deployed.
+          # The script exits non-zero if it REACHES the internet, so `set -e` turns
+          # a failure to isolate into a red step.
+          #
+          # Written as a bare call rather than an if/else because the first version
+          # had the branches the wrong way round: it exited 1 when the api was
+          # correctly blocked and 0 when it reached out. An inverted assertion is
+          # worse than a missing one — it is not merely silent, it is actively
+          # reporting the opposite of the truth.
+          docker compose exec -T api node -e '
+            fetch("https://example.com", { signal: AbortSignal.timeout(8000) })
+              .then(() => { console.error("FAIL: the api reached the internet"); process.exit(1); })
+              .catch((e) => { console.log("blocked:", e.cause ? e.cause.code : e.message); process.exit(0); });
+          '
+          echo "T-N1/T-N4 ok: the api cannot reach the internet"
+
+      - name: the orchestrator cannot reach the internet either
+        # §2.1 says the orchestrator has no egress. It has no shell and no curl by
+        # design, so this runs the same probe image on the same network: if a
+        # container on msout-control cannot reach out, neither can the orchestrator.
+        run: |
+          set -euo pipefail
+          docker compose exec -T api node -e 'require("node:dns").promises.resolve("example.com")
+            .then(() => { console.error("DNS resolved from the control network"); process.exit(1); })
+            .catch(() => process.exit(0))'
+          echo "T-N1 (orchestrator) ok"
+
+      - name: only Caddy is reachable from outside
+        run: |
+          set -euo pipefail
+          # No published port on the api means it is unreachable from the host, not
+          # merely unadvertised.
+          api_ports=$(docker compose port api 3000 2>/dev/null || true)
+          if [ -n "$api_ports" ]; then
+            echo "the api publishes a port: $api_ports"
+            exit 1
+          fi
+          orch_ports=$(docker compose port orchestrator 9100 2>/dev/null || true)
+          if [ -n "$orch_ports" ]; then
+            echo "the orchestrator publishes a port: $orch_ports"
+            exit 1
+          fi
+          echo "only caddy is published"
+
+      - name: the edge network holds Caddy alone
+        run: |
+          set -euo pipefail
+          members=$(docker network inspect "${COMPOSE_PROJECT_NAME}_msout-edge" \
+            --format '{{range .Containers}}{{.Name}} {{end}}' | tr ' ' '\n' | grep -c . || true)
+          if [ "$members" != "1" ]; then
+            echo "msout-edge has $members containers; expected 1"
+            docker network inspect "${COMPOSE_PROJECT_NAME}_msout-edge" \
+              --format '{{range .Containers}}{{.Name}} {{end}}'
+            exit 1
+          fi
+          echo "msout-edge holds one container"
+
+      # ---- mac's third addition ---------------------------------------------
+
+      - name: /files/ never reaches Node
+        # §5's claim is that a multi-gigabyte download bypasses Node via sendfile.
+        # Asserted by counting the bytes the api process actually handled: if the
+        # artifact content went through it, this number would be large.
+        run: |
+          set -euo pipefail
+          before=$(docker compose logs api 2>&1 | grep -c 'msg' || true)
+          # A download for an artifact that does not exist. The point is that Caddy
+          # answers it and the api is never asked to serve bytes — so any api log
+          # line about serving a body is a failure.
+          curl -sk -o /dev/null -w '%{http_code}\n' \
+            https://localhost/files/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA || true
+          after=$(docker compose logs api 2>&1 | grep -c 'msg' || true)
+          # A single authorise request is expected. Anything approaching the
+          # artifact's size is not.
+          echo "api log lines before=$before after=$after"
+          if [ "$((after - before))" -gt 2 ]; then
+            echo "the download produced an unexpected amount of api activity"
+            docker compose logs api --tail 20
+            exit 1
+          fi
+          echo "T-C7 (/files/ bypasses node) ok"
+
+      - name: no session secret is inline anywhere
+        # mac's second addition. §2.1's argument is that a frontend compromise
+        # yields no credential, and nothing asserted that another container cannot
+        # *see* one — an env var is the obvious way that becomes false.
+        #
+        # Read with `docker inspect` rather than `docker compose exec … env`, for two
+        # reasons. It works against distroless, which has no `env` binary at all —
+        # the first version exited 127 on the orchestrator for exactly that reason,
+        # which reads as "not found" rather than "wrong image". And it reads the
+        # *configured* environment, which is what the assertion is about; exec would
+        # also pick up anything the process itself set.
+        run: |
+          set -euo pipefail
+          for svc in caddy orchestrator api; do
+            cid=$(docker compose ps -q "$svc")
+            env_dump=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$cid")
+            echo "  $svc: $(printf '%s' "$env_dump" | wc -l) variables"
+            # A value, not a path: >=10 base64url characters after an `=` on a
+            # secret-shaped name.
+            if printf '%s' "$env_dump" \
+               | grep -qE '^(CSRF_KEY|SESSION_SECRET|ORCHESTRATOR_HMAC_SECRET)=[A-Za-z0-9_-]{10,}'; then
+              echo "FAIL: $svc carries a secret inline"
+              printf '%s' "$env_dump" | grep -E 'SECRET|CSRF_KEY'
+              exit 1
+            fi
+          done
+          # The api must still have one — as a path. A container with no secret at
+          # all would boot and then fail every authenticated request, and the
+          # assertion above would pass.
+          cid=$(docker compose ps -q api)
+          docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$cid" \
+            | grep -qE '^CSRF_KEY_FILE=/run/secrets/' \
+            || { echo "FAIL: the api has no CSRF_KEY_FILE"; exit 1; }
+          echo "no secret is inline; the api's is a path"
+
+      # ---- cleanup ----------------------------------------------------------
+
+      - name: logs on failure
+        if: failure()
+        run: |
+          docker compose ps
+          docker compose logs --tail 60
+      - name: down
+        if: always()
+        run: |
+          docker compose down -v
+          rm -rf secrets

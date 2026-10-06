@@ -106,12 +106,17 @@
 			# for. Untrusted input to that endpoint, which parses it strictly.
 			header_up X-Original-Uri {uri}
 
-			# The api answers 204 with `X-Artifact-Partial: 1` when the artifact is a
-			# partial vault. Copying that onto the download response is what makes
-			# partialness server-enforced rather than something the UI has to
-			# remember: §5's rule is that a partial vault must not be mistakable for a
-			# complete one, and that must not depend on the frontend being correct.
-			copy_response_headers X-Artifact-Partial
+			# No `copy_response_headers` here, and that is not an omission.
+			#
+			# `forward_auth` already copies *every* response header from the auth
+			# server onto the response — unlike `reverse_proxy` it has no directive
+			# for it, because there is nothing to select. So the api's
+			# `X-Artifact-Partial: 1` reaches the download with no Caddy
+			# configuration at all, which is a smaller surface than asking for it.
+			#
+			# It was written here first, on the reasonable assumption that
+			# `reverse_proxy`'s directive applied. Caddy rejected the entire config
+			# with "unrecognized subdirective copy_response_headers".
 
 			# Deliberately NOT copied: Authorization, and every other header the
 			# browser sent. This subrequest should carry the session and nothing

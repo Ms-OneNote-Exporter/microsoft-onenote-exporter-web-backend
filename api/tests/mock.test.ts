@@ -134,6 +134,9 @@ afterEach(() => {
 
 // ---- it really is the real api -------------------------------------------
 
+/** A Microsoft account: an email or a username, never a secret, never logged. */
+const ACCOUNT = "someone@example.com";
+
 describe("the mock uses the real api", () => {
   it("serves the real version handshake", async () => {
     const { app } = await newApp();
@@ -165,6 +168,7 @@ describe("the mock uses the real api", () => {
         url: "/api/session/credential",
         headers: {
           "content-type": "text/plain",
+          "x-microsoft-account": ACCOUNT,
           cookie: cookie(),
           origin: "https://evil.test",
           "x-csrf-token": csrf(),
@@ -188,6 +192,7 @@ describe("the mock uses the real api", () => {
         url: "/api/session/credential",
         headers: {
           "content-type": "text/plain",
+          "x-microsoft-account": ACCOUNT,
           cookie: cookie(),
           origin: ORIGIN,
           "x-csrf-token": csrf(),
@@ -232,6 +237,7 @@ describe("routes that were 501", () => {
         url: "/api/session/credential",
         headers: {
           "content-type": "text/plain",
+          "x-microsoft-account": ACCOUNT,
           cookie: cookie(),
           origin: ORIGIN,
           "x-csrf-token": csrf(),
@@ -259,6 +265,7 @@ describe("routes that were 501", () => {
         url: "/api/session/credential",
         headers: {
           "content-type": "text/plain",
+          "x-microsoft-account": ACCOUNT,
           cookie: cookie(),
           origin: ORIGIN,
           "x-csrf-token": csrf(),
@@ -284,6 +291,7 @@ describe("routes that were 501", () => {
         url: "/api/session/credential",
         headers: {
           "content-type": "text/plain",
+          "x-microsoft-account": ACCOUNT,
           cookie: cookie(),
           origin: ORIGIN,
           "x-csrf-token": csrf(),
@@ -427,6 +435,9 @@ describe("routes that were 501", () => {
           url,
           headers: {
             "content-type": "application/json",
+            ...(url === "/api/session/credential"
+              ? { "x-microsoft-account": ACCOUNT }
+              : {}),
             cookie: cookie(),
             origin: ORIGIN,
             "x-csrf-token": csrf(),
@@ -456,6 +467,7 @@ describe("binding a runner on login", () => {
         url: "/api/session/credential",
         headers: {
           "content-type": "text/plain",
+          "x-microsoft-account": ACCOUNT,
           cookie: cookie(),
           origin: ORIGIN,
           "x-csrf-token": csrf(),
@@ -488,6 +500,7 @@ describe("binding a runner on login", () => {
         url: "/api/session/credential",
         headers: {
           "content-type": "text/plain",
+          "x-microsoft-account": ACCOUNT,
           cookie: cookie(),
           origin: ORIGIN,
           "x-csrf-token": csrf(),
@@ -515,6 +528,7 @@ describe("binding a runner on login", () => {
         url: "/api/session/credential",
         headers: {
           "content-type": "text/plain",
+          "x-microsoft-account": ACCOUNT,
           cookie: cookie(),
           origin: ORIGIN,
           "x-csrf-token": csrf(),
@@ -542,6 +556,7 @@ describe("binding a runner on login", () => {
         url: "/api/session/credential",
         headers: {
           "content-type": "text/plain",
+          "x-microsoft-account": ACCOUNT,
           cookie: cookie(),
           origin: ORIGIN,
           "x-csrf-token": csrf(),
@@ -573,6 +588,7 @@ describe("the mock does not handle the credential", () => {
       url: "/api/session/credential",
       headers: {
         "content-type": "text/plain",
+        "x-microsoft-account": ACCOUNT,
         cookie: cookie(),
         origin: ORIGIN,
         "x-csrf-token": csrf(),
@@ -602,6 +618,7 @@ describe("the mock does not handle the credential", () => {
       url: "/api/session/credential",
       headers: {
         "content-type": "text/plain",
+        "x-microsoft-account": ACCOUNT,
         cookie: cookie(),
         origin: ORIGIN,
         "x-csrf-token": csrf(),
@@ -622,6 +639,7 @@ describe("the mock does not handle the credential", () => {
         url: "/api/session/credential",
         headers: {
           "content-type": "text/plain",
+          "x-microsoft-account": ACCOUNT,
           cookie: cookie(),
           origin: ORIGIN,
           "x-csrf-token": csrf(),

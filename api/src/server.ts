@@ -116,7 +116,23 @@ const MINT_PATHS = new Set(["/api/session"]);
  * `Access-Control-Request-Headers` would let a caller enumerate what this
  * service accepts.
  */
-const requiredPreflightHeaders = ["x-csrf-token", "content-type"] as const;
+const requiredPreflightHeaders = [
+  "x-csrf-token",
+  "content-type",
+  /**
+   * The Microsoft account, which mac sends alongside an opaque password body.
+   *
+   * This entry is load-bearing in a way the other two are not, and getting it wrong
+   * produces the most confusing failure in the whole route. **A request header the
+   * preflight does not allowlist means the preflight fails, so the browser never
+   * transmits the request at all** — not a 4xx from the route, nothing from the
+   * route, just a failed preflight with an opaque cause in the browser console.
+   *
+   * mac's observation, and the reason the list is asserted in a test rather than
+   * only read here.
+   */
+  "x-microsoft-account",
+] as const;
 
 /**
  * What a route finds on the request after the hooks have run.

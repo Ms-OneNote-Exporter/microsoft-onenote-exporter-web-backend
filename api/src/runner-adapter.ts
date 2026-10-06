@@ -33,6 +33,20 @@ export type Challenge =
 export interface SubmitCredentialInput {
   readonly sessionId: string;
   /**
+   * The Microsoft account the password belongs to.
+   *
+   * An email address or a username — Microsoft accepts either, and telling a user
+   * to "enter your email" when their account is a username is a dead end.
+   *
+   * **It is a header, not part of the body**, which is the whole point: the
+   * credential stream stays byte-identical from the browser to the runner. Putting
+   * both in one body would need a delimiter, and a delimiter is another place for
+   * the truncation bug this pair has shipped twice from opposite ends.
+   *
+   * Not a secret, but still an identifier: never log it.
+   */
+  readonly account: string;
+  /**
    * The raw credential stream.
    *
    * Already framed and capped by the route — `checkFraming` against a ~4 KB limit

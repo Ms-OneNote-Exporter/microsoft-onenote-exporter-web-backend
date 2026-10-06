@@ -161,6 +161,16 @@ const cases = [
     expectMessage: /orchestrator does not set ORCH_HMAC_SECRET_FILE/,
   },
   {
+    // Also found on the first deploy: POOL_SIZE was passed unprefixed, so the
+    // orchestrator ignored it and came up at its built-in pool size. Silently, and
+    // while looking correctly configured.
+    name: "gives the orchestrator an unprefixed variable",
+    mutate: (c) => {
+      c.services.orchestrator.environment.POOL_SIZE = "2";
+    },
+    expectMessage: /POOL_SIZE, which its config never reads/,
+  },
+  {
     name: "stops dropping all capabilities on the api",
     mutate: (c) => {
       delete c.services.api.cap_drop;

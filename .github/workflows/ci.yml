@@ -214,11 +214,18 @@ jobs:
         # `${VAR:?...}`. That syntax is the point: an unset host name is a startup
         # failure, not a silently-defaulted one, and CI must supply values to prove
         # the file resolves at all.
+        #
+        # _DOCKER_GID is the host's docker group. The orchestrator runs as distroless
+        # `nonroot` and needs that group to reach the socket, which it would
+        # otherwise fail on with "permission denied" — a real deploy failure found
+        # by deploying. The value here is arbitrary; what matters is that the file
+        # refuses to start without one.
         env:
           COMPOSE_PROJECT_NAME: msout
           PUBLIC_HOST: one-backend.phttp.com
           ACME_EMAIL: ops@example.com
           ALLOWED_ORIGINS: https://app.example.com
+          _DOCKER_GID: "998"
         run: docker compose -f docker-compose.yml config --quiet
 
       - name: the required host name is genuinely required
@@ -229,6 +236,7 @@ jobs:
           COMPOSE_PROJECT_NAME: msout
           ACME_EMAIL: ops@example.com
           ALLOWED_ORIGINS: https://app.example.com
+          _DOCKER_GID: "998"
           PUBLIC_HOST: ""
         run: |
           if docker compose -f docker-compose.yml config --quiet 2>/dev/null; then
@@ -247,18 +255,33 @@ jobs:
           PUBLIC_HOST: one-backend.phttp.com
           ACME_EMAIL: ops@example.com
           ALLOWED_ORIGINS: https://app.example.com
+          _DOCKER_GID: "998"
         run: |
           docker compose -f docker-compose.yml config --format json \
             | node .github/assert-compose.mjs
 
       - name: the assertions can actually fail
         # A check that cannot fail is not a check. This feeds deliberately broken
-        # configs to the assertion script and requires each one to be caught.
+        # configs to the assertion script and requires each to be caught.
         #
         # It exists because the first version of the socket check stringified the
-        # volume list and matched the mount *target* \u2014 so repointing the source at
+        # volume list and matched the mount *target* — so repointing the source at
         # an unrelated path still passed. A static check that silently checks the
-        # wrong half of a thing is worse than no check, because it reads as coverage.
+        # wrong half of a thing is worse than none, because it reads as coverage.
+        #
+        # Two more cases were added after the first deploy, which found a secret
+        # variable and two configuration variables in the wrong namespace.
+        #
+        # The env is required because the script runs `docker compose config` itself
+        # to get a baseline to mutate. Compose marks these required with
+        # `${VAR:?}`, which is correct — a missing one should be a refusal, not a
+        # default — so the script has to supply them.
+        env:
+          COMPOSE_PROJECT_NAME: msout
+          PUBLIC_HOST: one-backend.phttp.com
+          ACME_EMAIL: ops@example.com
+          ALLOWED_ORIGINS: https://app.example.com
+          _DOCKER_GID: "998"
         run: node .github/assert-compose.test.mjs
 
       - name: no secret is committed

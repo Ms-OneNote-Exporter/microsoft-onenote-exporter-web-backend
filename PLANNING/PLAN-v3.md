@@ -1061,3 +1061,91 @@ Microsoft Q&A page preserved in
 `microsoft-onenote-export-notebook/docs/graphapi-sharepoint-notebook-limit-evidence.pdf`
 is **Microsoft's content, not this project's**, and is quoted as evidence outside
 the MIT licence. Nothing in that file is vendored into this repository.
+
+## 15. Next steps and msout package expectations
+
+### 15.1  What the conversation with `mac` revealed
+
+During bidirectional review of the `@msout/*` contract, three errors in my own
+notes were identified and corrected, all by checking the published tarballs rather
+than assuming from the repository layout:
+
+1. **`sections` has no counter in the exporter** (PLAN-v3 §6.1). I had written
+   that `newStats` and `reportSummary` "already keep the numbers", so emitting
+   `progress: { pages, sections, assets }` would be "wiring, not instrumentation".
+   Review of the published `@msout/microsoft-onenote-export-notebook@0.4.0`
+   showed `newStats` returns `totalPages: 0, totalAssets: 0, failedPages: 0,
+   failedSections: 0, failedGroups: 0` — **there is no `totalSections` anywhere**.
+   `failedSections` is a failure tally, not a progress figure. The `sections`
+   field must be counted where the section list is enumerated. (One increment:
+   minutes of work; the contract on my side does not move.)
+
+2. **The logger writes to stdout *and* the file** (utils/logger.js:170-201). I had
+   recorded "its `logger.info` calls go to a file (`app.log`), not stdout." **False.**
+   Every level (`info`/`warn`/`error`/`success`/`debug`/`step`) calls
+   `process.stdout.write`. The file `app.log` is also written, in the same
+   `_formatMessage` path. That claim was load-bearing: I used it to mark typed
+   login-failure classification *blocked* and to dismiss a file-tail adapter as
+   speculative. Neither survives — the problem is **stringly**, not impossible.
+
+3. **Number-match IS bridgeable** (auth.js:1572-1612, published 0.1.9). The
+   published package extracts the number from `.displaySign`, prints it via
+   `logger.step`, and waits up to 120s in a `Promise.race` of three Playwright
+   waits. My earlier claim that it "cannot show a number and wait" was drawn from
+   reading `dismissFidoPage()` and generalising across the feature without verifying
+   the post-password path. The three-way screen separation is real:
+   - `auth.js:1069-1077` — pre-password `approver_prompt` / `no_password_route`, returns `{reached: false}`
+   - `auth.js:1507` — `// 2. Enter Password`
+   - `auth.js:1572+` — post-password number-match, extracted, printed, waited on
+
+   The frontend disclaimer (PR #15) that declares number-match unsupported is
+   **wrong** on my authority. It should be removed or reworded.
+
+4. **The truthy-object bug, confirmed** (index.js:102-103). `const ok =
+   await login({...}); if (!ok)` — `{ ok: false }` is truthy, `!ok` is `false`,
+   and a **failed login silently reports success with exit code 0**. I endorse
+   mac's refusal of a major-version return-type change: the boolean must stay and
+   the structured result must arrive on a `login-result` event, not as the return
+   value. Zero callers migrate, and there is no upgrade path that turns a working
+   sign-in into a silent false success.
+
+5. **Both packages are on npm, published via OIDC** (not npm tokens). All four
+   repos (`microsoft-webauth`, `microsoft-onenote-export-notebook`,
+   `microsoft-onenote-list-notebooks`, `microsoft-onenote-exporter`) carry
+   `npm-publish.yml` using `id-token: write` → `npm publish --access public --provenance`.
+   The trigger is `push: tags: ['v*']` with a gate that the tag must equal
+   `package.json` version. No auto-tag step exists — the order is: land on `main`,
+   bump `package.json`, *then* push the tag. Last successful runs: `webauth`
+   v0.1.9 (2026-10-03), `export-notebook` v0.4.0 (2026-10-04).
+
+6. **`LOGIN_REASONS` must be a frozen union, exported from the package** so my
+   mapping table can assert mechanically that every reason has a mapping, rather
+   than a new cause silently becoming my generic message. His reasons
+   (`approver_prompt`, `code_prompt`, `no_password_route`, `password_field`,
+   `unreadable`, and the new `timed_out`) are authoritative; I map them to six
+   fixed display strings with an unmapped→generic fallback.
+
+### 15.2  What I expect to find when I examine the msout packages
+
+| Package | What I verified in the published tarball | What I expect the runner to consume |
+|---|---|---|
+| `@msout/microsoft-webauth@0.1.9` | - `login({email,password})` returns `boolean`<br>- Every `logger.*` level writes to `process.stdout`<br>- `auth.js:1572+`: number-match handled via `.displaySign` wait, number printed, 120s race<br>- `login()` truthy-object pitfall at `index.js:102-103`<br>- No npm secret needed; OIDC publish from `git push origin v<version>` | - `challenge` event (code prompt or number-match)<br>- `login-result { ok, reason }` terminal fact<br>- Stdout lines containing `Enter the number:` for number-match bridge<br>- `reason` mapped through `LOGIN_REASONS` → six display strings<br>- Export `LOGIN_REASONS` frozen constant for mechanical assertion |
+| `@msout/microsoft-onenote-export-notebook@0.4.0` | - `newStats()`: `totalPages`, `totalAssets`, `failedPages`, `failedSections`, `failedGroups`<br>- **No `totalSections`** — must be counted where sections are enumerated<br>- `reportSummary` exports the same shape<br>- Logger writes to both stdout and `app.log`<br>- `runExport(options)` takes an options object, no `onEvent` / no `AbortSignal` in 0.4.0<br>- Progress reports `{pages, sections, assets}` — `sections` requires a counter<br>- Export does not implement abort; partial marker is separate | - `progress: { pages, sections, assets }` from `newStats` + enumerated section count<br>- `export-aborted` / `export-partial` events (if `onEvent` added)<br>- `export.error` closed set via `sanitiseExportError`<br>- `runExport` with `signal` for abort (per PLAN-v2 §8.2)<br>- `EVENT_TYPES` on the api side (18 types + snapshot) |
+| `@msout/microsoft-onenote-list-notebooks@0.0.7` | - Consumed from npm, not forked (§14)<br>- Published via same OIDC workflow<br>- Versioned v0.0.7 on registry | - List notebooks endpoint; no credential path involvement |
+| `@msout/microsoft-webauth` (umbrella) | - `package.json` references `git+https://github.com/Ms-OneNote-Exporter/microsoft-webauth.git`<br>- Publish gate: tag must equal `package.json` version<br>- Last publish: v0.1.9 (2026-10-03) via `git push origin v0.1.9` | - Same as `@msout/microsoft-webauth@0.1.9` above — the scoped package is the same code, only the import path differs |
+
+### 15.3  Next-step sequence
+
+1. **mac publishes updated `@msout/microsoft-webauth` and `@msout/microsoft-onenote-export-notebook`** whenever ready (trigger: `git push origin v<version>` after bumping `package.json`).<br>I re-pin the exact version and deploy.<br>**I am not blocked** — I am testing the credential path today against published 0.1.9 with a stdin bridge; his changes make it *clean*, not *possible*.
+
+2. **I add `onEvent` to `runExport`** (optional, omitted‑safe) and `LOGIN_REASONS` frozen union to the webauth package, per the mappings above. These are the only package changes that unblock the credential path.
+
+3. **I remove or reword the PR #15 disclaimer** that declares number-match unsupported — that claim is mine and it is false.
+
+4. **I add a test** that spawns the real `webauth` package and asserts both (a) the wait for `.displaySign` hidden and (b) the stdout line `Enter the number:` appears. This is the load-bearing property my runner consumes.
+
+5. **Sections counter** — I add one increment where the section list is enumerated in the exporter. This is minutes of work and does not wait on any other item.
+
+6. **Number-match** — Declined as a user-facing disclaimer; kept as a technical finding (`timed_out` reason on the non-approval path).
+
+And to be explicit: **I am not waiting on mac for the credential path.** I am building and testing it now against published 0.1.9. His package changes make the path clean, not possible.

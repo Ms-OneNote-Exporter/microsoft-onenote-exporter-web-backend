@@ -214,11 +214,18 @@ jobs:
         # `${VAR:?...}`. That syntax is the point: an unset host name is a startup
         # failure, not a silently-defaulted one, and CI must supply values to prove
         # the file resolves at all.
+        #
+        # _DOCKER_GID is the host's docker group. The orchestrator runs as distroless
+        # `nonroot` and needs that group to reach the socket, which it would
+        # otherwise fail on with "permission denied" — a real deploy failure found
+        # by deploying. The value here is arbitrary; what matters is that the file
+        # refuses to start without one.
         env:
           COMPOSE_PROJECT_NAME: msout
           PUBLIC_HOST: one-backend.phttp.com
           ACME_EMAIL: ops@example.com
           ALLOWED_ORIGINS: https://app.example.com
+          _DOCKER_GID: "998"
         run: docker compose -f docker-compose.yml config --quiet
 
       - name: the required host name is genuinely required
@@ -229,6 +236,7 @@ jobs:
           COMPOSE_PROJECT_NAME: msout
           ACME_EMAIL: ops@example.com
           ALLOWED_ORIGINS: https://app.example.com
+          _DOCKER_GID: "998"
           PUBLIC_HOST: ""
         run: |
           if docker compose -f docker-compose.yml config --quiet 2>/dev/null; then
@@ -247,6 +255,7 @@ jobs:
           PUBLIC_HOST: one-backend.phttp.com
           ACME_EMAIL: ops@example.com
           ALLOWED_ORIGINS: https://app.example.com
+          _DOCKER_GID: "998"
         run: |
           docker compose -f docker-compose.yml config --format json \
             | node .github/assert-compose.mjs

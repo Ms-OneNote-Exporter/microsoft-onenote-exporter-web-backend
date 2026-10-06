@@ -194,12 +194,42 @@ services:
       # reasonable design; it just has to be spelled correctly, and nothing in
       # either test suite could have caught it because both mock the other side.
       ORCH_HMAC_SECRET_FILE: /run/secrets/orchestrator_hmac_secret
+      # Every variable the orchestrator reads is `ORCH_`-prefixed. Three of the
+      # four below were previously written without that prefix — POOL_SIZE and
+      # RUNNER_TTL_SECONDS were silently ignored and the process fell back to its
+      # built-in defaults, so the pool came up at 4 instead of the configured 2 and
+      # nothing said so.
+      #
+      # RUNNER_TTL_SECONDS does not exist at all: the orchestrator's recycle budget
+      # is a compile-time constant (5 minutes, PLAN-v2 §2.1), so it is dropped
+      # rather than renamed. A variable that configures nothing is worse than no
+      # variable, because an operator changes it and believes it took effect.
+      #
+      # assert-compose.mjs checks the whole set, so a name that drifts out of the
+      # namespace fails a test rather than a deployment.
+      ORCH_POOL_SIZE: ${POOL_SIZE:-2}
+
       # No PUBLIC_HOST, no ALLOWED_ORIGINS, no CSRF key. The orchestrator is not a
       # component that should know any of them, and its absence here is a property
       # rather than an omission — CI asserts the runner image sees no session
       # secret, and this is the same idea one step earlier.
-      POOL_SIZE: ${POOL_SIZE:-2}
-      RUNNER_TTL_SECONDS: ${RUNNER_TTL_SECONDS:-300}
+
+    # The docker socket is root:docker mode 0660 on the host, and this image runs
+    # as uid 65532 (distroless `nonroot`). Without this the orchestrator dies with
+    # "permission denied" on the socket — which it did, on the first deploy.
+    #
+    # `group_add` rather than running as root, because root would work and would
+    # throw away the entire argument for a separate component: the reason the
+    # orchestrator is the only process with the socket is that it is the only
+    # process whose compromise means container creation, and running it as root
+    # would add "and root" to that sentence.
+    #
+    # The host's docker group must have this GID. `_DOCKER_GID` is set in .env from
+    # `getent group docker | cut -d: -f3`; startup asserts it is set, because a
+    # missing GID here means the orchestrator cannot reach its one dependency and
+    # the failure appears as an opaque permission error.
+    group_add:
+      - "${_DOCKER_GID:?set _DOCKER_GID to the host docker group gid; see infra/README.md}"
     secrets:
       - orchestrator_hmac_secret
     volumes:

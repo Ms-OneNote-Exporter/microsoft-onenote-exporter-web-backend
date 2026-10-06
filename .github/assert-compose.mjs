@@ -222,7 +222,41 @@ for (const [svc, expected] of Object.entries(SECRET_VAR_BY_SERVICE)) {
   );
 }
 
-// 8. The api is not root and holds no extra capabilities.
+// 8. Every variable given to the orchestrator is one it actually reads.
+//
+// Found on the first deploy: compose passed POOL_SIZE and RUNNER_TTL_SECONDS, and
+// the orchestrator reads ORCH_POOL_SIZE and has no runner-TTL variable at all. Both
+// were silently ignored, so the pool came up at its built-in default of 4 rather
+// than the configured 2, and nothing anywhere said so.
+//
+// A variable in the wrong namespace is the worst kind of config error, because the
+// container starts, looks configured, and ignores you. The list below is read out of
+// the orchestrator's own config.go; add to it there and here together.
+const ORCH_VARS_ACTUALLY_READ = new Set([
+  "ORCH_LISTEN",
+  "ORCH_DOCKER_SOCKET",
+  "ORCH_HMAC_SECRET_FILE",
+  "ORCH_POOL_SIZE",
+  "ORCH_REPLAY_WINDOW_SECONDS",
+  "ORCH_RUNNER_IMAGE",
+  "ORCH_RUNNER_NETWORK",
+  "ORCH_VAULT_ROOT",
+  "ORCH_ARTIFACT_ROOT",
+  // Not read by the orchestrator; Docker's own group_add interpolation.
+  "_DOCKER_GID",
+]);
+
+const orchEnv = services.orchestrator?.environment ?? {};
+for (const key of Object.keys(orchEnv)) {
+  check(
+    ORCH_VARS_ACTUALLY_READ.has(key),
+    `orchestrator environment: ${key} is a variable it reads`,
+    `orchestrator is given ${key}, which its config never reads — it is silently ` +
+      `ignored and the process uses a default instead`,
+  );
+}
+
+// 9. The api is not root and holds no extra capabilities.
 //
 // A `USER` directive does not survive `docker compose config` — it lives in the
 // image — so this is checked where it is actually true, in the Dockerfile, by CI

@@ -245,6 +245,39 @@ export function validateOrigins(raw: string | undefined): Set<string> {
   return out;
 }
 
+/**
+ * readSecret resolves a secret from either an inline value or a file path.
+ *
+ * Docker secrets arrive as files, and the `*_FILE` convention is the reason the
+ * value never appears in `docker inspect` or in `/proc/<pid>/environ`. Compose
+ * passes `CSRF_KEY_FILE=/run/secrets/csrf_key` and no `CSRF_KEY` at all, so this
+ * is the path a real deployment takes and the inline form is the development one.
+ *
+ * The trailing newline is stripped, and it has to be: a file written with
+ * `echo "$secret" >` has one, and without stripping it every deployment would
+ * fail `validateSecret` with a shape error pointing at the wrong thing.
+ *
+ * `_FILE` wins when both are set. A deployment that sets both has made a mistake,
+ * and preferring the file is the choice that cannot leak the inline value into a
+ * process listing.
+ */
+function readSecret(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const file = env[`${name}_FILE`]?.trim();
+  if (file !== undefined && file !== "") {
+    try {
+      return readFileSync(file, "utf8").trim();
+    } catch (error) {
+      throw new ConfigError(
+        `${name}_FILE`,
+        `points at ${file}, which could not be read: ${
+          error instanceof Error ? error.message : "unknown error"
+        }`,
+      );
+    }
+  }
+  return env[name];
+}
+
 /** validateSecret checks the CSRF key's shape. */
 export function validateSecret(raw: string | undefined, variable = "CSRF_KEY"): string {
   const value = (raw ?? "").trim();
@@ -319,6 +352,7 @@ function positiveInt(
 }
 
 /** loadConfig validates the whole environment and returns the result. */
+import { readFileSync } from "node:fs";
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
   const level = (env.LOG_LEVEL?.trim() || "info") as ApiConfig["logLevel"];
   if (!["debug", "info", "warn", "error"].includes(level)) {
@@ -327,12 +361,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
 
   return {
     allowedOrigins: validateOrigins(env.ALLOWED_ORIGINS),
-    csrfKey: validateSecret(env.CSRF_KEY),
+    csrfKey: validateSecret(readSecret(env, "CSRF_KEY")),
     sessionTtlHours: positiveInt(env, "SESSION_TTL_HOURS", 12),
     minFreeDiskMb: positiveInt(env, "MIN_FREE_DISK_MB", 2048),
     orchestratorUrl: validateInternalOrigin(env.ORCHESTRATOR_URL),
     orchestratorSecret: validateSecret(
-      env.ORCHESTRATOR_HMAC_SECRET_FILE ? undefined : env.ORCHESTRATOR_HMAC_SECRET,
+      readSecret(env, "ORCHESTRATOR_HMAC_SECRET"),
       "ORCHESTRATOR_HMAC_SECRET",
     ),
     orchestratorReplayWindowSeconds: positiveInt(

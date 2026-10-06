@@ -89,6 +89,15 @@ export interface OrchestratorStats {
   size: number;
   byState: Record<string, number>;
   runnerTtlSeconds: number;
+  /**
+   * The orchestrator's own names for its slots.
+   *
+   * Optional because the two components are deployed independently, and a new api
+   * will briefly talk to an orchestrator that predates this field. An absent list
+   * means "this orchestrator cannot tell me its slot names", and the caller treats
+   * that as an unseedable pool rather than as an empty one — see `syncPool`.
+   */
+  readonly slotIds?: readonly string[];
 }
 
 /** Errors the orchestrator's HTTP surface can produce, as typed results. */

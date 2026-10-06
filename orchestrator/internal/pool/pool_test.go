@@ -940,3 +940,77 @@ func TestContainerNameIsEngineCompatible(t *testing.T) {
 		t.Errorf("name must start alphanumeric, got %q", name[0])
 	}
 }
+
+// T-I6: /stats must expose the orchestrator's own slot names.
+//
+// The api stores one of these in sessions.runner_id and passes it back as a slotId
+// to release and recycle. Without them the api can only invent ids, and an invented
+// id that happens to collide is one session releasing another's container.
+func TestStatsExposesSlotIDs(t *testing.T) {
+	p := slotIDsPool(t, 3)
+	stats := p.Stats()
+
+	if len(stats.SlotIDs) != 3 {
+		t.Fatalf("SlotIDs = %d ids, want 3", len(stats.SlotIDs))
+	}
+	// Distinct and non-empty: an id that repeats would let two sessions bind the
+	// same slot name, which is the failure this exists to prevent.
+	seen := map[string]bool{}
+	for _, id := range stats.SlotIDs {
+		if id == "" {
+			t.Fatal("a slot id is empty")
+		}
+		if seen[id] {
+			t.Fatalf("slot id %q appears twice", id)
+		}
+		seen[id] = true
+	}
+}
+
+// Sorted, so two calls against an unchanged pool are byte-identical. An unstable
+// order makes a diff of two /stats responses meaningless and churns the api's view
+// for no reason.
+func TestStatsSlotIDsAreSorted(t *testing.T) {
+	p := slotIDsPool(t, 5)
+	first := p.Stats().SlotIDs
+	for i := 0; i < 20; i++ {
+		next := p.Stats().SlotIDs
+		if len(next) != len(first) {
+			t.Fatalf("slot count changed between calls: %d then %d", len(first), len(next))
+		}
+		for j := range first {
+			if first[j] != next[j] {
+				t.Fatalf("slot order is unstable at %d: %q then %q", j, first[j], next[j])
+			}
+		}
+	}
+}
+
+// Slot ids must not carry container identities. §2.1 restricts the api from
+// holding a container id it cannot verify; a slot name is how it asks for a slot,
+// not a handle it can address a container with.
+func TestStatsSlotIDsAreNotContainerIDs(t *testing.T) {
+	p := slotIDsPool(t, 2)
+	stats := p.Stats()
+	for _, s := range p.Slots() {
+		if s.ContainerID == "" {
+			continue // idle slot, nothing to leak
+		}
+		for _, id := range stats.SlotIDs {
+			if id == s.ContainerID {
+				t.Fatalf("slot id %q is also a container id", id)
+			}
+		}
+	}
+}
+
+// slotIDsPool builds a pool with n named idle slots, for the Stats tests.
+func slotIDsPool(t *testing.T, n int) *Pool {
+	t.Helper()
+	p := New(testConfig(t, n), nil, discardLog())
+	for i := 1; i <= n; i++ {
+		id := fmt.Sprintf("slot-%d", i)
+		p.slots[id] = &Slot{ID: id, State: StateIdle}
+	}
+	return p
+}

@@ -191,7 +191,14 @@ export class FakeOrchestrator {
     }
     return {
       ok: true,
-      value: { size: this.#slots.size, byState, runnerTtlSeconds: 300 },
+      value: {
+        size: this.#slots.size,
+        byState,
+        runnerTtlSeconds: 300,
+        // The real orchestrator exposes these now, and the api seeds its pool from
+        // them. Sorted so the fake matches the real response byte for byte.
+        slotIds: this.slotIds().sort(),
+      },
     };
   }
 

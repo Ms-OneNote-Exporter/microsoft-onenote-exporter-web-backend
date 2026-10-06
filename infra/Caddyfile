@@ -1,0 +1,159 @@
+# Caddy — the only process that terminates TLS.
+#
+# ## The host name lives in exactly one place
+#
+# `{$PUBLIC_HOST}` is substituted from the environment by compose, from
+# `PUBLIC_HOST` in `.env`. That is the only place the domain is written down, so
+# changing it is one edit rather than a search for every spelling of it.
+#
+# It is deliberately *not* derived from an `X-Forwarded-Host` header. The host
+# name decides which certificate is presented and which origin every artifact
+# download URL is built from; a request header in that path would let a second
+# operator's proxy re-point both.
+#
+# If you change it, change `PUBLIC_HOST` in `.env` and nothing else. The api reads
+# the same value as `PUBLIC_ORIGIN`, and mac's frontend has it as
+# `VITE_API_ORIGIN` — see the README for the three places that must agree.
+#
+# ## What Caddy is and is not for
+#
+# It is for TLS, and for `/files/*`: Caddy serves artifacts directly with
+# sendfile, so a multi-gigabyte download never passes through Node.
+#
+# It is *not* an access-control layer. Every decision about who may do what is
+# made by the api, and the only route Caddy makes on its own judgement is
+# refusing to log a body.
+
+{
+	# No automatic HTTP->HTTPS redirect here: the redirect has to be a 308 with an
+	# empty body, and Caddy's default is fine because the only thing on this origin
+	# is the api.
+	email {$ACME_EMAIL}
+
+	# TLS 1.2 floor. TLS 1.0/1.1 are refused rather than merely not requested,
+	# because a client that can be talked down to TLS 1.0 is a downgrade waiting for
+	# an attacker, and `Strict-Transport-Security` cannot undo a connection that was
+	# never secure.
+	protocols tls1.2 tls1.3
+}
+
+# The api's own origin. This is where `/files/*` is served — see the note in
+# PLAN-v3 §5 for why it cannot be the frontend's origin.
+{$PUBLIC_HOST} {
+	encode zstd gzip
+
+	header {
+		# HSTS. `preload` is omitted deliberately: submitting a host to the preload
+		# list is close to irreversible, and that is the operator's decision to make
+		# deliberately rather than a line in a config file.
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+
+		# No `Content-Security-Policy` here. The CSP belongs to the frontend's own
+		# origin, which Caddy does not serve in this deployment. Setting it on the
+		# api origin would be inert and would look like coverage.
+		-Server
+	}
+
+	# ---- no body logging, anywhere -----------------------------------------
+	#
+	# §5's hardest operational constraint, because the credential route's body *is*
+	# the Microsoft password. The global `log` directive below sets an empty
+	# logger, and this block is the belt to its braces: if a future edit adds a
+	# `log` with a filter that includes request bodies, the config still says no.
+	log {
+		output discard
+	}
+
+	# ---- health, so an orchestrator can probe without auth ------------------
+	#
+	# Liveness only. Deliberately unauthenticated and deliberately useless: it
+	# reveals that the process is up and nothing else. Any deeper health answer
+	# would be a status oracle for pool occupancy.
+	handle /healthz {
+		respond "ok" 200
+	}
+
+	# ---- artifacts ---------------------------------------------------------
+	#
+	# Served on THIS origin, not the frontend's, and that is load-bearing rather
+	# than incidental. The session cookie is `__Host-msout`; the `__Host-` prefix
+	# forbids a `Domain` attribute, so the browser only ever sends it to this host.
+	# A relative `/files/<id>` would resolve against the frontend's origin, where
+	# the cookie cannot travel — so `forward_auth` would receive no `Cookie` header
+	# and refuse every download. `SameSite=None` does not help: SameSite governs
+	# site, not host.
+	handle /files/* {
+		forward_auth api:3000 {
+			# Rewritten, so the api sees a known route rather than a proxy's idea of
+			# the user's path.
+			uri /internal/authorize-download
+
+			# The cookie is the whole point of the subrequest: it is what
+			# forward_auth sends so the api can decide whose download this is.
+			copy_headers Cookie
+
+			# The original path, so the api knows *which* artifact is being asked
+			# for. Untrusted input to that endpoint, which parses it strictly.
+			header_up X-Original-Uri {uri}
+
+			# The api answers 204 with `X-Artifact-Partial: 1` when the artifact is a
+			# partial vault. Copying that onto the download response is what makes
+			# partialness server-enforced rather than something the UI has to
+			# remember: §5's rule is that a partial vault must not be mistakable for a
+			# complete one, and that must not depend on the frontend being correct.
+			copy_response_headers X-Artifact-Partial
+
+			# Deliberately NOT copied: Authorization, and every other header the
+			# browser sent. This subrequest should carry the session and nothing
+			# else.
+		}
+
+		file_server {
+			root /srv/msout/artifacts
+
+			# `attachment` so a browser saves the archive rather than trying to render
+			# it. The notebook name is deliberately NOT placed here by Caddy: Caddy
+			# only knows the artifact id, and §5 requires the name to travel in
+			# Content-Disposition rather than in the path or the access log. The name
+			# reaches the client through `artifact.fileName` in the snapshot, which
+			# the browser uses as the `download` attribute.
+			#
+			# So the `.partial.zip` suffix is a client-side nicety and only
+			# `X-Artifact-Partial` is the server-enforced half. That split is stated
+			# in api/README.md rather than papered over with a placeholder trick that
+			# would produce a worse filename.
+		}
+	}
+
+	# ---- the api -----------------------------------------------------------
+	handle {
+		reverse_proxy api:3000 {
+			# Buffer nothing. The credential route hands a raw stream to the
+			# container runner, and a proxy that buffers a request body would
+			# accumulate a password in Caddy's memory — which is the exact thing the
+			# credential path is built to prevent. PLAN-v3 §4.2.
+			flush_interval -1
+
+			# The client's address, so the rate limiter counts per user rather than
+			# per proxy hop. Trusted by the api only because it is set here and the
+			# api's port is on an internal network; PLAN-v3 §3.5.
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+
+			# SSE must not be buffered or the progress events arrive in a clump at
+			# the end. `-1` means flush immediately.
+			transport http {
+				read_timeout 0
+				write_timeout 0
+			}
+		}
+	}
+
+	# Anything not matched above is the api's to answer, which means 401 for an
+	# unknown path rather than 404. Caddy does not add its own catch-all: a proxy
+	# that answered 404 would hand back a path oracle that the api deliberately
+	# refuses to create.
+}

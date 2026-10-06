@@ -131,7 +131,56 @@ describe("GET /internal/authorize-download", () => {
   });
 });
 
-// ---- everything that must not be authorised ------------------------------
+it("flags a partial artifact, so the server enforces it rather than the UI", async () => {
+    // §5: a partial vault must not be mistakable for a complete one, and that must
+    // not depend on the frontend being correct. Caddy copies this header onto the
+    // download response, so the fact travels with the bytes.
+    const id = generateArtifactId();
+    seedSession(GUID, SECRET, id);
+    db.run(`UPDATE sessions SET artifact_partial = 1 WHERE guid = ?`, GUID);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/internal/authorize-download",
+      headers: { cookie: cookieFor(GUID, SECRET), "x-original-uri": `/files/${id}` },
+    });
+    expect(response.statusCode).toBe(204);
+    expect(response.headers["x-artifact-partial"]).toBe("1");
+  });
+
+  it("omits the header for a complete artifact", async () => {
+    // The absence is the signal. A default of "0" would mean a partial artifact
+    // whose flag was lost in a refactor looks complete.
+    const id = generateArtifactId();
+    seedSession(GUID, SECRET, id);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/internal/authorize-download",
+      headers: { cookie: cookieFor(GUID, SECRET), "x-original-uri": `/files/${id}` },
+    });
+    expect(response.headers["x-artifact-partial"]).toBeUndefined();
+  });
+
+  it("sets no header on a denial", async () => {
+    // A refused download must not leak partialness, or existence, through a
+    // header difference.
+    seedSession(GUID, SECRET, generateArtifactId());
+    seedSession(OTHER_GUID, OTHER_SECRET, generateArtifactId());
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/internal/authorize-download",
+      headers: {
+        cookie: cookieFor(GUID, SECRET),
+        "x-original-uri": `/files/${generateArtifactId()}`,
+      },
+    });
+    expect(response.statusCode).toBe(403);
+    expect(response.headers["x-artifact-partial"]).toBeUndefined();
+  });
+
+  // ---- everything that must not be authorised ------------------------------
 
 describe("GET /internal/authorize-download denies", () => {
   it("another session's artifact", async () => {

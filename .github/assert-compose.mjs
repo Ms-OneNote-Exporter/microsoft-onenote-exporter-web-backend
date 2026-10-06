@@ -1,0 +1,239 @@
+#!/usr/bin/env node
+/**
+ * Static assertions about the resolved compose config.
+ *
+ * Run against `docker compose config --format json`, so it checks what Compose
+ * actually resolved rather than what the YAML appears to say. That distinction is
+ * the point: every one of these mistakes produces a stack that starts, serves, and
+ * looks fine.
+ *
+ *   docker compose config --format json | node .github/assert-compose.mjs
+ *
+ * None of this proves a container is isolated — that needs running containers and
+ * lives in capability.yml. These are the properties that are wrong in the file
+ * rather than wrong at runtime, and they are cheap because `config` needs no
+ * daemon.
+ */
+
+import { readFileSync } from "node:fs";
+
+const cfg = JSON.parse(readFileSync(0, "utf8"));
+
+/** @type {string[]} */
+const failures = [];
+/** @type {string[]} */
+const passes = [];
+
+const check = (condition, okMessage, failMessage) => {
+  if (condition) passes.push(okMessage);
+  else failures.push(failMessage);
+};
+
+const services = cfg.services ?? {};
+
+// 1. The control network has no route to the internet.
+//
+// §2.1: the orchestrator talks only to the Docker socket, which is not a network,
+// so it needs no egress. A network declared without `internal: true` still works
+// perfectly, so nothing else in the stack would complain — the orchestrator would
+// simply be able to reach the internet, which is exactly what the component split
+// exists to prevent.
+check(
+  cfg.networks?.["msout-control"]?.internal === true,
+  "msout-control has internal: true (no route to the internet)",
+  "msout-control is missing `internal: true` — the control plane can reach the internet",
+);
+
+// 2. Only Caddy publishes a port.
+//
+// The api and the orchestrator being unreachable from the host is the reason to
+// split them into separate components; a published port would undo it without any
+// error.
+for (const svc of ["api", "orchestrator"]) {
+  const ports = services[svc]?.ports ?? [];
+  check(
+    ports.length === 0,
+    `${svc} publishes no port`,
+    `${svc} publishes ${ports.length} port(s): ${JSON.stringify(ports)}`,
+  );
+}
+check(
+  (services.caddy?.ports ?? []).length > 0,
+  "caddy publishes 80/443",
+  "caddy publishes no port, so nothing is reachable",
+);
+
+// 3. The Docker socket belongs to the orchestrator and only the orchestrator.
+//
+// This is §2.1 in one assertion. The socket *is* container creation, so it is the
+// entire reason the orchestrator is a separate component — a process that can
+// create a container can ignore every other restriction.
+//
+// Matched on the mount's **source**, not its target. The first version of this
+// check stringified the whole volume and looked for "docker.sock", which matched
+// the *target* — so replacing the source with an unrelated path still passed. That
+// is the direction that matters: the question is always "does this process have
+// the host's socket", and the answer lives in the source.
+const DOCKER_SOCK = "/var/run/docker.sock";
+
+/** Every bind mount whose source is the host's docker socket. */
+const socketsFor = (svc) =>
+  (services[svc]?.volumes ?? []).filter(
+    (v) => v.type === "bind" && String(v.source).endsWith("docker.sock"),
+  );
+
+/** Every bind mount at all, for a service. */
+const bindsFor = (svc) =>
+  (services[svc]?.volumes ?? []).filter((v) => v.type === "bind");
+
+check(
+  socketsFor("orchestrator").length === 1,
+  "orchestrator mounts the host docker socket, once",
+  `orchestrator has ${socketsFor("orchestrator").length} docker socket mount(s); expected exactly 1`,
+);
+for (const svc of ["api", "caddy"]) {
+  check(
+    socketsFor(svc).length === 0,
+    `${svc} mounts no docker socket`,
+    `${svc} mounts a docker socket — it must never hold one (§2.1)`,
+  );
+}
+
+// 3b. The api takes no host path whatsoever.
+//
+// §2.1: no socket, no vault mount, no host tree. Everything it needs arrives over
+// the network or through a Docker secret. A bind mount here is a hole in the split
+// that nothing else would notice, so it is asserted rather than reviewed.
+check(
+  bindsFor("api").length === 0,
+  "api has no bind mounts at all",
+  `api bind-mounts ${bindsFor("api").map((v) => v.source).join(", ")}; §2.1 gives it no host path`,
+);
+
+// 3c. Caddy takes no host path either, and no socket.
+// Its only host surface is the read-only Caddyfile, which compose renders as a
+// bind; everything else it needs is a named volume.
+const caddyBinds = bindsFor("caddy").map((v) => v.source);
+check(
+  caddyBinds.every((src) => src.endsWith("Caddyfile")),
+  `caddy bind-mounts only its config (${caddyBinds.join(", ") || "none"})`,
+  `caddy bind-mounts something unexpected: ${caddyBinds.join(", ")}`,
+);
+
+// 4. The edge network holds Caddy alone.
+//
+// So the api's unreachability is a property of the topology rather than of
+// remembering not to publish a port. The api reaches Caddy over msout-control,
+// which Caddy also joins.
+const onEdge = Object.entries(services)
+  .filter(([, def]) => Object.keys(def.networks ?? {}).includes("msout-edge"))
+  .map(([name]) => name);
+check(
+  onEdge.length === 1 && onEdge[0] === "caddy",
+  `msout-edge holds only caddy (found: [${onEdge}])`,
+  `msout-edge holds [${onEdge}]; expected [caddy] only`,
+);
+
+// 5. The orchestrator learns nothing it has no use for.
+//
+// §2.1 restricts it deliberately. An env var is how such a restriction quietly
+// stops being true — one copy-pasted line, and the component that should know
+// least about sessions knows the CSRF key.
+for (const key of [
+  "PUBLIC_HOST",
+  "PUBLIC_ORIGIN",
+  "ALLOWED_ORIGINS",
+  "CSRF_KEY",
+  "CSRF_KEY_FILE",
+]) {
+  check(
+    !(key in (services.orchestrator?.environment ?? {})),
+    `orchestrator environment has no ${key}`,
+    `orchestrator environment carries ${key}, which it must not know`,
+  );
+}
+
+// 6. Secrets arrive as file paths, never as values.
+//
+// An env var is visible in `docker inspect`, in `/proc/<pid>/environ`, and to
+// anything that can read the container's config. The value must never appear in
+// the compose file itself.
+//
+// An explicit list rather than a pattern like /SECRET|SESSION/. The first version
+// of this check used a pattern and flagged SESSION_TTL_HOURS, which is a duration
+// and not a secret — and a check that fires on harmless configuration trains a
+// reader to ignore it, which is worse than no check at all.
+const SECRET_VARS = [
+  "CSRF_KEY",
+  "ORCHESTRATOR_HMAC_SECRET",
+  "SESSION_SECRET",
+  "ARTIFACT_ENCRYPTION_KEY",
+];
+
+for (const svc of Object.keys(services)) {
+  const env = services[svc]?.environment ?? {};
+
+  for (const name of SECRET_VARS) {
+    if (name in env) {
+      failures.push(
+        `${svc}: ${name} is assigned inline. Use ${name}_FILE pointing at /run/secrets/...`,
+      );
+    }
+  }
+
+  // Every *_FILE that is present must point at a real secret path.
+  for (const [key, value] of Object.entries(env)) {
+    if (!key.endsWith("_FILE")) continue;
+    check(
+      typeof value === "string" && value.startsWith("/run/secrets/"),
+      `${svc}: ${key} points into /run/secrets`,
+      `${svc}: ${key} is "${value}", which is not a /run/secrets path`,
+    );
+  }
+}
+
+// 7. The api is not root and holds no extra capabilities.
+//
+// A `USER` directive does not survive `docker compose config` — it lives in the
+// image — so this is checked where it is actually true, in the Dockerfile, by CI
+// grepping the built image. Here the half that does resolve: no added capabilities.
+for (const svc of ["api", "orchestrator", "caddy"]) {
+  const added = services[svc]?.cap_add ?? [];
+  check(
+    (services[svc]?.cap_drop ?? []).includes("ALL"),
+    `${svc} drops ALL capabilities`,
+    `${svc} does not cap_drop ALL`,
+  );
+
+  // Only Caddy legitimately needs one capability, to bind :80 and :443. The api
+  // and the orchestrator need none at all.
+  //
+  // Two separate checks rather than one condition with a `svc !== "caddy" &&`
+  // guard: that version short-circuits to true for every service except caddy, so
+  // `cap_add: [SYS_ADMIN]` on the api passed. The meta-test in
+  // assert-compose.test.mjs is what found it.
+  if (svc === "caddy") {
+    check(
+      added.every((c) => c === "NET_BIND_SERVICE"),
+      `caddy adds only NET_BIND_SERVICE (${added.join(",") || "none"})`,
+      `caddy adds unexpected capabilities: ${added.join(",")}`,
+    );
+  } else {
+    check(
+      added.length === 0,
+      `${svc} adds no capabilities`,
+      `${svc} adds capabilities it has no use for: ${added.join(",")}`,
+    );
+  }
+}
+
+for (const line of passes) console.log(`  ok    ${line}`);
+if (failures.length > 0) {
+  console.error("");
+  for (const line of failures) console.error(`  FAIL  ${line}`);
+  console.error(
+    `\n${failures.length} of ${failures.length + passes.length} static capability assertions failed.`,
+  );
+  process.exit(1);
+}
+console.log(`\n${passes.length} static capability assertions passed.`);

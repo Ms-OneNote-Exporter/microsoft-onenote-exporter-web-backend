@@ -1,0 +1,28 @@
+# The api image needs the lockfile, the sources, and the tsconfigs. Nothing else.
+#
+# The exclusions matter more than they look: `COPY` sends the whole build context
+# to the daemon, so without these the layer cache stores `node_modules` (hundreds
+# of megabytes) and `.git` (the entire history) on every build — and, worse, a
+# `.env` would be baked into a layer that someone can extract from the registry.
+
+.git
+.github
+node_modules
+dist
+mock
+tests
+coverage
+*.log
+
+# Never let a developer's local secret file reach the daemon.
+.env
+.env.*
+!.env.example
+
+# Docs and tooling that the image does not need.
+*.md
+!package.json
+.vscode
+.idea
+Dockerfile
+.dockerignore

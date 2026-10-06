@@ -291,6 +291,17 @@ jobs:
           IMAGE_TAG: "0000000"
         run: node .github/assert-compose.test.mjs
 
+      - name: nothing logs a request header
+        # Now that the Microsoft account travels in a header, "no body logging" is
+        # too narrow a promise: an identifier would sit in an access log, and
+        # headers are logged by more things than bodies are.
+        #
+        # A grep rather than a unit test, because this is a property of every line
+        # in api/src rather than of one function — which is how the CSRF-cookie bug
+        # survived review: true everywhere the reviewer looked, false in a file
+        # nobody opened.
+        run: .github/check-no-header-logging.sh
+
       - name: no secret is committed
         # The compose file names the paths of Docker secrets, never their values. A
         # value here means a real secret is in git history.

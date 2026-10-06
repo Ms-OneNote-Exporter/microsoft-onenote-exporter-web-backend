@@ -33,6 +33,7 @@ import {
 } from "./auth.js";
 import { serialiseCookie, sessionCookie } from "./cookies.js";
 import { header as headerValue } from "./server.js";
+import { ACCOUNT_HEADER, MAX_ACCOUNT_CHARS } from "./credentials-header.js";
 import {
   deriveCsrfToken,
   generateArtifactId,
@@ -87,6 +88,7 @@ export interface RouteDeps {
  * the same reason the snapshot's parser tolerates garbage.
  */
 const EXPORT_STATES = new Set(["none", "queued", "running", "done", "partial", "failed"]);
+
 
 /**
  * parseJsonObject reads a body as a plain object with unknown fields rejected.
@@ -478,6 +480,32 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
       return reply.code(415).send({ error: "unsupported content-type" });
     }
 
+    /**
+     * The Microsoft account, in a header rather than in the body.
+     *
+     * mac's design, and his reasoning for it is the reason I agreed rather than
+     * proposing the obvious alternative: the body stays byte-identical. Splitting
+     * "account\npassword" in one body would mean a delimiter, and a delimiter is
+     * another place for a truncation bug — a bug class this pair has now shipped
+     * twice from opposite ends (his client JSON-encoding the password, my
+     * `capStream` ending the body before it began), with the same user-visible
+     * symptom both times.
+     *
+     * An email address or a username, because Microsoft accepts either and telling
+     * someone to "enter your email" when their account is a username is a dead
+     * end. So: validated as a non-empty bounded string, not as an email.
+     *
+     * Not a secret, but still an identifier, so it is never logged — see the
+     * no-header-logging assertion in CI.
+     */
+    const account = headerValue(request, ACCOUNT_HEADER);
+    if (account === undefined || account.trim() === "") {
+      return reply.code(400).send({ error: "microsoft account required" });
+    }
+    if (account.length > MAX_ACCOUNT_CHARS) {
+      return reply.code(400).send({ error: "microsoft account too long" });
+    }
+
     // A 501 must not claim a slot. The container is the expensive thing to leak
     // and there is nothing here to hand the credential to, so the order is:
     // refuse first, bind second. The stream is still created and destroyed so the
@@ -538,6 +566,7 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
         sessionId: session.guid,
         stream: forwardable,
         correlationId: session.guid,
+        account,
       });
     } catch (error) {
       // A transport failure, not a login failure. The login outcome arrives over

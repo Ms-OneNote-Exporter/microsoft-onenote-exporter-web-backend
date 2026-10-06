@@ -85,6 +85,9 @@ beforeEach(async () => {
 
 // ---- Property 1: no body parser is reachable ------------------------------
 
+/** A Microsoft account: an email or a username, never a secret, never logged. */
+const ACCOUNT = "someone@example.com";
+
 describe("body parsing", () => {
   // The specific hazard mac flagged: a global parser runs before a route's
   // opt-out, so "I don't parse the credential" becomes false by accident.
@@ -419,6 +422,7 @@ describe("csrf", () => {
       url: "/api/session/credential",
       headers: {
         "content-type": "text/plain",
+        "x-microsoft-account": ACCOUNT,
         cookie: sessionCookie(),
         origin: ALLOWED,
         "x-csrf-token": csrfToken,
@@ -437,6 +441,7 @@ describe("csrf", () => {
       url: "/api/session/credential",
       headers: {
         "content-type": "text/plain",
+        "x-microsoft-account": ACCOUNT,
         cookie: sessionCookie(),
         origin: ALLOWED,
         "x-csrf-token": csrfToken,
@@ -456,6 +461,7 @@ describe("csrf", () => {
       url: "/api/session/credential",
       headers: {
         "content-type": "text/plain",
+        "x-microsoft-account": ACCOUNT,
         cookie: sessionCookie(),
         origin: ALLOWED,
         "x-csrf-token": csrfToken,
@@ -528,6 +534,7 @@ describe("responses", () => {
       url: "/api/session/credential",
       headers: {
         "content-type": "text/plain",
+        "x-microsoft-account": ACCOUNT,
         cookie: sessionCookie(),
         origin: ALLOWED,
         "x-csrf-token": csrfToken,

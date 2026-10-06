@@ -54,6 +54,15 @@ export class MockRunner implements RunnerAdapter, RunnerEraseControl {
   readonly #notebooks: readonly string[];
   #nextLogin: LoginScript;
 
+  /**
+   * The account from the last submitCredential call.
+   *
+   * For the dev controls only. Deliberately not emitted as an SSE event, because
+   * that would put a user's Microsoft account identifier into a frame a browser
+   * holds in memory for the life of the session.
+   */
+  lastAccount: string | null = null;
+
   /** Live export abort controllers, so abort can actually cancel a run. */
   readonly #running = new Map<string, AbortController>();
 
@@ -82,9 +91,18 @@ export class MockRunner implements RunnerAdapter, RunnerEraseControl {
   // ---- login ------------------------------------------------------------
 
   async submitCredential(input: SubmitCredentialInput): Promise<void> {
-    const { sessionId, stream } = input;
+    const { sessionId, stream, account } = input;
     const script = this.#nextLogin;
     this.#nextLogin = "success";
+
+    // The account is recorded in memory for the length of the call only, so the dev
+    // controls can show which account a scripted login used. It is not a secret,
+    // but it is an identifier and this is a development tool: never write it to a
+    // log, and never put it in an SSE frame a real client would receive.
+    this.lastAccount = account;
+    if (account.trim() === "") {
+      throw new Error("empty account"); // the route already refuses this
+    }
 
     // Drain and discard. Never buffer, never decode, never log. See the file
     // header: a tool that inspected the password would be a second handler for it.

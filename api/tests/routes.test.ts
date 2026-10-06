@@ -97,6 +97,9 @@ beforeEach(() => {
 
 // ---- POST /api/session ----------------------------------------------------
 
+/** A Microsoft account: an email or a username, never a secret, never logged. */
+const ACCOUNT = "someone@example.com";
+
 describe("POST /api/session", () => {
   const create = (payload: unknown, headers: Record<string, string> = {}) =>
     newApp().then((app) =>
@@ -522,7 +525,13 @@ describe("POST /api/session/credential", () => {
         .inject({
           method: "POST",
           url: "/api/session/credential",
-          headers: { "content-type": "text/plain", cookie: cookieHeader(), origin: ALLOWED, ...headers },
+          headers: {
+            "content-type": "text/plain",
+            "x-microsoft-account": ACCOUNT,
+            cookie: cookieHeader(),
+            origin: ALLOWED,
+            ...headers,
+          },
           payload,
         })
         .finally(() => app.close()),
@@ -922,6 +931,7 @@ describe("misc routes", () => {
         url: "/api/session/credential?x=1",
         headers: {
           "content-type": "text/plain",
+          "x-microsoft-account": ACCOUNT,
           cookie: cookieHeader(),
           origin: ALLOWED,
           "x-csrf-token": derive(csrfKey, GUID),

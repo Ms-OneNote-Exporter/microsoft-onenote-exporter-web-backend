@@ -1,0 +1,609 @@
+/**
+ * The routes.
+ *
+ * Registered on the Fastify instance built in server.ts. Every mutating route has
+ * already been authenticated and CSRF-checked by the `onRequest` hook, so a
+ * handler here can read `request.ctx.session` without repeating those checks —
+ * and cannot accidentally skip them.
+ *
+ * Two rules the handlers follow:
+ *
+ *   - A handler never returns a field the plan does not name. The snapshot shape
+ *     is `SessionSnapshot` in auth.ts, which is the single definition of the
+ *     cross-component contract.
+ *   - A handler that cannot do its job returns 501 rather than pretending. The
+ *     routes that need the runner or the artifact pipeline are not wired yet, and
+ *     a 501 says that honestly where a stub returning `{}` would look like a bug.
+ */
+
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import type { Readable } from "node:stream";
+
+import type { ApiConfig } from "./config.js";
+import type { Db, SessionRow } from "./db.js";
+import type { OrchestratorClient } from "./orchestrator-client.js";
+import type { SseHub } from "./sse.js";
+import type { RateLimiter } from "./rate-limit.js";
+import { API_BUILD, PROTOCOL_VERSION, buildSnapshot } from "./auth.js";
+import { csrfCookie, serialiseCookie, sessionCookie } from "./cookies.js";
+import {
+  deriveCsrfToken,
+  generateArtifactId,
+  generateCsrfKey,
+  hashSecret,
+} from "./session.js";
+import {
+  checkFraming,
+  capStream,
+  contentTypeIsAcceptable,
+  MAX_CREDENTIAL_BYTES,
+} from "./credential.js";
+import { resolveClientAddress } from "./client-ip.js";
+import { readJsonObject } from "./server.js";
+import { expireCookieHeaders, runErase, type EraseDeps } from "./erase.js";
+
+/**
+ * Dependencies the routes need beyond config.
+ *
+ * Mutable only so `buildServer` can assemble it conditionally under
+ * `exactOptionalPropertyTypes`; nothing mutates it afterwards.
+ */
+export interface RouteDeps {
+  readonly db: Db;
+  readonly orchestrator: OrchestratorClient;
+  readonly sse: SseHub;
+  readonly limiter: RateLimiter;
+  knownProxies?: ReadonlySet<string>;
+  eraseRunner?: EraseDeps["runner"];
+  now?: () => number;
+}
+
+/**
+ * EXPORT_STATES is the export state union, validated on read.
+ *
+ * Checking membership rather than trusting the column means a corrupt or
+ * hand-edited value cannot put the client in a state it has no rendering for —
+ * the same reason the snapshot's parser tolerates garbage.
+ */
+const EXPORT_STATES = new Set(["none", "queued", "running", "done", "partial", "failed"]);
+
+/**
+ * parseJsonObject reads a body as a plain object with unknown fields rejected.
+ *
+ * Unknown fields are refused rather than ignored so a caller cannot come to
+ * believe it set something the server read. This is the same rule the
+ * orchestrator applies, for the same reason.
+ */
+async function parseJsonObject(
+  request: FastifyRequest,
+  limitBytes = 64 * 1024,
+  allowedKeys?: readonly string[],
+): Promise<Record<string, unknown> | null> {
+  const parsed = await readJsonObject(request.body as Readable, limitBytes);
+  if (parsed === null || allowedKeys === undefined) return parsed;
+
+  // Unknown fields are refused rather than ignored, for the same reason the
+  // orchestrator does it: a caller that sends `image` and gets a 201 would
+  // reasonably conclude it was set. The route names the keys it reads, and this
+  // checks the body against that list.
+  for (const key of Object.keys(parsed)) {
+    if (!allowedKeys.includes(key)) return null;
+  }
+  return parsed;
+}
+
+/** asString returns a field as a string, or undefined. */
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" && value !== "" ? value : undefined;
+}
+
+/** registerRoutes attaches every route to the instance. */
+export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: RouteDeps): void {
+  const now = deps.now ?? (() => Date.now());
+  const knownProxies = deps.knownProxies ?? new Set<string>();
+  const ttlSeconds = config.sessionTtlHours * 3600;
+
+  // ---- GET /api/public/version -------------------------------------------
+
+  // §7.2: the protocol handshake. Named in server.ts's PUBLIC_PATHS so the hook
+  // leaves it unauthenticated — a client checks the version before it has a
+  // session, and refusing it would break the thing that diagnoses a version skew.
+  app.get("/api/public/version", async (_request, reply) =>
+    reply.send({ protocol: PROTOCOL_VERSION, build: API_BUILD }),
+  );
+
+  // ---- POST /api/session --------------------------------------------------
+
+  // Exempt from the authentication hook, because there is no session yet. The
+  // hook skips it by exact path.
+  app.post("/api/session", async (request, reply) => {
+    const origin = request.headers.origin;
+    if (origin !== undefined && !config.allowedOrigins.has(origin)) {
+      return reply.code(403).send({ error: "forbidden" });
+    }
+
+    const body = await parseJsonObject(request, 64 * 1024, ["guid", "secret"]);
+    if (body === null) {
+      return reply.code(400).send({ error: "malformed request body" });
+    }
+
+    const guid = asString(body.guid);
+    const secret = asString(body.secret);
+
+    // Validated mechanically rather than trusted. Under the split the secret is
+    // generated by Component A, and a compromised frontend could generate a weak
+    // one (PLAN-v3 §4, T9).
+    if (guid === undefined || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(guid)) {
+      return reply.code(400).send({ error: "guid must be a lowercase uuid" });
+    }
+    if (secret === undefined || !/^[A-Za-z0-9_-]{43}$/.test(secret)) {
+      return reply
+        .code(400)
+        .send({ error: "secret must be exactly 43 base64url characters" });
+    }
+
+    // Rate limited per address: three sessions an hour stops an address farming
+    // sessions to burn the runner pool.
+    const client = resolveClientAddress({
+      peerAddress: request.ip,
+      forwardedFor: typeof request.headers["x-forwarded-for"] === "string"
+        ? request.headers["x-forwarded-for"]
+        : undefined,
+      knownProxies,
+    });
+    const limited = deps.limiter.checkNewSession(client.address);
+    if (!limited.allowed) {
+      reply.header("retry-after", String(limited.retryAfterSeconds));
+      return reply.code(429).send({ error: limited.reason, retryAfterSeconds: limited.retryAfterSeconds });
+    }
+
+    // The session already exists and this is a restore, not a creation: the
+    // frontend generates the GUID and the secret once and may reload into the
+    // same session. Re-creating would throw away a live auth.json, so an existing
+    // valid row is left alone and its cookies re-issued.
+    const existing = deps.db.getSession(guid);
+    const timestamp = now();
+
+    if (existing !== undefined && existing.expires_at > timestamp && existing.secret_hash !== null) {
+      // Verify the presented secret against the existing row before re-issuing
+      // cookies, or this becomes a way to take over a session by guessing its GUID.
+      if (existing.secret_hash !== hashSecret(secret)) {
+        return reply.code(401).send({ error: "unauthorised" });
+      }
+      const csrfToken = existing.csrf_key ?? generateCsrfKey();
+      return reply
+        .code(200)
+        .header("set-cookie", [
+          serialiseCookie(sessionCookie(`${guid}:${secret}`, ttlSeconds)),
+          serialiseCookie(csrfCookie(csrfToken, ttlSeconds)),
+        ])
+        .send({ protocol: PROTOCOL_VERSION });
+    }
+
+    const csrfKey = generateCsrfKey();
+    const expiresAt = timestamp + ttlSeconds * 1000;
+
+    try {
+      deps.db.createSession({
+        guid,
+        // Only the hash is stored. The secret is never written, logged or echoed
+        // beyond the cookie the browser already holds (PLAN-v3 §4).
+        secretHash: hashSecret(secret),
+        csrfKey,
+        now: timestamp,
+        expiresAt,
+      });
+    } catch {
+      // A row that appeared between the read and the insert. Re-read and answer
+      // as a restore, which is the same situation by another name.
+      return reply.code(409).send({ error: "session already exists" });
+    }
+
+    deps.sse.emit(guid, "session-status", { state: "created" });
+
+    // The CSRF token is derived rather than random, so there is no server-side
+    // token table to keep consistent with the session table (PLAN-v3 §3.3).
+    const csrfToken = deriveCsrfToken(csrfKey, guid);
+
+    return reply
+      .code(201)
+      .header("set-cookie", [
+        serialiseCookie(sessionCookie(`${guid}:${secret}`, ttlSeconds)),
+        serialiseCookie(csrfCookie(csrfToken, ttlSeconds)),
+      ])
+      .send({ protocol: PROTOCOL_VERSION, expiresAt: new Date(expiresAt).toISOString() });
+  });
+
+  // ---- GET /api/session/status -------------------------------------------
+
+  app.get("/api/session/status", async (request, reply) => {
+    const session = request.ctx.session;
+    if (session === null) {
+      return reply.code(401).send({ error: "unauthorised" });
+    }
+
+    // A session whose auth expired is still readable, so the frontend can render
+    // "please log in again" rather than a bare 401 (§13.2's accepted risk).
+    const snapshot = buildSnapshot(session, now(), {
+      state: "idle",
+      items: notebooksFor(session),
+    });
+
+    return reply.send(snapshot);
+  });
+
+  // ---- GET /api/session/events -------------------------------------------
+
+  app.get("/api/session/events", async (request, reply) => {
+    const session = request.ctx.session;
+    if (session === null) {
+      return reply.code(401).send({ error: "unauthorised" });
+    }
+
+    // Cross-origin SSE needs the credential on the stream. §6 calls this the most
+    // likely v3 bug: without withCredentials on the client every reconnect
+    // silently 401s and the UI shows "reconnecting…" forever.
+    reply.raw.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-store",
+      connection: "keep-alive",
+      // Without this a reverse proxy may buffer and deliver the stream in one lump
+      // at close, which looks exactly like a broken event stream.
+      "x-accel-buffering": "no",
+      // ACAO and ACAC, because an EventSource from the frontend origin is a
+      // cross-origin request. Emitted only for an allowlisted origin — see the
+      // onRequest hook, which set Vary and the success case already.
+      ...(request.ctx.origin !== null
+        ? {
+            "access-control-allow-origin": request.ctx.origin,
+            "access-control-allow-credentials": "true",
+          }
+        : {}),
+    });
+    request.raw.socket?.setNoDelay?.(true);
+
+    const lastEventIdHeader = request.headers["last-event-id"];
+    const lastEventId =
+      typeof lastEventIdHeader === "string" && lastEventIdHeader !== ""
+        ? Number(lastEventIdHeader)
+        : null;
+    const resumeFrom =
+      lastEventId !== null && Number.isInteger(lastEventId) && lastEventId >= 0
+        ? lastEventId
+        : null;
+
+    // The response stream, not the request. The SSE hub writes frames to a
+    // ServerResponse; `reply.raw` on a GET is typed as the IncomingMessage until
+    // Fastify has committed a response, and this route bypasses that entirely.
+    const stream = reply.raw as unknown as import("node:http").ServerResponse;
+
+    const attached = deps.sse.attach(session.guid, stream, resumeFrom);
+
+    if (attached.replayed === null) {
+      // A gap, or a fresh connection. Either way a snapshot is the honest
+      // answer; the alternative is a client that believes it is up to date.
+      deps.sse.sendSnapshot(
+        session.guid,
+        attached.subscriberId,
+        buildSnapshot(session, now(), { state: "idle", items: notebooksFor(session) }),
+        attached.hub.nextId,
+      );
+    } else {
+      for (const event of attached.replayed) {
+        deps.sse.sendSnapshot(session.guid, attached.subscriberId, event.data, event.id);
+      }
+    }
+
+    request.raw.on("close", () => {
+      deps.sse.detach(session.guid, attached.subscriberId);
+    });
+
+    // The response never ends on its own; the socket stays open until the client
+    // closes it or the process does.
+    return reply;
+  });
+
+  // ---- POST /api/session/credential ---------------------------------------
+
+  app.post("/api/session/credential", async (request, reply) => {
+    const session = request.ctx.session;
+    if (session === null) {
+      return reply.code(401).send({ error: "unauthorised" });
+    }
+
+    // Framing was already checked in onRequest, before a byte was read. Checked
+    // again here because the handler must not depend on a hook having run: a
+    // route added later would otherwise forward a credential with no cap.
+    const framed = checkFraming(
+      typeof request.headers["content-length"] === "string"
+        ? request.headers["content-length"]
+        : undefined,
+    );
+    if (!framed.ok) {
+      return reply
+        .code(framed.refusal === "content-length-too-large" ? 413 : 411)
+        .send({ error: framed.refusal });
+    }
+    if (
+      !contentTypeIsAcceptable(
+        typeof request.headers["content-type"] === "string"
+          ? request.headers["content-type"]
+          : undefined,
+      )
+    ) {
+      return reply.code(415).send({ error: "unsupported content-type" });
+    }
+
+    // The credential reaches the runner through the orchestrator's claim, so a
+    // session with no bound runner cannot accept one. Refusing here means the
+    // password never travels anywhere it cannot be used.
+    if (session.runner_id === null) {
+      return reply.code(409).send({ error: "no runner bound to this session" });
+    }
+
+    deps.sse.emit(session.guid, "login-started", {});
+
+    // Forwarding is not wired: it needs the runner's address and a streaming
+    // client, which arrives with the runner sidecar (PLAN-v3 §12 steps 1–2).
+    //
+    // The capped stream is created and destroyed here so the guarantees hold
+    // even in the unwired state: a caller who understates Content-Length and
+    // sends 4 MB has it cut off at 4 KB whether or not forwarding exists. Wiring
+    // the forward then becomes a change to where this stream goes, not a change
+    // to the credential path's limits.
+    const forwardable = capStream(request.body as Readable, MAX_CREDENTIAL_BYTES);
+    forwardable.destroy();
+
+    return reply.code(501).send({ error: "credential forwarding not wired yet" });
+  });
+
+  // ---- POST /api/session/erase -------------------------------------------
+
+  app.post("/api/session/erase", async (request, reply) => {
+    const session = request.ctx.session;
+    if (session === null) {
+      return reply.code(401).send({ error: "unauthorised" });
+    }
+
+    if (deps.eraseRunner === undefined) {
+      return reply.code(501).send({ error: "erase not wired yet" });
+    }
+
+    const outcome = await runErase(
+      {
+        db: deps.db,
+        orchestrator: {
+          remove: async (slotId: string) => deps.orchestrator.remove(slotId),
+          // The erase machine only needs to know whether the orchestrator is
+          // reachable, so a typed failure is flattened rather than propagated —
+          // the machine reports "pool stats unavailable", not a TS error.
+          stats: async () => {
+            const result = await deps.orchestrator.stats();
+            return { ok: result.ok, value: { size: result.ok ? result.value.size : 0 } };
+          },
+        },
+        runner: deps.eraseRunner,
+        sse: deps.sse,
+      } satisfies EraseDeps,
+      session.guid,
+    );
+
+    // The cookie is expired whether or not the machine succeeded. A stale tab
+    // holding a cookie for a deleted row is exactly what T7 describes, and a
+    // failed erase that deleted the row still needs the cookie gone.
+    const headers = expireCookieHeaders();
+
+    if (!outcome.ok) {
+      return reply
+        .code(500)
+        .header("set-cookie", headers)
+        .send({ error: "erase_failed", failedAt: outcome.failedAt });
+    }
+
+    // The address's counters are dropped so a legitimate user who erases and
+    // retries is not throttled as if they had never cleaned up.
+    const client = resolveClientAddress({
+      peerAddress: request.ip,
+      forwardedFor:
+        typeof request.headers["x-forwarded-for"] === "string"
+          ? request.headers["x-forwarded-for"]
+          : undefined,
+      knownProxies,
+    });
+    deps.limiter.forgetAddress(client.address);
+
+    return reply
+      .code(200)
+      .header("set-cookie", headers)
+      .send({ erased: true });
+  });
+
+  // ---- POST /api/session/notebooks ---------------------------------------
+
+  // Named `/api/session/notebooks` rather than `/api/notebooks` to match the
+  // other session sub-resources. Listing is an action — it runs a CLI in a
+  // container — so it is a POST, and there is deliberately no GET that mutates
+  // server state.
+  app.post("/api/session/notebooks", async (request, reply) => {
+    const session = request.ctx.session;
+    if (session === null) {
+      return reply.code(401).send({ error: "unauthorised" });
+    }
+
+    const body = await parseJsonObject(request);
+    // An empty body is valid: the route takes no parameters, so there is nothing
+    // to send. A non-empty body must still be an object with no unknown fields.
+    if (body !== null && Object.keys(body).length > 0) {
+      return reply.code(400).send({ error: "this route takes no parameters" });
+    }
+
+    // Listing needs an authenticated session, because the CLI reads auth.json.
+    if (session.auth_state !== "valid") {
+      return reply.code(409).send({ error: "not authenticated" });
+    }
+
+    if (session.runner_id === null) {
+      return reply.code(409).send({ error: "no runner bound to this session" });
+    }
+
+    deps.sse.emit(session.guid, "auth-state", { state: "authenticating" });
+
+    // Running the CLI needs the runner, which arrives with the runner sidecar.
+    return reply.code(501).send({ error: "notebook listing not wired yet" });
+  });
+
+  // ---- POST /api/export ---------------------------------------------------
+
+  app.post("/api/export", async (request, reply) => {
+    const session = request.ctx.session;
+    if (session === null) {
+      return reply.code(401).send({ error: "unauthorised" });
+    }
+
+    const body = await parseJsonObject(request, 64 * 1024, ["notebook"]);
+    if (body === null) {
+      return reply.code(400).send({ error: "malformed request body" });
+    }
+    const notebook = asString(body.notebook);
+    if (notebook === undefined) {
+      return reply.code(400).send({ error: "notebook is required" });
+    }
+
+    if (session.auth_state !== "valid") {
+      return reply.code(409).send({ error: "not authenticated" });
+    }
+
+    // §8.1: one active export per session. Driven from the stored state rather
+    // than from anything the client sent, so a second tab cannot start a second
+    // export by lying about the first.
+    const stored = session.export_state;
+    if (stored !== null) {
+      try {
+        const parsed = JSON.parse(stored) as { state?: string };
+        if (parsed.state !== undefined && EXPORT_STATES.has(parsed.state)) {
+          if (parsed.state === "queued" || parsed.state === "running") {
+            return reply.code(409).send({ error: "an export is already running" });
+          }
+        }
+      } catch {
+        // A corrupt column must not block an export; it is treated as no export.
+      }
+    }
+
+    // The global cap is the backstop. §8.1 has no queue in v1, so the over-cap
+    // case is a refusal with retry guidance.
+    const slot = deps.limiter.acquireExportSlot();
+    if (!slot.allowed) {
+      reply.header("retry-after", String(slot.retryAfterSeconds));
+      return reply.code(429).send({ error: slot.reason, retryAfterSeconds: slot.retryAfterSeconds });
+    }
+    // Released if the route bails below, so a failed start does not consume a
+    // global slot indefinitely.
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      deps.limiter.releaseExportSlot();
+    };
+
+    if (session.runner_id === null) {
+      release();
+      return reply.code(409).send({ error: "no runner bound to this session" });
+    }
+
+    const exportId = generateArtifactId();
+    deps.db.run(
+      `UPDATE sessions SET state = 'exporting', notebook = ?, export_state = ? WHERE guid = ?`,
+      notebook,
+      JSON.stringify({
+        state: "queued",
+        id: exportId,
+        notebook,
+        progress: { pages: 0, sections: 0, assets: 0 },
+        startedAt: now(),
+        finishedAt: null,
+      }),
+      session.guid,
+    );
+    deps.sse.emit(session.guid, "export-queued", { id: exportId, notebook });
+
+    // Spawning the CLI needs the runner.
+    release();
+    return reply.code(501).send({ error: "export execution not wired yet" });
+  });
+
+  // ---- POST /api/export/:id/abort ----------------------------------------
+
+  app.post("/api/export/:id/abort", async (request, reply) => {
+    const session = request.ctx.session;
+    if (session === null) {
+      return reply.code(401).send({ error: "unauthorised" });
+    }
+
+    const { id } = request.params as { id?: string };
+    if (id === undefined || !/^[A-Za-z0-9_-]{43}$/.test(id)) {
+      return reply.code(400).send({ error: "invalid export id" });
+    }
+
+    // The id is validated for shape and then matched against what the session
+    // actually owns. Shape alone is not authorisation: one session must not be
+    // able to abort another's export, however it learned the id.
+    const stored = session.export_state;
+    if (stored === null) {
+      return reply.code(404).send({ error: "no export" });
+    }
+    let owned = false;
+    try {
+      owned = (JSON.parse(stored) as { id?: string }).id === id;
+    } catch {
+      owned = false;
+    }
+    if (!owned) {
+      return reply.code(404).send({ error: "no such export" });
+    }
+
+    // §8.2: abort preserves what is on disk and marks the artifact partial. The
+    // state change is recorded here so a client that refreshes sees "partial"
+    // rather than a running export that will never finish.
+    deps.db.run(
+      `UPDATE sessions SET export_state = ? WHERE guid = ?`,
+      JSON.stringify({
+        state: "partial",
+        id,
+        notebook: session.notebook,
+        progress: null,
+        startedAt: null,
+        finishedAt: now(),
+      }),
+      session.guid,
+    );
+    deps.sse.emit(session.guid, "export-aborted", { id });
+    deps.sse.emit(session.guid, "export-partial", { id });
+
+    return reply.code(501).send({ error: "abort not wired yet" });
+  });
+
+  // ---- GET /files/:artifactId --------------------------------------------
+
+  // Not served here. Caddy serves it with `forward_auth` to an internal endpoint,
+  // so a multi-gigabyte vault never passes through Node (PLAN-v2 §8.3, PLAN-v3
+  // §5). The authorisation decision is made here from SQLite; the bytes are not.
+  app.get("/files/:artifactId", async (request, reply) =>
+    reply.code(501).send({ error: "artifacts are served by Caddy, not by the api" }),
+  );
+
+  // ---- GET /healthz -------------------------------------------------------
+
+  app.get("/healthz", async (_request, reply) =>
+    reply.send({ ok: true, protocol: PROTOCOL_VERSION, build: API_BUILD }),
+  );
+}
+
+/** notebooksFor reads the notebook list stored on the session, if any. */
+function notebooksFor(session: SessionRow): string[] {
+  if (session.notebook === null) return [];
+  // One notebook is recorded per export; the full list arrives over SSE and is
+  // not persisted here yet. Returning an array keeps the snapshot's shape stable
+  // so the client's `items` is never null.
+  return session.notebook === "" ? [] : [session.notebook];
+}

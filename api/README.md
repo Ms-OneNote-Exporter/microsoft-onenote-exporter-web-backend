@@ -19,16 +19,36 @@ that complete the flow are stubs returning 501.
 | Credential path primitives | done |
 | Cookie serialisation | done |
 | Signed orchestrator client | done |
-| `GET /api/public/version` | done |
-| `POST /api/session` | validates, then 501 |
-| `POST /api/session/credential` | frames and caps, then 501 |
-| `GET /api/session/status`, `/events` | not started |
-| `POST /api/session/erase`, `/notebooks` | not started |
-| `POST /api/export`, `/export/:id/abort` | not started |
+| SSE hub, ring buffer, replay, keepalive | done |
+| Rate limiter, three layers | done |
+| Erase state machine | done, needs runner half |
+| `GET /api/public/version`, `/healthz` | done |
+| `POST /api/session` | done |
+| `GET /api/session/status` | done |
+| `GET /api/session/events` | done |
+| `POST /api/session/credential` | framing + caps, then 501 |
+| `POST /api/session/notebooks` | guards, then 501 |
+| `POST /api/export`, `/export/:id/abort` | state recorded, then 501 |
+| `POST /api/session/erase` | machine runs, needs runner half |
+| `GET /files/:artifactId` | 501 — Caddy serves it via `forward_auth` |
 | Pool binding, claim-on-login, sweepers | not started |
 
-`npm test` → 256 tests. `npm run typecheck` clean under `exactOptionalPropertyTypes`
+`npm test` → 377 tests. `npm run typecheck` clean under `exactOptionalPropertyTypes`
 and `noUncheckedIndexedAccess`.
+
+## Routes that return 501
+
+Four of them, and none of them lies. Each returns a body naming what is missing:
+
+- `POST /api/session/credential` — needs the runner's address to stream to
+- `POST /api/session/notebooks` — runs a CLI in the runner
+- `POST /api/export` — spawns a CLI in the runner
+- `POST /api/session/erase` — needs the runner half of the machine
+
+A stub returning `{}` would look like a working route with an empty result. A 501
+says the flow is incomplete, and the guards ahead of it — CSRF, Origin, framing,
+the runner-bound check — all run first, so those properties hold even in the
+unwired state.
 
 ## Three things in here that are controls, not wiring
 

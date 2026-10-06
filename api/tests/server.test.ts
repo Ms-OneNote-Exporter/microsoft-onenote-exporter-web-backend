@@ -200,7 +200,10 @@ describe("cors", () => {
   });
 
   it("omits ACAO on a 500", async () => {
-    const failing = buildServer(config, deps);
+    // The boom route needs no session, so it is named in the exemption list.
+    // Without that it would 401 before it could throw, and the test would be
+    // asserting about a 401 instead.
+    const failing = buildServer(config, deps, { testOnlyAuthExemptPaths: ["/boom"] });
     // Force an internal failure: a route that throws. Registered before ready()
     // for the same reason as the probe route above.
     failing.get("/boom", async () => {
@@ -423,10 +426,13 @@ describe("csrf", () => {
       },
       payload: "hunter2",
     });
-    // inject sets content-length itself, so this is asserted by unit test in
-    // credential.test.ts; here the point is that a well-formed request passes
-    // framing and reaches the not-yet-wired handler.
-    expect([411, 501]).toContain(response.statusCode);
+    // inject computes content-length itself, so the missing-header case is a unit
+    // test in credential.test.ts. What is asserted here is that a well-formed,
+    // small credential passes framing and reaches the handler — where it is
+    // refused for a *different* reason: this session has no runner bound, so the
+    // password would have nowhere to go. 409, never 200 and never 501.
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toBe("no runner bound to this session");
   });
 });
 

@@ -56,6 +56,19 @@ COPY --from=build /app/dist ./dist
 # image — the mock accepts any password and reports success. The control is CI's
 # grep of dist/ for MockRunner and FakeOrchestrator; this comment is not it.
 
+# The database directory, created here with the right ownership.
+#
+# Load-bearing, and missing on the first deploy, where the api died with
+# `ERR_SQLITE_ERROR: unable to open database file`. Docker creates a fresh named
+# volume from the image's directory *and its ownership*, so a path that does not
+# exist in the image yields a root-owned volume — and this container runs as uid
+# 1000 (node), so SQLite cannot create its file inside it.
+#
+# Declaring the path in the image is the fix, rather than an entrypoint that
+# chowns as root and drops privileges: that would need the container to start as
+# root, which is exactly what §2.1 says this component does not do.
+RUN mkdir -p /srv/msout/data && chown -R node:node /srv/msout
+
 # ---- the zero-dependency invariant, checked in the image ------------------
 #
 # The orchestrator has zero third-party Go dependencies and the api has exactly

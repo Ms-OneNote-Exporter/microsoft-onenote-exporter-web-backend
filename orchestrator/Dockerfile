@@ -34,12 +34,32 @@ RUN if go list -m all | tail -n +2 | grep -q .; then \
       exit 1; \
     fi
 
+# The directory tree copied into the runtime image below. Built here because the
+# runtime stage has no shell to create it with.
+RUN mkdir -p /out/srv/artifacts /out/srv/vault
+
 # ---- runtime --------------------------------------------------------------
 # distroless/static has no shell and no package manager. The orchestrator never
 # execs anything, so there is no reason to ship the means to.
 FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=build /out/orchestrator /usr/local/bin/orchestrator
+
+# The artifact and vault roots, so a fresh named volume inherits their ownership.
+#
+# Same reasoning as the api's database directory, and the same failure otherwise:
+# Docker seeds a new named volume from the image's directory *and its ownership*, so
+# a path absent from the image produces a root-owned volume that a container
+# running as uid 65532 cannot write to.
+#
+# Built in the `build` stage and copied, NOT created with a RUN here: distroless has
+# no shell, so a `RUN mkdir` in this stage is the same class of bug as the one this
+# line exists to fix — a Dockerfile instruction that reads correctly and cannot
+# execute. `--chown` sets the ownership at copy time, so nothing needs root at
+# runtime.
+
+# `nonroot` is distroless's uid 65532, the same user the container runs as.
+COPY --from=build --chown=nonroot:nonroot /out/srv /srv
 
 # Non-root. The Docker socket is the privilege here, not the uid; running as
 # nonroot keeps everything else unprivileged (PLAN-v3 §2.1).

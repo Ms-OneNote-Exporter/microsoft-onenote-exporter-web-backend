@@ -127,6 +127,10 @@ services:
     build:
       context: ./api
       dockerfile: Dockerfile
+      args:
+        # The commit this image is, surfaced as `build` on /api/public/version.
+        # Set IMAGE_TAG to the commit and the two cannot drift.
+        BUILD_ID: ${IMAGE_TAG:?set IMAGE_TAG in .env - the commit this image is}
     image: ghcr.io/ms-one-note-exporter/msout-api:${IMAGE_TAG:-dev}
     networks:
       # msout-control only, and that is deliberate rather than incidental.

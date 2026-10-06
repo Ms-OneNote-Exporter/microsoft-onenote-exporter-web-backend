@@ -10,6 +10,22 @@
 # in the component that holds the session secret. See api/README.md.
 
 # ---- build ---------------------------------------------------------------
+# Which commit this image is. Injected by compose from IMAGE_TAG.
+#
+# mac's point, adopted: `build` on /api/public/version said "dev" on a live host
+# with a real TLS certificate, which is actively misleading rather than merely
+# untidy. A build identifier nobody chose is worse than none.
+#
+# No default. An unset BUILD_ID is a packaging mistake, and the resulting image
+# reports "local" — which is visibly wrong for a published image rather than
+# invisibly wrong.
+#
+# Declared before the first FROM, which is what makes it a build argument rather
+# than an instruction. It has to be *re-declared* inside the runtime stage before
+# use: a global ARG is only available to FROM lines, not to ENV or RUN. Putting the
+# ENV here instead fails the build with "no build stage in current context".
+ARG BUILD_ID
+
 FROM node:22.13.0-bookworm-slim AS build
 
 WORKDIR /app
@@ -35,6 +51,9 @@ RUN node -e "require('node:sqlite'); console.log('node:sqlite ok, unflagged')"
 
 # ---- runtime -------------------------------------------------------------
 FROM node:22.13.0-bookworm-slim AS runtime
+
+ARG BUILD_ID
+ENV BUILD_ID=${BUILD_ID}
 
 # The volume directory, created while this stage is still root and then handed to
 # the unprivileged user. It has to be *here*, before the first `USER node`: a RUN

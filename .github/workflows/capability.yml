@@ -65,6 +65,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: stamp the images with this commit
+        # `build` on /api/public/version is this value, and compose requires it.
+        # Taken from the checkout rather than pinned to a literal, so the stamp is
+        # the commit that is actually being tested.
+        run: echo "IMAGE_TAG=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
       - name: discover the host docker group
         # Not hardcoded. The first version pinned _DOCKER_GID to a literal, which is
         # right on a runner that happens to use that GID and silently wrong

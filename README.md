@@ -150,3 +150,33 @@ and MSAL alternatives are unavailable for this use case, with the upstream
 documentation as the source; §14 carries the licence position, including the
 note that the Microsoft Q&A page quoted as evidence is Microsoft's content and
 is not vendored here.
+
+## An assertion about the handler is not an assertion about the transport
+
+mac's sentence, after the third instance of this shape across the two repositories.
+
+| what the test asserted | what was actually broken |
+|---|---|
+| ACAO was **absent** for a foreign origin | it was absent for an **allowlisted** one too |
+| the credential route returned 202 and emitted `login-started` | the adapter received **zero bytes** |
+
+Both passed. Both were about the handler's behaviour, and both bugs were in the
+path between the client and the handler — a header the hook set and the route
+clobbered, and a stream wrapper that ended the body before it began.
+
+The pattern is not specific to either bug. A test that exercises a handler can only
+tell you what the handler did with what it was given; it cannot tell you whether it
+was given the right thing. For the places where data crosses a boundary you did not
+write — a proxy, a socket, a stream — that assertion has to be made against the
+boundary itself, over a real connection rather than an in-memory harness.
+
+Concretely, in this repository that has meant:
+
+  - SSE headers asserted over a **real socket**, because `app.inject` materialises
+    the response and cannot express a stream that does not end;
+  - the credential asserted as **buffer equality over a real socket**, because
+    `app.inject` materialises the request body before the handler runs, so the
+    race in `capStream` could not fire under it.
+
+Two of the three worst bugs in this project were invisible to a suite that had
+hundreds of green tests, and both were invisible for the same reason.

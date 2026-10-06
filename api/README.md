@@ -140,12 +140,15 @@ optional.
 `undici` moved from the scaffold's 7.3.0 to 8.11.2. 7.3.0 carries 23 advisories,
 including an HTTP request-smuggling issue and a `Set-Cookie` `SameSite` downgrade
 via permissive substring matching — the latter is directly relevant to a service
-whose cross-site cookie handling is load-bearing. `npm audit` is clean at 8.11.2.
+whose cross-site cookie handling is load-bearing. `npm audit --omit=dev` is clean
+with `undici` removed: it was declared but never imported, so it was a CVE
+surface and a version to track in the component that holds the session secret.
 
 SQLite is `node:sqlite` rather than `better-sqlite3`: a native addon means a
 compilation step and a prebuilt-binary supply chain in the component that holds
 the session secret. The cost is an experimental API, which is why `engines` pins
-`>=22.5`.
+`>=22.13.0` — the release where `node:sqlite` stopped being behind
+`--experimental-sqlite`, rather than the 22.5.0 release that introduced it.
 
 ## Two reconcilers, not one
 

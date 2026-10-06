@@ -369,24 +369,18 @@ export class SseHub {
 
   }
 
-/**
- * writeSseHeaders sets the headers an EventSource needs.
+/*
+ * There is deliberately no `writeSseHeaders(res: ServerResponse)` here any more.
  *
- * `X-Accel-Buffering: no` matters behind Caddy: without it a reverse proxy may
- * buffer the response and the stream arrives in one lump at close, which looks
- * exactly like a broken event stream.
+ * It took a raw ServerResponse and wrote headers with `res.writeHead(200, {...})`,
+ * which **replaces** the header set rather than merging into it — so it would have
+ * discarded the CORS headers the onRequest hook had already applied. It was unused
+ * by the route, and only reachable from a test, which is the most dangerous shape a
+ * helper can have: correct in the test, a live bug the moment someone wires it in.
+ *
+ * Streaming headers belong to the route, which owns Fastify's header store. See
+ * `/api/session/events` in routes.ts for the merge that actually works.
  */
-export function writeSseHeaders(res: ServerResponse): void {
-  res.writeHead(200, {
-    "content-type": "text/event-stream",
-    "cache-control": "no-store",
-    connection: "keep-alive",
-    "x-accel-buffering": "no",
-  });
-  // Nagle would coalesce small frames, so a log line and the next event would
-  // arrive together.
-  res.socket?.setNoDelay?.(true);
-}
 
 /**
  * parseLastEventId reads the resume point.

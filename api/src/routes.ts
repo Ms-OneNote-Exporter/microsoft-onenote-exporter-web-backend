@@ -847,6 +847,14 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
 
     // 204 rather than 200: Caddy only checks for a 2xx, and an empty body keeps
     // this endpoint from ever becoming a place a response body could leak.
+    //
+    // The header is the server-enforced half of §5's rule that a partial vault
+    // must not be mistakable for a complete one. Caddy copies it onto the
+    // download response, so the fact comes from the database rather than from a
+    // frontend that might forget to check.
+    if (owner.artifact_partial === 1) {
+      reply.header("X-Artifact-Partial", "1");
+    }
     return reply.code(204).send();
   });
 

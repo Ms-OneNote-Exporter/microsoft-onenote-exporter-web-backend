@@ -1,0 +1,235 @@
+# The whole stack.
+#
+# ## The host name is written down once
+#
+# `PUBLIC_HOST` in `.env` is the only place the domain appears. The api reads it as
+# `PUBLIC_ORIGIN`, and Caddy substitutes it into the site address, so changing the
+# domain is a single edit rather than a search for every spelling of it.
+#
+# The three places that must agree, when you do change it:
+#
+#   PUBLIC_HOST      here, in .env
+#   PUBLIC_ORIGIN    derived from it below, and read by the api
+#   VITE_API_ORIGIN  mac's frontend build — he is told separately
+#
+# ## What is deployed, and what is not
+#
+# This file describes three services: caddy, api, orchestrator. The **runner
+# service does not exist yet** — it depends on `@msout/*` packages that are not
+# published (§12 steps 1–2), and `msout-runner` is declared below with no service
+# attached so the network exists to be documented. Do not read this file as a
+# working deployment; see infra/README.md.
+
+name: msout
+
+x-restart: &restart
+  restart: unless-stopped
+
+# ---- networks ---------------------------------------------------------------
+
+networks:
+  # The control plane. `internal: true` is the single most consequential word in
+  # this file: it means these services have **no route to the internet**. The
+  # orchestrator talks only to the Docker socket, which is not a network, so it
+  # needs no egress — and §2.1 forbids it having any.
+  #
+  # CI asserts this. A network declared without `internal: true` still works, so
+  # nothing would fail; it would just quietly let the orchestrator reach the
+  # internet, which is the thing the whole component split exists to prevent.
+  msout-control:
+    internal: true
+
+  # The edge. Caddy is the only member, and it is the only service that needs to be
+  # reachable from outside.
+  msout-edge: {}
+
+  # ---- KNOWN GAP, NOT AN OMISSION -------------------------------------------
+  #
+  # `msout-runner` is declared with NO egress enforcement, because Docker Compose
+  # cannot enforce egress. Declaring it anyway is the honest choice: a reviewer
+  # reading this file sees the gap, where omitting the network would let a runner
+  # reach the internet with nobody having mentioned it. mac's argument, and he is
+  # right — a comment in the file survives; a comment in a PR description does not.
+  #
+  # Accurate caveat, because this is easy to overclaim: while no service joins
+  # the network, `docker compose config` **prunes it**. It does not appear in the
+  # resolved config and enforces nothing. It is documentation today, and becomes a
+  # real network the moment the runner attaches. The comment here is what a
+  # reviewer reads in the meantime.
+  #
+  # When the runner lands it needs egress to login.microsoft.com and
+  # graph.microsoft.com and nothing else. That requires either a firewall rule on
+  # the host or `network_mode` with a dedicated netns. **This is an open item, not
+  # a solved one.**
+  msout-runner: {}
+
+# ---- secrets ----------------------------------------------------------------
+
+secrets:
+  # Files, never environment variables. An env var is visible in `docker inspect`,
+  # in `/proc/<pid>/environ`, and to anything that can read the container's config —
+  # including a container that has no business knowing the value.
+  #
+  # The files are created by the operator; see .env.example and infra/README.md.
+  csrf_key:
+    file: ${SECRETS_DIR:-./secrets}/csrf_key
+  orchestrator_hmac_secret:
+    file: ${SECRETS_DIR:-./secrets}/orchestrator_hmac_secret
+
+# ---- services ---------------------------------------------------------------
+
+services:
+  caddy:
+    <<: *restart
+    image: caddy:2.10-alpine
+    networks:
+      - msout-edge
+      - msout-control
+    ports:
+      # 80 and 443 only. Nothing else in the stack has a published port, which is
+      # what makes the capability assertions meaningful: the api is unreachable
+      # from the host, let alone from the internet.
+      - "80:80"
+      - "443:443"
+      # 443/udp for HTTP/3. Optional; commented out because it doubles the
+      # certificate path for no benefit on a single-origin site.
+      # - "443:443/udp"
+    environment:
+      # The one knob. See the header.
+      PUBLIC_HOST: ${PUBLIC_HOST:?set PUBLIC_HOST in .env - the api's public host name}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    volumes:
+      - ./infra/Caddyfile:/etc/caddy/Caddyfile:ro
+      # TLS material. Named volume rather than a bind so the host path is not a
+      # thing an operator has to create with the right ownership.
+      - caddy-data:/data
+      - caddy-config:/config
+    # Caddy reads its config and serves files. It gets no docker socket, no host
+    # tree, and no secrets: it makes no authorisation decision of its own, only
+    # relays one the api made.
+    cap_drop:
+      - ALL
+    cap_add:
+      # Binding 80/443 needs NET_BIND_SERVICE. Nothing else is granted.
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      # Caddy's own answer, not the api's: this probes the proxy, and a healthy
+      # proxy pointing at a dead api is not a healthy proxy.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  api:
+    <<: *restart
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    image: ghcr.io/ms-one-note-exporter/msout-api:${IMAGE_TAG:-dev}
+    networks:
+      # msout-control only, and that is deliberate rather than incidental.
+      #
+      # Caddy is on msout-control too, so it can reach the api without the api
+      # being on the edge network. That keeps `msout-edge` a single-member network
+      # holding only the process that terminates TLS — so "the api is unreachable
+      # from outside" becomes a consequence of the topology rather than of
+      # remembering not to publish a port.
+      #
+      # What the api must NOT have is a published port, and it has none.
+      - msout-control
+    environment:
+      # Derived from the single knob. https, because in production the cookie is
+      # `__Host-` and therefore Secure-only.
+      PUBLIC_ORIGIN: https://${PUBLIC_HOST:?set PUBLIC_HOST in .env}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?set the exact frontend origin(s), comma separated}
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-12}
+      MIN_FREE_DISK_MB: ${MIN_FREE_DISK_MB:-2048}
+      ORCHESTRATOR_URL: http://orchestrator:9100
+      DATABASE_PATH: /srv/msout/data/api.db
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+
+      # Secrets as file *paths*. The env vars carry paths, not values — see the
+      # `secrets` block above for why the distinction matters.
+      CSRF_KEY_FILE: /run/secrets/csrf_key
+      ORCHESTRATOR_HMAC_SECRET_FILE: /run/secrets/orchestrator_hmac_secret
+    secrets:
+      - csrf_key
+      - orchestrator_hmac_secret
+    volumes:
+      # The SQLite database. Named volume, so the host path is not an operator
+      # chore and the ownership is already right for the non-root user.
+      - api-data:/srv/msout/data
+    # The api holds no Docker socket, no vault mount and no egress (§2.1). The
+    # networks reflect that: it is on msout-control for the orchestrator call and
+    # on msout-edge only so Caddy can reach it — neither of which is a route to
+    # the internet, because Caddy is the only member of msout-edge.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+
+  orchestrator:
+    <<: *restart
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    image: ghcr.io/ms-one-note-exporter/msout-orchestrator:${IMAGE_TAG:-dev}
+    networks:
+      # msout-edge deliberately absent: the orchestrator is not reachable from
+      # outside at all, and has no reason to be.
+      - msout-control
+    environment:
+      ORCHESTRATOR_HMAC_SECRET_FILE: /run/secrets/orchestrator_hmac_secret
+      # No PUBLIC_HOST, no ALLOWED_ORIGINS, no CSRF key. The orchestrator is not a
+      # component that should know any of them, and its absence here is a property
+      # rather than an omission — CI asserts the runner image sees no session
+      # secret, and this is the same idea one step earlier.
+      POOL_SIZE: ${POOL_SIZE:-2}
+      RUNNER_TTL_SECONDS: ${RUNNER_TTL_SECONDS:-300}
+    secrets:
+      - orchestrator_hmac_secret
+    volumes:
+      # The ONLY docker socket in the stack. This is the entire reason the
+      # orchestrator is a separate component: it is the only process whose
+      # compromise would mean container creation, so it is the only process that
+      # gets the socket.
+      #
+      # Read-write is required — Docker has no read-only socket mode, and a
+      # container engine that cannot create containers cannot manage a pool. This
+      # is the sharpest edge in the deployment and it is why §2.1 gives the
+      # orchestrator no egress at all.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - artifacts:/srv/msout/artifacts
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/orchestrator", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ---- THE RUNNER IS NOT HERE -----------------------------------------------
+  #
+  # It depends on `@msout/*` packages that are not published, so a runner service
+  # would be a container that starts, fails, and looks like a deployment. When
+  # steps 1–2 land, add a service on `msout-runner` with:
+  #
+  #   - no secrets (only the orchestrator has the HMAC secret)
+  #   - no CSRF key, no session secret, and neither in its environment
+  #   - no bind mounts at all
+  #
+  # The capability tests in .github/workflows/capability.yml assert exactly those
+  # three things and will fail loudly if the service grows a capability.
+
+volumes:
+  api-data:
+  artifacts:
+  caddy-data:
+  caddy-config:

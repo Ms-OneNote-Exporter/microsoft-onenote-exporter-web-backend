@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+.npm/
+
+# Build output. Nothing generated is committed: a stale copy in the tree can
+# disagree with the source it was built from, which is a supply-chain problem
+# (PLANNING/PLAN-v3.md §12.5) and not a tidiness one.
+api/dist/
+runner/dist/
+orchestrator/dist/
+shared/dist/
+
+# Live session state. This is where auth.json (a Playwright storageState, i.e.
+# live Microsoft cookies), exported notebooks and runner logs land. It must
+# never be committed.
+data/
+vault/
+artifacts/
+
+# A stray auth.json anywhere is a credential leak, not a large file. Keep this
+# rule even though the trees above are already ignored: it is the backstop for
+# a path that has not been created yet.
+auth.json
+auth-file.json
+*.storageState.json
+
+# Local env. Holds the api->orchestrator HMAC secret and the session secret
+# material. Never committed.
+.env
+.env.local
+*.env
+!.env.example
+
+# Playwright / OS noise
+.DS_Store
+*.log
+
+# review scratch
+reviews/
+
+# Loose plan drafts at the repo root are personal. The published design docs
+# live in PLANNING/ and are tracked - they are cited by section number from
+# the code, so a reader needs them.
+PLAN*.md
+!PLANNING/PLAN*.md

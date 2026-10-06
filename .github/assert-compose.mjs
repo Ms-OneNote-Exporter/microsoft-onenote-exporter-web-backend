@@ -192,7 +192,37 @@ for (const svc of Object.keys(services)) {
   }
 }
 
-// 7. The api is not root and holds no extra capabilities.
+// 7. Each service names the secret variable its own code actually reads.
+//
+// Both components read the same file under different variable names: the api uses
+// ORCHESTRATOR_HMAC_SECRET_FILE, the orchestrator uses ORCH_HMAC_SECRET_FILE. The
+// orchestrator was given the api's name, so the secret never arrived and it
+// refused to start — reported by Docker only as "unhealthy", with the real reason
+// sitting in a log nobody was reading during a first deploy.
+//
+// No test on either side could have caught it, because each mocks the other
+// component. This is the same shape as a CMD naming a file that was never
+// written: two correctly-implemented halves disagreeing about one string.
+//
+// Asserted here, in the file that wires them, because that is the only place both
+// names are visible at once.
+const SECRET_VAR_BY_SERVICE = {
+  api: "CSRF_KEY_FILE",
+  orchestrator: "ORCH_HMAC_SECRET_FILE",
+};
+
+for (const [svc, expected] of Object.entries(SECRET_VAR_BY_SERVICE)) {
+  const env = services[svc]?.environment ?? {};
+  const present = Object.keys(env).filter((k) => k.endsWith("_FILE"));
+  check(
+    expected in env,
+    `${svc} reads its secret from ${expected}`,
+    `${svc} does not set ${expected}, which is what its own config reads ` +
+      `(it sets: ${present.join(", ") || "nothing"})`,
+  );
+}
+
+// 8. The api is not root and holds no extra capabilities.
 //
 // A `USER` directive does not survive `docker compose config` — it lives in the
 // image — so this is checked where it is actually true, in the Dockerfile, by CI

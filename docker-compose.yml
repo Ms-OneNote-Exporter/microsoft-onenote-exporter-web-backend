@@ -184,7 +184,16 @@ services:
       # outside at all, and has no reason to be.
       - msout-control
     environment:
-      ORCHESTRATOR_HMAC_SECRET_FILE: /run/secrets/orchestrator_hmac_secret
+      # `ORCH_`-prefixed, which is the orchestrator's own namespace and not the
+      # api's. It previously read `ORCHESTRATOR_HMAC_SECRET_FILE`, which is the
+      # name the *api* uses, so the secret never arrived and the orchestrator
+      # refused to start with "HMAC secret is absent or empty" — while Docker
+      # reported the container as merely unhealthy.
+      #
+      # Two components sharing a secret file but not a variable name is a
+      # reasonable design; it just has to be spelled correctly, and nothing in
+      # either test suite could have caught it because both mock the other side.
+      ORCH_HMAC_SECRET_FILE: /run/secrets/orchestrator_hmac_secret
       # No PUBLIC_HOST, no ALLOWED_ORIGINS, no CSRF key. The orchestrator is not a
       # component that should know any of them, and its absence here is a property
       # rather than an omission — CI asserts the runner image sees no session

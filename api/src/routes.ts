@@ -25,7 +25,8 @@ import type { OrchestratorClient } from "./orchestrator-client.js";
 import type { SseHub } from "./sse.js";
 import type { RateLimiter } from "./rate-limit.js";
 import { API_BUILD, PROTOCOL_VERSION, buildSnapshot } from "./auth.js";
-import { csrfCookie, serialiseCookie, sessionCookie } from "./cookies.js";
+import { serialiseCookie, sessionCookie } from "./cookies.js";
+import { header as headerValue } from "./server.js";
 import {
   deriveCsrfToken,
   generateArtifactId,
@@ -117,7 +118,11 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
   // Exempt from the authentication hook, because there is no session yet. The
   // hook skips it by exact path.
   app.post("/api/session", async (request, reply) => {
-    const origin = request.headers.origin;
+    // Through `header()`, not `request.headers.origin` directly. A repeated
+    // Origin arrives as `string[]`, and `has(array)` is false — which fails
+    // closed but disagrees with the deliberate repeated-header handling in the
+    // hook. mac caught the inconsistency.
+    const origin = headerValue(request, "origin");
     if (origin !== undefined && !config.allowedOrigins.has(origin)) {
       return reply.code(403).send({ error: "forbidden" });
     }
@@ -170,14 +175,15 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
       if (existing.secret_hash !== hashSecret(secret)) {
         return reply.code(401).send({ error: "unauthorised" });
       }
-      const csrfToken = existing.csrf_key ?? generateCsrfKey();
+      const existingToken =
+        existing.csrf_key === null ? "" : deriveCsrfToken(existing.csrf_key, guid);
       return reply
         .code(200)
-        .header("set-cookie", [
-          serialiseCookie(sessionCookie(`${guid}:${secret}`, ttlSeconds)),
-          serialiseCookie(csrfCookie(csrfToken, ttlSeconds)),
-        ])
-        .send({ protocol: PROTOCOL_VERSION });
+        .header("set-cookie", [serialiseCookie(sessionCookie(`${guid}:${secret}`, ttlSeconds))])
+        // The token comes back in the body, not in a readable cookie. See the
+        // file header in cookies.ts for why: the frontend is on a different host,
+        // so `document.cookie` there cannot see a cookie set by this origin.
+        .send({ protocol: PROTOCOL_VERSION, csrfToken: existingToken });
     }
 
     const csrfKey = generateCsrfKey();
@@ -201,17 +207,22 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
 
     deps.sse.emit(guid, "session-status", { state: "created" });
 
-    // The CSRF token is derived rather than random, so there is no server-side
-    // token table to keep consistent with the session table (PLAN-v3 §3.3).
+    // Derived rather than random, so there is no server-side token table to keep
+    // consistent with the session table (PLAN-v3 §3.3).
     const csrfToken = deriveCsrfToken(csrfKey, guid);
 
     return reply
       .code(201)
-      .header("set-cookie", [
-        serialiseCookie(sessionCookie(`${guid}:${secret}`, ttlSeconds)),
-        serialiseCookie(csrfCookie(csrfToken, ttlSeconds)),
-      ])
-      .send({ protocol: PROTOCOL_VERSION, expiresAt: new Date(expiresAt).toISOString() });
+      // One cookie, not two. The CSRF token travels in the body because a cookie
+      // set by this origin is invisible to `document.cookie` on the frontend's
+      // host — see the file header in cookies.ts. mac found this during review:
+      // every mutating route 403'd on a token no page could read.
+      .header("set-cookie", [serialiseCookie(sessionCookie(`${guid}:${secret}`, ttlSeconds))])
+      .send({
+        protocol: PROTOCOL_VERSION,
+        expiresAt: new Date(expiresAt).toISOString(),
+        csrfToken,
+      });
   });
 
   // ---- GET /api/session/status -------------------------------------------
@@ -229,7 +240,17 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
       items: notebooksFor(session),
     });
 
-    return reply.send(snapshot);
+    // The CSRF token comes back on every mount, not just at creation. This is
+    // what replaces the readable cookie across the split: §7.5's restore flow
+    // calls this endpoint on mount anyway, so the frontend re-arms its header from
+    // here after a refresh, when its in-memory copy is gone.
+    //
+    // Safe because CORS is not reflection: an attacker page can cause this request
+    // — the SameSite=None session cookie rides along — but cannot read the
+    // response, because ACAO is emitted only for an allowlisted origin.
+    const csrfToken = deriveCsrfToken(session.csrf_key ?? "", session.guid);
+
+    return reply.send({ ...snapshot, csrfToken });
   });
 
   // ---- GET /api/session/events -------------------------------------------
@@ -517,6 +538,7 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
       notebook,
       JSON.stringify({
         state: "queued",
+        partialReason: null,
         id: exportId,
         notebook,
         progress: { pages: 0, sections: 0, assets: 0 },
@@ -569,6 +591,8 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
       `UPDATE sessions SET export_state = ? WHERE guid = ?`,
       JSON.stringify({
         state: "partial",
+        // mac's pushback: "you stopped this" is false for a quota or disk abort.
+        partialReason: "aborted",
         id,
         notebook: session.notebook,
         progress: null,

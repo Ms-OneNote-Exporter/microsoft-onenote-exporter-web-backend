@@ -235,11 +235,20 @@ describe("runErase", () => {
 
 describe("expireCookieHeaders", () => {
   // T7: erase must invalidate the server row AND expire the cookie.
-  it("expires both cookies", () => {
+  it("expires the session cookie", () => {
     const headers = expireCookieHeaders();
-    expect(headers).toHaveLength(2);
+    expect(headers).toHaveLength(1);
     expect(headers[0]).toContain("__Host-msout=");
-    expect(headers[1]).toContain("msout_csrf=");
+  });
+
+  it("expires nothing for CSRF, because the token is not in a cookie", () => {
+    // The token lives in response bodies and in the frontend's memory. It stops
+    // validating when the row is deleted, because the per-session key it derives
+    // from is destroyed with the row — so there is nothing for the browser to
+    // clear, and nothing that could survive an erase.
+    for (const header of expireCookieHeaders()) {
+      expect(header).not.toContain("msout_csrf");
+    }
   });
 
   it("uses Max-Age=0 and a past Expires, because a browser may honour only one", () => {
@@ -252,18 +261,14 @@ describe("expireCookieHeaders", () => {
   // An expired cookie that drops HttpOnly or SameSite may not match the original,
   // leaving the real one in place.
   it("keeps the attributes so the browser matches and replaces the cookie", () => {
-    const [session, csrf] = expireCookieHeaders();
+    const [session] = expireCookieHeaders();
     expect(session).toContain("HttpOnly");
     expect(session).toContain("Secure");
     expect(session).toContain("SameSite=None");
     expect(session).toContain("Path=/");
-    expect(csrf).toContain("Secure");
-    expect(csrf).toContain("SameSite=None");
-    // The CSRF cookie stays readable, because that is what it is for.
-    expect(csrf).not.toContain("HttpOnly");
   });
 
-  it("emits no Domain attribute on either", () => {
+  it("emits no Domain attribute", () => {
     for (const header of expireCookieHeaders()) {
       expect(header).not.toMatch(/domain/i);
     }

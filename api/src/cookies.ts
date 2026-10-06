@@ -18,14 +18,32 @@
  *              check is not optional here.
  *   Path=/      required by the prefix.
  *
- * The CSRF cookie is the deliberate exception: it must be readable by
- * JavaScript, because the browser echoes it in a header. It carries no authority
- * on its own — possessing it proves nothing without also holding the session
- * cookie, and the header value is verified against a token derived from a
- * per-session key the browser never sees.
+ * There is deliberately no second, readable cookie.
+ *
+ * The obvious way to hand a CSRF token to JavaScript is a non-HttpOnly cookie the
+ * page reads with `document.cookie`. That works when the page and the API share
+ * an origin. They do not — the frontend is Component A and this is Component B,
+ * on a different host (§1.1). A cookie set here is scoped to *this* host with no
+ * `Domain`, so the frontend's `document.cookie` never returns it, and every
+ * mutating route would 403 with a token nobody can read. mac found this during
+ * review; §3.3's "delivered in a readable cookie" is a single-origin assumption
+ * that the split invalidated.
+ *
+ * The token is returned in the response *body* instead, from the two responses
+ * the frontend already reads: `POST /api/session` at creation and
+ * `GET /api/session/status` on every mount, which is what §7.5's restore flow
+ * calls anyway. That is safe because a cross-origin reader is blocked by CORS —
+ * `corsHeaders` emits ACAO only for an allowlisted origin, so an attacker page can
+ * cause the request (the `SameSite=None` cookie rides along) but cannot read the
+ * response. It carries no authority on its own: without the `HttpOnly` session
+ * cookie it is worth nothing.
+ *
+ * So the split costs a cookie and gains one fewer thing to reason about — no
+ * `Domain` scope, no sibling-subdomain readability question, and no question
+ * about whether the two origins share a registrable domain at all.
  */
 
-import { CSRF_COOKIE, SESSION_COOKIE } from "./csrf.js";
+import { SESSION_COOKIE } from "./csrf.js";
 
 /** Cookie attributes, as a name/value pair plus flags. */
 export interface CookieSpec {
@@ -63,25 +81,6 @@ export function sessionCookie(value: string, maxAgeSeconds: number): CookieSpec 
 }
 
 /**
- * csrfCookie returns the spec for the CSRF token cookie.
- *
- * `httpOnly: false` is required and is the reason this cookie exists as a
- * separate thing: the browser has to read it to put it in a header.
- */
-export function csrfCookie(value: string, maxAgeSeconds: number): CookieSpec {
-  return {
-    name: CSRF_COOKIE,
-    value,
-    httpOnly: false,
-    secure: true,
-    sameSite: "None",
-    path: "/",
-    expires: null,
-    maxAge: maxAgeSeconds,
-  };
-}
-
-/**
  * expiredSessionCookie returns a spec that deletes the session cookie.
  *
  * PLAN-v3 T7 and §11: erase must invalidate the server row **and** expire the
@@ -91,26 +90,17 @@ export function csrfCookie(value: string, maxAgeSeconds: number): CookieSpec {
  *
  * `Max-Age=0` and a past `Expires` are both emitted, because a browser that
  * ignores one of them will honour the other.
+ *
+ * There is no CSRF counterpart: the token lives in the frontend's memory and in
+ * response bodies, never in a cookie, so there is nothing to expire. The token
+ * stops validating the moment the row is gone, because the per-session key it is
+ * derived from is destroyed with it.
  */
 export function expiredSessionCookie(): CookieSpec {
   return {
     name: SESSION_COOKIE,
     value: "",
     httpOnly: true,
-    secure: true,
-    sameSite: "None",
-    path: "/",
-    expires: 0,
-    maxAge: 0,
-  };
-}
-
-/** expiredCsrfCookie returns a spec that deletes the CSRF cookie. */
-export function expiredCsrfCookie(): CookieSpec {
-  return {
-    name: CSRF_COOKIE,
-    value: "",
-    httpOnly: false,
     secure: true,
     sameSite: "None",
     path: "/",
@@ -145,8 +135,7 @@ export function serialiseCookie(spec: CookieSpec): string {
  * Written by hand rather than pulled in, because a cookie parser is the kind of
  * dependency that comes with a prototype-pollution advisory history and this
  * service has no use for one. Values are percent-decoded, which is required
- * because the session secret and the CSRF token are base64url and may arrive
- * quoted.
+ * because the session secret is base64url and may arrive quoted.
  *
  * A malformed pair is skipped rather than throwing: one bad cookie should not
  * fail a request that also carries a valid session.

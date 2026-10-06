@@ -350,12 +350,37 @@ describe("parseExportState", () => {
     const parsed = parseExportState(JSON.stringify({ state: "queued" }));
     expect(parsed).toEqual({
       state: "queued",
+      partialReason: null,
       id: null,
       notebook: null,
       progress: null,
       startedAt: null,
       finishedAt: null,
     });
+  });
+
+  // mac's pushback: "you stopped this export" is factually false when the disk
+  // or the quota is what stopped it, and it sends the user hunting for something
+  // they did not do.
+  it("keeps a recognised partialReason", () => {
+    for (const reason of ["aborted", "quota", "disk"] as const) {
+      const parsed = parseExportState(
+        JSON.stringify({ state: "partial", partialReason: reason }),
+      );
+      expect(parsed?.partialReason).toBe(reason);
+    }
+  });
+
+  it("drops an unrecognised partialReason rather than passing it through", () => {
+    // A stored value outside the union would put the client in a state it has no
+    // rendering for, and `partial` with an unknown reason is the one case where
+    // guessing a message would be wrong.
+    for (const bad of ["cancelled", "", 42, null, "unknown"]) {
+      const parsed = parseExportState(
+        JSON.stringify({ state: "partial", partialReason: bad }),
+      );
+      expect(parsed?.partialReason).toBeNull();
+    }
   });
 
   it("returns null when the state key is absent or not a string", () => {

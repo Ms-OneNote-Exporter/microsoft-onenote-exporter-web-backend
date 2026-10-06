@@ -1,14 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { CSRF_COOKIE, SESSION_COOKIE } from "../src/csrf.js";
+import { SESSION_COOKIE } from "../src/csrf.js";
 import {
-  csrfCookie,
-  expiredCsrfCookie,
   expiredSessionCookie,
   getCookie,
   parseCookies,
   serialiseCookie,
   sessionCookie,
 } from "../src/cookies.js";
+import { expireCookieHeaders } from "../src/erase.js";
 
 /**
  * PLAN-v3 §3.3 layer 4 and T-C5. The attribute set is asserted individually
@@ -60,25 +59,16 @@ describe("sessionCookie", () => {
   });
 });
 
-describe("csrfCookie", () => {
-  const spec = csrfCookie("token-value", TWELVE_HOURS);
-
-  it("is readable by JavaScript, which is the whole point of it", () => {
-    // The browser has to read it to echo it in a header.
-    expect(spec.httpOnly).toBe(false);
-  });
-
-  it("is still Secure, SameSite=None and Path=/", () => {
-    expect(spec.secure).toBe(true);
-    expect(spec.sameSite).toBe("None");
-    expect(spec.path).toBe("/");
-  });
-
-  it("does not use the __Host- prefix, because it is readable and has no Domain either", () => {
-    // Both are fine; what matters is that it carries no Domain, which the specs
-    // structurally cannot.
-    expect(spec.name).toBe(CSRF_COOKIE);
-    expect(serialiseCookie(spec)).not.toMatch(/domain/i);
+// mac's blocking review finding, and the reason this suite has no CSRF cookie
+// tests: a cookie set by the API origin is scoped to that origin, so
+// `document.cookie` on the frontend's different host never sees it. The token
+// travels in the response body instead — see cookies.ts.
+describe("csrf delivery", () => {
+  it("sets exactly one cookie, the session cookie", () => {
+    // The blocker was that both cookies were asserted *present*, which is true
+    // and useless. What had to be asserted is that the frontend can obtain the
+    // token at all — see routes.test.ts, which does the full round trip.
+    expect(serialiseCookie(sessionCookie("v", TWELVE_HOURS))).toContain(SESSION_COOKIE);
   });
 });
 
@@ -95,13 +85,14 @@ describe("expiry", () => {
     expect(header).toMatch(/Expires=Thu, 01 Jan 1970/);
   });
 
-  it("expires the csrf cookie too", () => {
-    const header = serialiseCookie(expiredCsrfCookie());
-    expect(header).toContain("Max-Age=0");
-    expect(header).toContain(`${CSRF_COOKIE}=`);
+  // There is no CSRF cookie to expire: the token lives in response bodies and in
+  // the frontend's memory, and stops validating when the row is deleted because
+  // the per-session key it derives from is destroyed with the row.
+  it("expires nothing else, because there is nothing else in the jar", () => {
+    expect(expireCookieHeaders()).toHaveLength(1);
   });
 
-  it("keeps the expired cookies' attributes, so the browser matches and replaces them", () => {
+  it("keeps the expired cookie's attributes, so the browser matches and replaces it", () => {
     // An expired cookie that drops SameSite or Path may not match the original,
     // leaving it in place.
     const spec = expiredSessionCookie();
@@ -186,10 +177,8 @@ describe("parseCookies", () => {
 });
 
 describe("getCookie", () => {
-  it("finds the session cookie", () => {
-    const header = `${CSRF_COOKIE}=tok; ${SESSION_COOKIE}=sec`;
-    expect(getCookie(header, SESSION_COOKIE)).toBe("sec");
-    expect(getCookie(header, CSRF_COOKIE)).toBe("tok");
+  it("finds the session cookie among others", () => {
+    expect(getCookie(`other=1; ${SESSION_COOKIE}=sec; more=2`, SESSION_COOKIE)).toBe("sec");
   });
 
   it("returns undefined for a missing cookie", () => {

@@ -25,7 +25,7 @@
 
 import type { Db, SessionRow } from "./db.js";
 import type { SseHub } from "./sse.js";
-import { expiredCsrfCookie, expiredSessionCookie, serialiseCookie } from "./cookies.js";
+import { expiredSessionCookie, serialiseCookie } from "./cookies.js";
 
 /** Where a step in the machine got to. Recorded so a retry knows what is left. */
 export type EraseStep =
@@ -228,11 +228,15 @@ export async function runErase(deps: EraseDeps, sessionId: string): Promise<Eras
  * Both orders are therefore correct: cookie-then-machine and machine-then-cookie.
  */
 export function expireCookieHeaders(): string[] {
-  // Composed from the cookie specs rather than written out here, so the two paths
+  // One cookie, not two. The CSRF token is not in a cookie at all — it travels in
+  // response bodies and lives in the frontend's memory, so there is nothing for
+  // the browser to clear. It stops validating the moment the row is gone, because
+  // the per-session key it derives from is destroyed with the row.
+  //
+  // Composed from the cookie spec rather than written out here, so the two paths
   // cannot drift: an expired cookie that drops HttpOnly or SameSite may not match
-  // the original, leaving it in place. See cookies.ts for why each attribute is
-  // what it is.
-  return [serialiseCookie(expiredSessionCookie()), serialiseCookie(expiredCsrfCookie())];
+  // the original, leaving it in place.
+  return [serialiseCookie(expiredSessionCookie())];
 }
 
 /**

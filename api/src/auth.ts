@@ -164,6 +164,17 @@ export interface SessionSnapshot {
   };
   readonly export: {
     readonly state: "none" | "queued" | "running" | "done" | "partial" | "failed";
+    /**
+     * Why a partial export stopped, or null when it did not.
+     *
+     * `partial` alone is not enough to render honestly. mac's point: telling a
+     * user "you stopped this export" is factually false when the quota or the
+     * disk filled up, and it sends them hunting for something they did not do.
+     * This separates the two so the message can match the cause — and the
+     * difference between "try again" and "free some space and try again" is the
+     * whole point of telling them.
+     */
+    readonly partialReason: "aborted" | "quota" | "disk" | null;
     readonly id: string | null;
     readonly notebook: string | null;
     readonly progress: { pages: number; sections: number; assets: number } | null;
@@ -181,6 +192,8 @@ export interface SessionSnapshot {
 /** Stored export state, as JSON in the session row. */
 export interface StoredExportState {
   state: SessionSnapshot["export"]["state"];
+  /** See SessionSnapshot.export.partialReason. */
+  partialReason: "aborted" | "quota" | "disk" | null;
   id: string | null;
   notebook: string | null;
   progress: { pages: number; sections: number; assets: number } | null;
@@ -230,6 +243,7 @@ export function buildSnapshot(
     },
     export: {
       state: exportState?.state ?? "none",
+      partialReason: exportState?.partialReason ?? null,
       id: exportState?.id ?? null,
       notebook: exportState?.notebook ?? null,
       progress: exportState?.progress ?? null,
@@ -287,6 +301,15 @@ export function parseExportState(raw: string | null): StoredExportState | null {
     if (typeof parsed.state !== "string") return null;
     return {
       state: parsed.state,
+      // Validated rather than trusted. A stored value outside the union would put
+      // the client in a state it has no rendering for, and `partial` with an
+      // unknown reason is the one case where guessing a message would be wrong.
+      partialReason:
+        parsed.partialReason === "aborted" ||
+        parsed.partialReason === "quota" ||
+        parsed.partialReason === "disk"
+          ? parsed.partialReason
+          : null,
       id: parsed.id ?? null,
       notebook: parsed.notebook ?? null,
       progress: parsed.progress ?? null,

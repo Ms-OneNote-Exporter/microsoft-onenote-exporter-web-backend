@@ -210,12 +210,20 @@ jobs:
           set -euo pipefail
           # Probed with the api's own runtime rather than a helper image, so this
           # asserts about the api as deployed.
-          if docker compose exec -T api node -e '
+          # The script exits non-zero if it REACHES the internet, so `set -e` turns
+          # a failure to isolate into a red step.
+          #
+          # Written as a bare call rather than an if/else because the first version
+          # had the branches the wrong way round: it exited 1 when the api was
+          # correctly blocked and 0 when it reached out. An inverted assertion is
+          # worse than a missing one — it is not merely silent, it is actively
+          # reporting the opposite of the truth.
+          docker compose exec -T api node -e '
             fetch("https://example.com", { signal: AbortSignal.timeout(8000) })
-              .then(() => { console.error("the api reached the internet"); process.exit(1); })
-              .catch(() => process.exit(0));
-          '; then :; else echo "T-N1/T-N4 ok"; exit 0; fi
-          exit 1
+              .then(() => { console.error("FAIL: the api reached the internet"); process.exit(1); })
+              .catch((e) => { console.log("blocked:", e.cause ? e.cause.code : e.message); process.exit(0); });
+          '
+          echo "T-N1/T-N4 ok: the api cannot reach the internet"
 
       - name: the orchestrator cannot reach the internet either
         # §2.1 says the orchestrator has no egress. It has no shell and no curl by

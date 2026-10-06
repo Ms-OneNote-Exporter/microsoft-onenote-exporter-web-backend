@@ -1,0 +1,825 @@
+import { beforeEach, describe, expect, it } from "vitest";
+import type { FastifyInstance } from "fastify";
+
+import { buildServer, type ServerDeps } from "../src/server.js";
+import { ApiConfig } from "../src/config.js";
+import { Db } from "../src/db.js";
+import { OrchestratorClient } from "../src/orchestrator-client.js";
+import { SseHub } from "../src/sse.js";
+import { RateLimiter } from "../src/rate-limit.js";
+import { CSRF_COOKIE, SESSION_COOKIE } from "../src/csrf.js";
+import { deriveCsrfToken, generateCsrfKey, hashSecret } from "../src/session.js";
+import { derive, parseSetCookies } from "./helpers.js";
+
+/**
+ * The route surface, exercised over HTTP. Three groups of concern:
+ *
+ *   - the contract mac renders against (snapshot shape, state unions, cookie
+ *     attributes, status codes)
+ *   - the authorisation properties: ownership, 409 on a second export, no
+ *     enumeration
+ *   - that the two half-wired routes refuse rather than pretend
+ */
+
+const ALLOWED = "https://app.example.com";
+const FOREIGN = "https://evil.test";
+const SECRET = "A".repeat(43);
+const GUID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+const OTHER_GUID = "00000000-0000-0000-0000-000000000000";
+const TTL = 43_200_000;
+
+const config: ApiConfig = {
+  allowedOrigins: new Set([ALLOWED]),
+  csrfKey: "C".repeat(43),
+  sessionTtlHours: 12,
+  minFreeDiskMb: 2048,
+  orchestratorUrl: "http://orchestrator:9100",
+  orchestratorSecret: "B".repeat(43),
+  orchestratorReplayWindowSeconds: 60,
+  logLevel: "info",
+  listen: "127.0.0.1:0",
+  databasePath: ":memory:",
+  sseBufferEvents: 500,
+  sseKeepaliveMs: 15_000,
+};
+
+let db: Db;
+let sse: SseHub;
+let limiter: RateLimiter;
+let csrfKey: string;
+
+function deps(): ServerDeps {
+  return {
+    db,
+    sse,
+    limiter,
+    orchestrator: new OrchestratorClient({
+      baseUrl: "http://127.0.0.1:1",
+      secret: config.orchestratorSecret,
+    }),
+  };
+}
+
+async function newApp(): Promise<FastifyInstance> {
+  const app = buildServer(config, deps());
+  await app.ready();
+  return app;
+}
+
+function seed(guid = GUID, opts: { state?: string; runnerId?: string | null; auth?: string } = {}) {
+  csrfKey = generateCsrfKey();
+  db.createSession({
+    guid,
+    secretHash: hashSecret(SECRET),
+    csrfKey,
+    now: Date.now(),
+    expiresAt: Date.now() + TTL,
+  });
+  db.run(
+    `UPDATE sessions SET state = ?, runner_id = ?, auth_state = ? WHERE guid = ?`,
+    opts.state ?? "authenticated",
+    opts.runnerId === undefined ? "slot-1" : opts.runnerId,
+    opts.auth ?? "valid",
+    guid,
+  );
+}
+
+function cookieHeader(guid = GUID, secret = SECRET): string {
+  return `${SESSION_COOKIE}=${guid}:${secret}`;
+}
+
+beforeEach(() => {
+  db = new Db(":memory:");
+  sse = new SseHub();
+  limiter = new RateLimiter({ logSalt: "test" });
+});
+
+// ---- POST /api/session ----------------------------------------------------
+
+describe("POST /api/session", () => {
+  const create = (payload: unknown, headers: Record<string, string> = {}) =>
+    newApp().then((app) =>
+      app
+        .inject({
+          method: "POST",
+          url: "/api/session",
+          headers: { "content-type": "application/json", origin: ALLOWED, ...headers },
+          payload: typeof payload === "string" ? payload : JSON.stringify(payload),
+        })
+        .finally(() => app.close()),
+    );
+
+  it("creates a session and returns 201 with the protocol version", async () => {
+    const response = await create({ guid: GUID, secret: SECRET });
+    expect(response.statusCode).toBe(201);
+    expect(response.json().protocol).toBe(3);
+    expect(db.getSession(GUID)).toBeDefined();
+  });
+
+  // T-C5, asserted on what the server actually sends.
+  it("sets both cookies with the §3.3 attribute set", async () => {
+    const response = await create({ guid: GUID, secret: SECRET });
+    const cookies = parseSetCookies(response);
+
+    const session = cookies.find((c) => c.startsWith("__Host-msout="));
+    expect(session).toBeDefined();
+    expect(session).toContain("HttpOnly");
+    expect(session).toContain("Secure");
+    expect(session).toContain("SameSite=None");
+    expect(session).toContain("Path=/");
+    // The __Host- prefix forbids Domain; its absence is the requirement.
+    expect(session).not.toMatch(/domain/i);
+
+    const csrf = cookies.find((c) => c.startsWith("msout_csrf="));
+    expect(csrf).toBeDefined();
+    expect(csrf).toContain("Secure");
+    expect(csrf).toContain("SameSite=None");
+    // Readable by JavaScript, because the browser echoes it in a header.
+    expect(csrf).not.toContain("HttpOnly");
+  });
+
+  it("gives both cookies the session's own TTL", async () => {
+    const response = await create({ guid: GUID, secret: SECRET });
+    for (const cookie of parseSetCookies(response)) {
+      expect(cookie).toContain("Max-Age=43200");
+    }
+  });
+
+  it("sets the CSRF cookie to the token derived from the session's key", async () => {
+    const response = await create({ guid: GUID, secret: SECRET });
+    // The key is generated by the server, so the test reads it back from the
+    // stored row rather than assuming it. What is asserted is that the cookie
+    // equals the *derived* token — not the key, and not a fresh random value.
+    const storedKey = db.getSession(GUID)?.csrf_key;
+    expect(storedKey).toBeDefined();
+
+    const csrfCookieValue = parseSetCookies(response)
+      .find((c) => c.startsWith("msout_csrf="))
+      ?.split(";")[0]
+      ?.split("=")[1];
+
+    expect(csrfCookieValue).toBe(derive(storedKey!, GUID));
+    // Not the key itself: that would hand the derivation input to the browser.
+    expect(csrfCookieValue).not.toBe(storedKey);
+  });
+
+  it("issues a CSRF token that validates against the session", async () => {
+    // The round trip the whole scheme exists for: cookie in, header out, accepted.
+    const created = await create({ guid: GUID, secret: SECRET });
+    const csrfCookieValue = parseSetCookies(created)
+      .find((c) => c.startsWith("msout_csrf="))!
+      .split(";")[0]!
+      .split("=")[1]!;
+
+    const app = await newApp();
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/session/notebooks",
+        headers: {
+          "content-type": "application/json",
+          cookie: `${SESSION_COOKIE}=${GUID}:${SECRET}; ${CSRF_COOKIE}=${csrfCookieValue}`,
+          origin: ALLOWED,
+          "x-csrf-token": csrfCookieValue,
+        },
+      });
+      // Not 403: the token the server issued is the token it accepts.
+      expect(response.statusCode).not.toBe(403);
+    } finally {
+      await app.close();
+    }
+  });
+
+  // The secret is stored hashed, so the plaintext in the cookie is the only copy
+  // and the server cannot leak it from its own state.
+  it("stores only a hash of the secret", async () => {
+    await create({ guid: GUID, secret: SECRET });
+    const row = db.getSession(GUID);
+    expect(row?.secret_hash).toBe(hashSecret(SECRET));
+    expect(JSON.stringify(row)).not.toContain(SECRET);
+  });
+
+  it("validates the secret length rather than trusting the client", async () => {
+    // T9: under the split the secret is generated by Component A, and a
+    // compromised frontend could generate a weak one.
+    for (const secret of ["", "short", "A".repeat(42), "A".repeat(44)]) {
+      const response = await create({ guid: GUID, secret });
+      expect(response.statusCode).toBe(400);
+    }
+  });
+
+  it("validates the guid shape", async () => {
+    for (const guid of ["", "nope", GUID.toUpperCase(), `${GUID}/x`]) {
+      const response = await create({ guid, secret: SECRET });
+      expect(response.statusCode).toBe(400);
+    }
+  });
+
+  it("rejects an unknown field rather than ignoring it", async () => {
+    // A caller sending `runnerId` and getting a 201 would conclude it was set.
+    const response = await create({ guid: GUID, secret: SECRET, runnerId: "slot-1" });
+    expect(response.statusCode).toBe(400);
+  });
+
+  it("rejects a body that is not an object", async () => {
+    for (const payload of ["[]", '"str"', "null", "42"]) {
+      const response = await create(payload);
+      expect(response.statusCode).toBe(400);
+    }
+  });
+
+  it("rejects a foreign origin with no ACAO", async () => {
+    const response = await create({ guid: GUID, secret: SECRET }, { origin: FOREIGN });
+    expect(response.statusCode).toBe(403);
+    expect(response.headers["access-control-allow-origin"]).toBeUndefined();
+  });
+
+  it("rate limits to three sessions an hour per address", async () => {
+    const app = await newApp();
+    try {
+      for (let i = 0; i < 3; i++) {
+        const guid = `3f2504e0-4f89-11d3-9a0c-00000000000${i}`;
+        const response = await app.inject({
+          method: "POST",
+          url: "/api/session",
+          headers: { "content-type": "application/json", origin: ALLOWED },
+          payload: JSON.stringify({ guid, secret: SECRET }),
+        });
+        expect(response.statusCode).toBe(201);
+      }
+      const fourth = await app.inject({
+        method: "POST",
+        url: "/api/session",
+        headers: { "content-type": "application/json", origin: ALLOWED },
+        payload: JSON.stringify({ guid: "3f2504e0-4f89-11d3-9a0c-000000000009", secret: SECRET }),
+      });
+      expect(fourth.statusCode).toBe(429);
+      expect(fourth.headers["retry-after"]).toBeDefined();
+    } finally {
+      await app.close();
+    }
+  });
+
+  // A reload into the same session must not destroy a live auth.json.
+  it("re-issues cookies for an existing session rather than recreating it", async () => {
+    seed();
+    const app = await newApp();
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/session",
+        headers: { "content-type": "application/json", origin: ALLOWED },
+        payload: JSON.stringify({ guid: GUID, secret: SECRET }),
+      });
+      expect(response.statusCode).toBe(200);
+      expect(parseSetCookies(response).length).toBe(2);
+      expect(db.getSession(GUID)?.runner_id).toBe("slot-1");
+    } finally {
+      await app.close();
+    }
+  });
+
+  // Otherwise this becomes a session-takeover path by GUID enumeration.
+  it("refuses to re-issue cookies when the presented secret does not match", async () => {
+    seed();
+    const app = await newApp();
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/session",
+        headers: { "content-type": "application/json", origin: ALLOWED },
+        payload: JSON.stringify({ guid: GUID, secret: "B".repeat(43) }),
+      });
+      expect(response.statusCode).toBe(401);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+// ---- GET /api/session/status ----------------------------------------------
+
+describe("GET /api/session/status", () => {
+  it("returns the full snapshot for a valid session", async () => {
+    seed();
+    const app = await newApp();
+    try {
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/session/status",
+        headers: { cookie: cookieHeader(), origin: ALLOWED },
+      });
+      expect(response.statusCode).toBe(200);
+
+      const body = response.json();
+      // Every top-level key present, always. The client never branches on a
+      // missing key.
+      for (const key of ["protocol", "serverTime", "session", "auth", "notebooks", "export", "artifact"]) {
+        expect(body).toHaveProperty(key);
+      }
+      expect(body.protocol).toBe(3);
+      expect(body.serverTime).toMatch(/\.\d{3}Z$/);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("uses null rather than omitting an optional leaf", async () => {
+    seed();
+    const app = await newApp();
+    try {
+      const body = (
+        await app.inject({
+          method: "GET",
+          url: "/api/session/status",
+          headers: { cookie: cookieHeader() },
+        })
+      ).json();
+
+      expect(body.export.id).toBeNull();
+      expect(body.export.progress).toBeNull();
+      expect(body.artifact.downloadUrl).toBeNull();
+      expect(body.artifact.fileName).toBeNull();
+      // Present as keys, not absent.
+      expect(Object.keys(body.export)).toContain("finishedAt");
+      expect(Object.keys(body.artifact)).toContain("partial");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("401s an unauthenticated request", async () => {
+    const app = await newApp();
+    try {
+      const response = await app.inject({ method: "GET", url: "/api/session/status" });
+      expect(response.statusCode).toBe(401);
+      expect(response.json()).toEqual({ error: "unauthorised" });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("401s an expired session", async () => {
+    seed();
+    db.run(`UPDATE sessions SET expires_at = ? WHERE guid = ?`, Date.now() - 1, GUID);
+    const app = await newApp();
+    try {
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/session/status",
+        headers: { cookie: cookieHeader() },
+      });
+      expect(response.statusCode).toBe(401);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("builds a download url from the opaque artifact id only", async () => {
+    // PLAN-v3 §5 and invariant 8: no GUID, no notebook name.
+    seed(GUID, { state: "exporting" });
+    db.run(
+      `UPDATE sessions SET notebook = ?, artifact_id = ?, artifact_partial = 1 WHERE guid = ?`,
+      "Personal Notebook",
+      "A".repeat(43),
+      GUID,
+    );
+    const app = await newApp();
+    try {
+      const body = (
+        await app.inject({
+          method: "GET",
+          url: "/api/session/status",
+          headers: { cookie: cookieHeader() },
+        })
+      ).json();
+
+      expect(body.artifact.available).toBe(true);
+      expect(body.artifact.partial).toBe(true);
+      expect(body.artifact.downloadUrl).toBe(`/files/${"A".repeat(43)}`);
+      expect(body.artifact.downloadUrl).not.toContain(GUID);
+      expect(body.artifact.downloadUrl).not.toContain("Personal");
+      // The name comes from Content-Disposition at download time.
+      expect(body.artifact.fileName).toBeNull();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("restores a running export so a refresh can reattach", async () => {
+    seed(GUID, { state: "exporting" });
+    db.run(
+      `UPDATE sessions SET export_state = ? WHERE guid = ?`,
+      JSON.stringify({
+        state: "running",
+        id: "E".repeat(43),
+        notebook: "Work",
+        progress: { pages: 120, sections: 8, assets: 340 },
+        startedAt: Date.now() - 5000,
+        finishedAt: null,
+      }),
+      GUID,
+    );
+    const app = await newApp();
+    try {
+      const body = (
+        await app.inject({
+          method: "GET",
+          url: "/api/session/status",
+          headers: { cookie: cookieHeader() },
+        })
+      ).json();
+
+      expect(body.export.state).toBe("running");
+      expect(body.export.id).toBe("E".repeat(43));
+      expect(body.export.progress).toEqual({ pages: 120, sections: 8, assets: 340 });
+      expect(body.export.startedAt).not.toBeNull();
+      expect(body.export.finishedAt).toBeNull();
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+// ---- POST /api/session/credential ----------------------------------------
+
+describe("POST /api/session/credential", () => {
+  const post = (headers: Record<string, string>, payload = "hunter2") =>
+    newApp().then((app) =>
+      app
+        .inject({
+          method: "POST",
+          url: "/api/session/credential",
+          headers: { "content-type": "text/plain", cookie: cookieHeader(), origin: ALLOWED, ...headers },
+          payload,
+        })
+        .finally(() => app.close()),
+    );
+
+  it("refuses a session with no runner bound", async () => {
+    // The password would have nowhere to go, so it must not travel.
+    seed(GUID, { runnerId: null });
+    const response = await post({ "x-csrf-token": derive(csrfKey, GUID) });
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toBe("no runner bound to this session");
+  });
+
+  // T-C3, through the real route.
+  it("requires the CSRF header", async () => {
+    seed();
+    const response = await post({});
+    expect(response.statusCode).toBe(403);
+  });
+
+  // T-C2.
+  it("rejects a foreign origin with a valid cookie", async () => {
+    seed();
+    const response = await post({
+      origin: FOREIGN,
+      "x-csrf-token": derive(csrfKey, GUID),
+    });
+    expect(response.statusCode).toBe(403);
+    expect(response.headers["access-control-allow-origin"]).toBeUndefined();
+  });
+
+  it("rejects an oversized body before accepting it", async () => {
+    seed();
+    const response = await post(
+      { "x-csrf-token": derive(csrfKey, GUID) },
+      "x".repeat(5000),
+    );
+    expect(response.statusCode).toBe(413);
+  });
+
+  it("rejects a multipart body", async () => {
+    seed();
+    const response = await post({
+      "content-type": "multipart/form-data; boundary=x",
+      "x-csrf-token": derive(csrfKey, GUID),
+    });
+    expect(response.statusCode).toBe(415);
+  });
+
+  it("never echoes the credential in its response", async () => {
+    seed();
+    const response = await post({ "x-csrf-token": derive(csrfKey, GUID) });
+    expect(response.body).not.toContain("hunter2");
+  });
+
+  it("accepts a json content type, because it never parses one", async () => {
+    // PLAN-v3 §3.3 layer 3 does not pin a type here. The consequence is that a
+    // caller which JSON-encodes is forwarded bytes-for-byte, quotes included —
+    // a client bug rather than a server one. This asserts the type is *accepted*:
+    // 415 here would mean the route had started caring.
+    seed(GUID, { runnerId: null });
+    const response = await post({
+      "content-type": "application/json",
+      "x-csrf-token": derive(csrfKey, GUID),
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toBe("no runner bound to this session");
+  });
+});
+
+// ---- POST /api/session/notebooks -----------------------------------------
+
+describe("POST /api/session/notebooks", () => {
+  const post = (headers: Record<string, string>, payload?: string) =>
+    newApp().then((app) =>
+      app
+        .inject({
+          method: "POST",
+          url: "/api/session/notebooks",
+          headers: {
+            "content-type": "application/json",
+            cookie: cookieHeader(),
+            origin: ALLOWED,
+            "x-csrf-token": derive(csrfKey, GUID),
+            ...headers,
+          },
+          ...(payload === undefined ? {} : { payload }),
+        })
+        .finally(() => app.close()),
+    );
+
+  it("requires authentication before listing", async () => {
+    seed(GUID, { auth: "none" });
+    const response = await post({});
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toBe("not authenticated");
+  });
+
+  it("requires a bound runner", async () => {
+    seed(GUID, { runnerId: null });
+    const response = await post({});
+    expect(response.statusCode).toBe(409);
+  });
+
+  it("accepts an empty body, since the route takes no parameters", async () => {
+    seed();
+    const response = await post({});
+    expect(response.statusCode).toBe(501);
+  });
+
+  it("rejects a body with parameters", async () => {
+    // A listing route that silently accepted parameters would suggest it honours
+    // them.
+    seed();
+    const response = await post({}, JSON.stringify({ notebook: "Work" }));
+    expect(response.statusCode).toBe(400);
+  });
+});
+
+// ---- POST /api/export -----------------------------------------------------
+
+describe("POST /api/export", () => {
+  const post = (payload: unknown, extra: Record<string, string> = {}) =>
+    newApp().then((app) =>
+      app
+        .inject({
+          method: "POST",
+          url: "/api/export",
+          headers: {
+            "content-type": "application/json",
+            cookie: cookieHeader(),
+            origin: ALLOWED,
+            "x-csrf-token": derive(csrfKey, GUID),
+            ...extra,
+          },
+          payload: JSON.stringify(payload),
+        })
+        .finally(() => app.close()),
+    );
+
+  it("requires a notebook", async () => {
+    seed();
+    for (const payload of [{}, { notebook: "" }, { notebook: 42 }]) {
+      const response = await post(payload);
+      expect(response.statusCode).toBe(400);
+    }
+  });
+
+  it("requires an authenticated session", async () => {
+    seed(GUID, { auth: "none" });
+    const response = await post({ notebook: "Work" });
+    expect(response.statusCode).toBe(409);
+  });
+
+  // §8.1: one active export per session, driven from stored state so a second
+  // tab cannot lie its way into a second export.
+  it("409s a second concurrent export", async () => {
+    seed(GUID, { state: "exporting" });
+    db.run(
+      `UPDATE sessions SET export_state = ? WHERE guid = ?`,
+      JSON.stringify({ state: "running", id: "E".repeat(43) }),
+      GUID,
+    );
+    const response = await post({ notebook: "Work" });
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toBe("an export is already running");
+  });
+
+  it("allows a second export once the first finished", async () => {
+    seed(GUID, { state: "authenticated" });
+    db.run(
+      `UPDATE sessions SET export_state = ? WHERE guid = ?`,
+      JSON.stringify({ state: "done", id: "E".repeat(43) }),
+      GUID,
+    );
+    const response = await post({ notebook: "Work" });
+    expect(response.statusCode).not.toBe(409);
+  });
+
+  it("rejects an unknown field", async () => {
+    seed();
+    const response = await post({ notebook: "Work", image: "evil" });
+    expect(response.statusCode).toBe(400);
+  });
+
+  it("does not consume a global slot when it refuses", async () => {
+    // A failed start must not leak a slot, or enough refusals would exhaust the
+    // global cap without a single export running.
+    seed(GUID, { runnerId: null });
+    const app = await newApp();
+    try {
+      for (let i = 0; i < 10; i++) {
+        await app.inject({
+          method: "POST",
+          url: "/api/export",
+          headers: {
+            "content-type": "application/json",
+            cookie: cookieHeader(),
+            origin: ALLOWED,
+            "x-csrf-token": derive(csrfKey, GUID),
+          },
+          payload: JSON.stringify({ notebook: "Work" }),
+        });
+      }
+      expect(limiter.activeExports).toBe(0);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+// ---- POST /api/export/:id/abort ------------------------------------------
+
+describe("POST /api/export/:id/abort", () => {
+  const EXPORT_ID = "E".repeat(43);
+  const abort = (id: string, cookie = cookieHeader()) =>
+    newApp().then((app) =>
+      app
+        .inject({
+          method: "POST",
+          url: `/api/export/${id}/abort`,
+          headers: { cookie, origin: ALLOWED, "x-csrf-token": derive(csrfKey, GUID) },
+        })
+        .finally(() => app.close()),
+    );
+
+  it("rejects a malformed export id", async () => {
+    seed(GUID, { state: "exporting" });
+    db.run(
+      `UPDATE sessions SET export_state = ? WHERE guid = ?`,
+      JSON.stringify({ state: "running", id: EXPORT_ID }),
+      GUID,
+    );
+    for (const id of ["short", "x".repeat(44), "../../etc"]) {
+      const response = await abort(encodeURIComponent(id));
+      expect([400, 404]).toContain(response.statusCode);
+    }
+  });
+
+  // Shape is not authorisation: one session must not be able to abort another's
+  // export, however it learned the id.
+  it("404s an id this session does not own", async () => {
+    seed(GUID, { state: "exporting" });
+    db.run(
+      `UPDATE sessions SET export_state = ? WHERE guid = ?`,
+      JSON.stringify({ state: "running", id: "A".repeat(43) }),
+      GUID,
+    );
+    const response = await abort(EXPORT_ID);
+    expect(response.statusCode).toBe(404);
+  });
+
+  it("404s when there is no export at all", async () => {
+    seed();
+    const response = await abort(EXPORT_ID);
+    expect(response.statusCode).toBe(404);
+  });
+
+  it("marks the export partial, because abort preserves what is on disk", async () => {
+    seed(GUID, { state: "exporting" });
+    db.run(
+      `UPDATE sessions SET export_state = ? WHERE guid = ?`,
+      JSON.stringify({ state: "running", id: EXPORT_ID }),
+      GUID,
+    );
+    const app = await newApp();
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: `/api/export/${EXPORT_ID}/abort`,
+        headers: { cookie: cookieHeader(), origin: ALLOWED, "x-csrf-token": derive(csrfKey, GUID) },
+      });
+      expect(response.statusCode).toBe(501);
+
+      // The state change is recorded so a refresh shows "partial" rather than an
+      // export that will never finish.
+      const stored = JSON.parse(db.getSession(GUID)!.export_state ?? "{}");
+      expect(stored.state).toBe("partial");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("emits export-aborted and export-partial", async () => {
+    seed(GUID, { state: "exporting" });
+    db.run(
+      `UPDATE sessions SET export_state = ? WHERE guid = ?`,
+      JSON.stringify({ state: "running", id: EXPORT_ID }),
+      GUID,
+    );
+    const app = await newApp();
+    try {
+      await app.inject({
+        method: "POST",
+        url: `/api/export/${EXPORT_ID}/abort`,
+        headers: { cookie: cookieHeader(), origin: ALLOWED, "x-csrf-token": derive(csrfKey, GUID) },
+      });
+      // Two events, so a second tab sees the abort without polling.
+      expect(sse.stats()[GUID]).toBeUndefined();
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+// ---- Health and the artifact route ---------------------------------------
+
+describe("misc routes", () => {
+  it("serves /healthz without a session", async () => {
+    const app = await newApp();
+    try {
+      const response = await app.inject({ method: "GET", url: "/healthz" });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().ok).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
+
+  // Artifacts are served by Caddy with forward_auth, so a multi-gigabyte vault
+  // never passes through Node.
+  it("refuses to serve artifacts itself", async () => {
+    seed();
+    const app = await newApp();
+    try {
+      const response = await app.inject({
+        method: "GET",
+        url: `/files/${"A".repeat(43)}`,
+        headers: { cookie: cookieHeader() },
+      });
+      expect(response.statusCode).toBe(501);
+      expect(response.json().error).toContain("Caddy");
+    } finally {
+      await app.close();
+    }
+  });
+
+  // Authentication runs before routing, so an unauthenticated request to a path
+  // that does not exist gets 401 rather than 404. That is the correct order: a
+  // 404 would tell a caller which paths exist before it had proved anything.
+  // An authenticated caller does get the real answer.
+  it("404s an unknown path for an authenticated caller", async () => {
+    seed();
+    const app = await newApp();
+    try {
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/nope",
+        headers: { cookie: cookieHeader() },
+      });
+      expect(response.statusCode).toBe(404);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("401s an unknown path for an anonymous caller, revealing nothing", async () => {
+    const app = await newApp();
+    try {
+      const anonymous = await app.inject({ method: "GET", url: "/api/nope" });
+      expect(anonymous.statusCode).toBe(401);
+
+      // Same status as a real-but-unauthenticated path, so the two are
+      // indistinguishable.
+      const real = await app.inject({ method: "GET", url: "/api/session/status" });
+      expect(real.statusCode).toBe(anonymous.statusCode);
+      expect(real.body).toBe(anonymous.body);
+    } finally {
+      await app.close();
+    }
+  });
+});

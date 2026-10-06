@@ -36,6 +36,10 @@ import type { Readable } from "node:stream";
 import { ApiConfig } from "./config.js";
 import { Db } from "./db.js";
 import { OrchestratorClient } from "./orchestrator-client.js";
+import { SseHub } from "./sse.js";
+import { RateLimiter } from "./rate-limit.js";
+import type { EraseDeps } from "./erase.js";
+import { registerRoutes, type RouteDeps } from "./routes.js";
 import { authenticate, authErrorBody, authStatus, PROTOCOL_VERSION, API_BUILD } from "./auth.js";
 import {
   CSRF_HEADER,
@@ -54,6 +58,28 @@ import {
   contentTypeIsAcceptable,
 } from "./credential.js";
 import { resolveClientAddress } from "./client-ip.js";
+
+/**
+ * PUBLIC_PATHS are the two reads that need no session.
+ *
+ * Exact matches, not prefixes. A prefix rule would open whatever else began with
+ * the same characters, and the whole point of naming them is that the list is
+ * short enough to read.
+ */
+const PUBLIC_PATHS = new Set(["/api/public/version", "/healthz"]);
+
+/**
+ * MINT_PATHS are the mutating routes that create a credential, so they cannot
+ * require one.
+ *
+ * `POST /api/session` is the only member, and being a POST it is also the one
+ * route where §3.3's CSRF layer cannot apply — there is no token yet to derive
+ * from a session that does not exist. What stands in its place is the Origin
+ * allowlist, checked in the route's own handler, plus the fact that a successful
+ * call establishes nothing an attacker could ride: the caller gets a session and
+ * no one else does.
+ */
+const MINT_PATHS = new Set(["/api/session"]);
 
 /**
  * requiredPreflightHeaders is what the credential route needs the browser to
@@ -103,6 +129,18 @@ declare module "fastify" {
 export interface ServerDeps {
   readonly db: Db;
   readonly orchestrator: OrchestratorClient;
+  /** The SSE hub. One per process; sessions are multiplexed inside it. */
+  readonly sse: SseHub;
+  /** The rate limiter. One per process, since its counters are per-process. */
+  readonly limiter: RateLimiter;
+  /**
+   * Runner control for the erase machine.
+   *
+   * Optional because erase spans three hosts and the runner half arrives with the
+   * sidecar. Without it `POST /api/session/erase` answers 501 rather than
+   * pretending to have deleted anything.
+   */
+  readonly eraseRunner?: EraseDeps["runner"];
 }
 
 /** Options for buildServer. */
@@ -127,7 +165,44 @@ export interface BuildServerOptions {
 }
 
 /** buildServer constructs the api. */
+/**
+ * buildServer constructs the api with its hooks and every route.
+ *
+ * The single entry point. `baseServer` exists separately so a test can build the
+ * hooks without the routes — useful when a test needs to register its own probe
+ * route against a live instance, which Fastify only permits before `ready()`.
+ */
 export function buildServer(
+  config: ApiConfig,
+  deps: ServerDeps,
+  options: BuildServerOptions = {},
+): FastifyInstance {
+  const app = baseServer(config, deps, options);
+  // Assembled conditionally rather than with explicit `undefined`, because
+  // exactOptionalPropertyTypes treats the two as different and RouteDeps' fields
+  // are optional rather than nullable.
+  const routeDeps: RouteDeps = {
+    db: deps.db,
+    orchestrator: deps.orchestrator,
+    sse: deps.sse,
+    limiter: deps.limiter,
+  };
+  if (options.knownProxies !== undefined) routeDeps.knownProxies = options.knownProxies;
+  if (deps.eraseRunner !== undefined) routeDeps.eraseRunner = deps.eraseRunner;
+
+  registerRoutes(app, config, routeDeps);
+  return app;
+}
+
+/**
+ * baseServer builds the instance with hooks and the two routes that must exist
+ * before the hook's own exemption list is installed.
+ *
+ * Split from `buildServer` so `registerRoutes` can attach the rest without
+ * creating a second instance, and so a test can register probe routes on a live
+ * server without re-declaring the hooks.
+ */
+export function baseServer(
   config: ApiConfig,
   deps: ServerDeps,
   options: BuildServerOptions = {},
@@ -212,30 +287,66 @@ export function buildServer(
       return reply.code(204).send();
     }
 
-    // GET and HEAD have no state to change, so §3.3 layer 1 does not apply to
-    // them. The ACAO emission above is what makes the browser's own decision.
-    if (request.method === "GET" || request.method === "HEAD") {
-      return;
+    const isRead = request.method === "GET" || request.method === "HEAD";
+
+    // Two paths need no session: the version handshake, because §7.2 makes
+    // checking the protocol the first thing a client does and it has no cookie
+    // yet; and health, because an operator's probe has none either.
+    //
+    // MINT_PATHS joins them for a different reason — POST /api/session *creates*
+    // the credential, so it cannot require one and has no CSRF token to check.
+    // Both sets are exact matches: a prefix rule would open whatever else began
+    // with the same characters.
+    const skipsAuth =
+      PUBLIC_PATHS.has(request.url) ||
+      MINT_PATHS.has(request.url) ||
+      options.testOnlyAuthExemptPaths?.includes(request.url) === true;
+
+    let authenticated: ReturnType<typeof authenticateFromCookies> | undefined;
+
+    if (!skipsAuth) {
+      // A read still needs a session: `/api/session/status` and `/events` are the
+      // two most valuable things to read without one. CORS is not an access
+      // control, so nothing about a GET is exempt from authentication.
+      authenticated = authenticateFromCookies(request, deps.db);
+      if (!authenticated.ok) {
+        return reply.code(authStatus(authenticated.failure)).send(authErrorBody());
+      }
+      request.ctx.session = authenticated.session;
+      request.ctx.csrfToken = authenticated.csrfToken;
     }
 
-    // Everything below is a state-changing request on an existing session.
+    // MINT_PATHS leaves here entirely. §3.3's CSRF layer cannot apply to a route
+    // that creates the credential — there is no token yet to derive from a session
+    // that does not exist — and the route enforces the Origin allowlist itself.
     //
-    // POST /api/session is exempt and handled by its own route, because there is
-    // no session yet to authenticate against — reaching it here would 401 the one
-    // request that mints a credential.
+    // The test-only exemptions leave here too, for the same mechanical reason: a
+    // route a test registered has no session and no token to present.
     if (
-      request.url === "/api/session" ||
+      MINT_PATHS.has(request.url) ||
       options.testOnlyAuthExemptPaths?.includes(request.url) === true
     ) {
       return;
     }
 
-    const authenticated = authenticateFromCookies(request, deps.db);
-    if (!authenticated.ok) {
-      return reply.code(authStatus(authenticated.failure)).send(authErrorBody());
+    // GET and HEAD have no state to change, so §3.3 layer 1 — the CSRF header —
+    // does not apply to them. The ACAO emission above is what makes the browser's
+    // own decision.
+    if (isRead) {
+      return;
     }
-    request.ctx.session = authenticated.session;
-    request.ctx.csrfToken = authenticated.csrfToken;
+
+    if (authenticated === undefined || !authenticated.ok) {
+      // A mutating route that needs a session but did not get one. The only
+      // reachable case is a route that should have been named in skipsAuth and
+      // was not — which would silently turn a feature into a 401 rather than a
+      // clear failure, so it is logged rather than passed over.
+      request.log.error(
+        { url: request.url, method: request.method },
+        "route requires a session but authentication did not run",
+      );
+      return reply.code(401).send(authErrorBody());
+    }
 
     const check = checkNonGetRequest({
       origin,
@@ -280,63 +391,19 @@ export function buildServer(
 
   // ---- Routes -------------------------------------------------------------
 
-  // §7.2: answerable before a session exists, because a version mismatch is
-  // exactly what a client checks on mount.
-  app.get("/api/public/version", async (_request, reply) =>
-    reply.send({ protocol: PROTOCOL_VERSION, build: API_BUILD }),
-  );
+  // The remaining routes are registered by registerRoutes() from buildServer().
+  //
+  // The two unauthenticated reads live in routes.ts alongside everything else, so
+  // the route table has one home; PUBLIC_PATHS is what tells this hook to leave
+  // them alone.
 
   // The one mutating route that cannot use the hook above: there is no session
   // yet. It is protected by the Origin allowlist, which is the only layer
   // available before a credential exists, and it establishes nothing an attacker
   // could ride — a successful call only mints a session for the caller.
-  app.post("/api/session", async (request, reply) => {
-    const origin = header(request, "origin");
-    if (origin !== undefined && !config.allowedOrigins.has(origin)) {
-      return reply.code(403).send({ error: "forbidden" });
-    }
-
-    const body = await readJsonObject(request.body as Readable);
-    if (body === null) {
-      return reply.code(400).send({ error: "malformed request body" });
-    }
-
-    // Validated mechanically rather than trusted: under the split the secret is
-    // generated by Component A, and a compromised frontend could generate a weak
-    // one (§4, T9).
-    if (!isValidGuid(body.guid)) {
-      return reply.code(400).send({ error: "guid must be a lowercase uuid" });
-    }
-    if (!isValidSecret(body.secret)) {
-      return reply
-        .code(400)
-        .send({ error: "secret must be exactly 43 base64url characters" });
-    }
-
-    return reply.code(501).send({ error: "session creation not wired yet" });
-  });
-
-  app.post("/api/session/credential", async (request, reply) => {
-    // Reached only after the hook authenticated the session and checked Origin,
-    // CSRF and framing. The raw stream is still unread at this point.
-    const framed = checkFraming(header(request, "content-length"));
-    if (!framed.ok) {
-      return reply.code(400).send({ error: "invalid content-length" });
-    }
-
-    request.log.info(auditFields({
-      contentLength: header(request, "content-length"),
-      contentType: header(request, "content-type"),
-      origin: header(request, "origin"),
-    }));
-
-    // A hard timeout: a login that hangs on an unanswered MFA prompt must not
-    // hold the connection for the session's lifetime (PLAN-v2 §5.5).
-    const cap = capStream(request.body as Readable, MAX_CREDENTIAL_BYTES);
-
-    return reply.code(501).send({ error: "credential forward not wired yet", stream: cap });
-  });
-
+  // The routes themselves live in routes.ts, except for the credential route's
+  // framing checks, which must run in `onRequest` — before a byte is read — and
+  // therefore cannot live in a handler.
   return app;
 }
 

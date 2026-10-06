@@ -6,7 +6,6 @@ import {
   EVENT_TYPES,
   SseHub,
   parseLastEventId,
-  writeSseHeaders,
 } from "../src/sse.js";
 
 /**
@@ -414,19 +413,16 @@ describe("drop", () => {
   });
 });
 
-describe("headers", () => {
-  it("sets the headers an EventSource needs behind a proxy", () => {
-    const res = fakeResponse();
-    writeSseHeaders(res);
-    const headers = res.headers as Record<string, string>;
-
-    expect(headers["content-type"]).toBe("text/event-stream");
-    expect(headers["cache-control"]).toBe("no-store");
-    // Without this a reverse proxy may buffer and deliver the stream in one lump
-    // at close, which looks exactly like a broken event stream.
-    expect(headers["x-accel-buffering"]).toBe("no");
-  });
-});
+/*
+ * The header assertions moved.
+ *
+ * They used to live here, testing a `writeSseHeaders(res)` helper that nothing in
+ * production called. That helper wrote headers with `res.writeHead(200, {...})`,
+ * which replaces the header set rather than merging — so it was correct in this
+ * test and would have discarded the CORS headers the moment a route used it. The
+ * live version is asserted against real HTTP in tests/sse-cors.test.ts, where a
+ * browser's view is what is being checked.
+ */
 
 describe("event types", () => {
   it("covers the contract from PLAN-v2 §7.1", () => {

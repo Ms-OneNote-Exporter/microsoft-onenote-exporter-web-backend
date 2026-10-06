@@ -342,27 +342,64 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
       return reply.code(401).send({ error: "unauthorised" });
     }
 
-    // Cross-origin SSE needs the credential on the stream. §6 calls this the most
-    // likely v3 bug: without withCredentials on the client every reconnect
-    // silently 401s and the UI shows "reconnecting…" forever.
-    reply.raw.writeHead(200, {
-      "content-type": "text/event-stream",
-      "cache-control": "no-store",
-      connection: "keep-alive",
-      // Without this a reverse proxy may buffer and deliver the stream in one lump
-      // at close, which looks exactly like a broken event stream.
-      "x-accel-buffering": "no",
-      // ACAO and ACAC, because an EventSource from the frontend origin is a
-      // cross-origin request. Emitted only for an allowlisted origin — see the
-      // onRequest hook, which set Vary and the success case already.
-      ...(request.ctx.origin !== null
-        ? {
-            "access-control-allow-origin": request.ctx.origin,
-            "access-control-allow-credentials": "true",
-          }
-        : {}),
-    });
-    request.raw.socket?.setNoDelay?.(true);
+    /*
+     * The streaming headers, set with `reply.header` and never with
+     * `res.writeHead(200, {...})`.
+     *
+     * Node's `writeHead` with an explicit headers object **replaces** the whole
+     * header set rather than merging into it. Calling it here therefore discarded
+     * everything the onRequest hook had already applied — `vary: Origin`, and the
+     * ACAO/ACAC for an allowlisted origin. mac found this against a real
+     * deployment: the browser refused the EventSource for a missing ACAO, while the
+     * 401 on this same route had one, which is the signature of headers being
+     * dropped between the hook and a streaming success.
+     *
+     * `reply.header` keeps them in Fastify's own store, which is what gets flushed
+     * when the raw response is written below.
+     */
+    reply.header("content-type", "text/event-stream");
+    // §6: an EventSource from the frontend origin is cross-origin, and
+    // `withCredentials` is what makes the cookie ride along. Without it every
+    // reconnect silently 401s and the UI shows "reconnecting…" forever — the
+    // failure mac predicted, and the one worth guarding.
+    reply.header("access-control-allow-credentials", "true");
+    // Without this a reverse proxy may buffer and deliver the stream in one lump at
+    // close, which looks exactly like a broken event stream.
+    reply.header("x-accel-buffering", "no");
+    // `no-store` because the stream is a live session event feed: a cached 200 here
+    // would be a stream of somebody else's events.
+    reply.header("cache-control", "no-store");
+
+    /*
+     * Take over the raw response and flush.
+     *
+     * `hijack` stops Fastify from trying to send a reply of its own once the
+     * handler returns, and `flushHeaders` emits the status line plus every header
+     * in the store — the SSE ones just added *and* the CORS ones the hook set.
+     * Calling writeHead with a headers object instead would replace both sets.
+     */
+    reply.hijack();
+
+    // Copy Fastify's accumulated header store onto the raw response explicitly.
+    //
+    // `reply.header()` does *not* reach `res.setHeader` until Fastify sends a
+    // reply, and after `hijack()` it never will — so on its own it sets nothing on
+    // the wire and the stream goes out with no CORS headers and no
+    // x-accel-buffering. `getHeaders()` is the store; `setHeader` accumulates on
+    // the response; and `writeHead(200)` with no headers object then emits the
+    // union. Nothing is replaced, which is the entire point.
+    for (const [key, value] of Object.entries(reply.getHeaders())) {
+      if (value !== undefined) reply.raw.setHeader(key, value as string | number | string[]);
+    }
+
+    // `reply.raw` is the ServerResponse; `request.raw` is the IncomingMessage,
+    // which has neither of these methods.
+    reply.raw.writeHead(200);
+    reply.raw.flushHeaders();
+
+    // Nagle would coalesce small frames, so a log line and the next event would
+    // arrive together.
+    reply.raw.socket?.setNoDelay?.(true);
 
     const lastEventIdHeader = request.headers["last-event-id"];
     const lastEventId =

@@ -334,9 +334,26 @@ export function baseServer(
     // Vary: Origin on every response, including the ones that set nothing else.
     // A cache that served one origin's ACAO to another would turn the allowlist
     // into a suggestion.
-    for (const [key, value] of Object.entries(corsHeaders(origin, config.allowedOrigins))) {
+    const cors = corsHeaders(origin, config.allowedOrigins);
+    for (const [key, value] of Object.entries(cors)) {
       reply.header(key, value);
     }
+
+    /*
+     * Record the matched origin on the context, for **every** method.
+     *
+     * This was assigned only in the mutating-request branch further down, after
+     * `if (isRead) return;`. A GET returned before reaching it, so `ctx.origin` was
+     * null on every read — and `/api/session/events` is a GET whose handler
+     * compensates for its own headers conditional on this field, so the
+     * compensation could never fire. Assigned here instead, at the point the CORS
+     * decision is actually made, so no method can be excluded from it by accident.
+     *
+     * Found by mac against a real deployment: the browser refused the EventSource
+     * for a missing ACAO while curl, which does not enforce CORS, saw a perfectly
+     * good 200.
+     */
+    request.ctx.origin = cors["access-control-allow-origin"] ?? null;
 
     // Client address, from the socket peer (§3.5).
     const client = resolveClientAddress({

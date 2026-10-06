@@ -291,28 +291,40 @@ jobs:
           fi
           echo "T-C7 (/files/ bypasses node) ok"
 
-      - name: no session secret in any environment but the api's
+      - name: no session secret is inline anywhere
         # mac's second addition. §2.1's argument is that a frontend compromise
-        # yields no credential; nothing asserted that the runner image cannot *see*
-        # one, and an env var is the obvious way that becomes false.
+        # yields no credential, and nothing asserted that another container cannot
+        # *see* one — an env var is the obvious way that becomes false.
+        #
+        # Read with `docker inspect` rather than `docker compose exec … env`, for two
+        # reasons. It works against distroless, which has no `env` binary at all —
+        # the first version exited 127 on the orchestrator for exactly that reason,
+        # which reads as "not found" rather than "wrong image". And it reads the
+        # *configured* environment, which is what the assertion is about; exec would
+        # also pick up anything the process itself set.
         run: |
-          must() { docker compose exec -T "$1" env; }
           set -euo pipefail
-          for svc in caddy orchestrator; do
-            env_dump=$(must "$svc")   # fails loudly if the container is not running
+          for svc in caddy orchestrator api; do
+            cid=$(docker compose ps -q "$svc")
+            env_dump=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$cid")
+            echo "  $svc: $(printf '%s' "$env_dump" | wc -l) variables"
+            # A value, not a path: >=10 base64url characters after an `=` on a
+            # secret-shaped name.
             if printf '%s' "$env_dump" \
                | grep -qE '^(CSRF_KEY|SESSION_SECRET|ORCHESTRATOR_HMAC_SECRET)=[A-Za-z0-9_-]{10,}'; then
-              echo "$svc carries a session secret inline in its environment"
-              printf '%s' "$env_dump" | grep -E 'SECRET|CSRF' || true
+              echo "FAIL: $svc carries a secret inline"
+              printf '%s' "$env_dump" | grep -E 'SECRET|CSRF_KEY'
               exit 1
             fi
           done
-          # The api does carry its CSRF key — as a path, never as a value.
-          if docker compose exec -T api env | grep -qE '^CSRF_KEY=[A-Za-z0-9_-]{43}$'; then
-            echo "the api has CSRF_KEY inline; it should be CSRF_KEY_FILE"
-            exit 1
-          fi
-          echo "no session secret is inline anywhere"
+          # The api must still have one — as a path. A container with no secret at
+          # all would boot and then fail every authenticated request, and the
+          # assertion above would pass.
+          cid=$(docker compose ps -q api)
+          docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$cid" \
+            | grep -qE '^CSRF_KEY_FILE=/run/secrets/' \
+            || { echo "FAIL: the api has no CSRF_KEY_FILE"; exit 1; }
+          echo "no secret is inline; the api's is a path"
 
       # ---- cleanup ----------------------------------------------------------
 

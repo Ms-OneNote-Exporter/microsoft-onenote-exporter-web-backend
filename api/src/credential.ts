@@ -23,7 +23,7 @@
  * non-allowlisted origin cannot cause a browser to transmit this body at all.
  */
 
-import { Readable } from "node:stream";
+import { Readable, Transform, pipeline } from "node:stream";
 
 /**
  * maxCredentialBytes caps the credential body at roughly 4 KB.
@@ -80,17 +80,38 @@ export function checkFraming(contentLength: string | undefined): CredentialFrami
 }
 
 /**
- * capStream returns a Readable that yields at most `limit` bytes and then
- * errors.
+ * capStream returns a Readable that yields at most `limit` bytes and then errors.
  *
- * This is the backstop for a caller whose Content-Length understates the body —
- * chunked encoding makes that trivial, and it is the difference between a
- * generous cap and an unbounded forward. Destroying the source on overflow
- * matters as much as stopping the output: otherwise the caller's connection
- * stays open and the request handler never returns.
+ * The backstop for a caller whose Content-Length understates the body — chunked
+ * encoding makes that trivial, and it is the difference between a generous cap and
+ * an unbounded forward. Destroying the source on overflow matters as much as
+ * stopping the output: otherwise the caller's connection stays open and the request
+ * handler never returns.
  *
- * The stream is never buffered, so a 4 KB credential occupies a 4 KB buffer and
- * a 4 MB one is cut off at 4 KB.
+ * The stream is never buffered, so a 4 KB credential occupies a 4 KB buffer and a
+ * 4 MB one is cut off at 4 KB.
+ *
+ * ## Written with `pipeline`, not with `source.read()`
+ *
+ * The first implementation polled:
+ *
+ *     const chunk = source.read(64 * 1024);
+ *     if (chunk === null) { this.push(null); return; }
+ *
+ * which is wrong in a way that looks fine. `read()` returning `null` means "nothing
+ * buffered *right now*", not "the body is finished" — and on a network stream the
+ * first chunk usually has not arrived yet when this runs. So the wrapper pushed a
+ * premature end-of-stream and **every adapter received a zero-byte credential**,
+ * while the route still answered 202 and still emitted `login-started`.
+ *
+ * Found by writing the byte-for-byte test mac asked for, ahead of the runner that
+ * would have made it visible as a sign-in failure. Nothing else in the suite noticed
+ * because every other credential test asserted that *events* happened, not that
+ * *bytes* arrived.
+ *
+ * `pipeline` waits for data, propagates backpressure, and destroys the source if
+ * the consumer goes away. The error surfaces on the returned stream, which the
+ * caller sees while reading.
  */
 export function capStream(
   source: Readable,
@@ -98,24 +119,27 @@ export function capStream(
 ): Readable {
   let seen = 0;
 
-  return new Readable({
-    read(this: Readable) {
-      const chunk = source.read(64 * 1024) as Buffer | null;
-      if (chunk === null) {
-        this.push(null);
-        return;
-      }
-      seen += chunk.length;
+  const tap = new Transform({
+    transform(chunk: Buffer, _encoding, done) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
+      seen += buf.length;
       if (seen > limit) {
-        // Destroy the source as well as ending this stream. Leaving the
-        // caller's connection open would hold the handler open indefinitely.
+        // Destroy the source as well as erroring this stream. Leaving the caller's
+        // connection open would hold the handler open indefinitely.
         source.destroy();
-        this.destroy(new Error("credential body exceeded the cap"));
+        done(new Error("credential body exceeded the cap"));
         return;
       }
-      this.push(chunk);
+      done(null, buf);
     },
   });
+
+  // The callback is required and is not an error handler for the caller: it exists
+  // so the stream machinery has somewhere to report teardown. The consumer sees the
+  // same error on `tap` itself.
+  pipeline(source, tap, () => {});
+
+  return tap;
 }
 
 /**

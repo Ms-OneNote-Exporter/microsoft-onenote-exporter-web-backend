@@ -5,6 +5,7 @@ import { ConfigError, loadConfig, validateInternalOrigin, validateOrigins, valid
 function baseEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
   return {
     ALLOWED_ORIGINS: "https://app.example.com",
+    PUBLIC_ORIGIN: "https://one-backend.example.com",
     CSRF_KEY: "A".repeat(43),
     ORCHESTRATOR_URL: "http://orchestrator:9100",
     ORCHESTRATOR_HMAC_SECRET: "B".repeat(43),
@@ -35,9 +36,41 @@ describe("validateOrigins", () => {
     expect(() => validateOrigins("null")).toThrow(/sandboxed iframe/);
   });
 
-  it("rejects http", () => {
-    expect(() => validateOrigins("http://app.example.com")).toThrow(/must be https/);
-    expect(() => validateOrigins("http://localhost:3000")).toThrow(/must be https/);
+  it("rejects http for a real host", () => {
+    // A credential over http to a real host crosses a wire in clear, which is the
+    // entire reason the rule exists.
+    for (const hostile of [
+      "http://app.example.com",
+      "http://192.168.1.10:5173",
+      "http://10.0.0.5",
+      "http://172.16.0.1",
+      "http://evil.test",
+    ]) {
+      expect(() => validateOrigins(hostile)).toThrow(/must be https/);
+    }
+  });
+
+  // The narrow exception, so a development frontend can be named in the
+  // allowlist without the mock server having to bypass validation entirely.
+  it("allows http on loopback only", () => {
+    for (const dev of [
+      "http://localhost:5173",
+      "http://127.0.0.1:5173",
+      "http://127.0.0.1",
+      "http://[::1]:5173",
+    ]) {
+      expect(() => validateOrigins(dev)).not.toThrow();
+      expect(validateOrigins(dev).has(new URL(dev).origin)).toBe(true);
+    }
+  });
+
+  it("does not extend the loopback exception to private ranges", () => {
+    // 127/8 is loopback by definition. 10/8 and 192.168/16 are reachable over a
+    // real network, so they stay https-only.
+    expect(() => validateOrigins("http://192.168.1.10")).toThrow(/must be https/);
+    expect(() => validateOrigins("http://10.1.2.3")).toThrow(/must be https/);
+    // And a hostname that merely looks local is not local.
+    expect(() => validateOrigins("http://localhost.evil.test")).toThrow(/must be https/);
   });
 
   it("rejects a trailing slash", () => {
@@ -145,6 +178,9 @@ describe("loadConfig", () => {
     expect(cfg.minFreeDiskMb).toBe(2048);
     expect(cfg.orchestratorReplayWindowSeconds).toBe(60);
     expect(cfg.logLevel).toBe("info");
+    // The download origin is a first-class config value, not derived from a
+    // request header — see validatePublicOrigin.
+    expect(cfg.publicOrigin).toBe("https://one-backend.example.com");
   });
 
   it("honours explicit values", () => {

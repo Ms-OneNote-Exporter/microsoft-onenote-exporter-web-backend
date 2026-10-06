@@ -175,6 +175,21 @@ export interface SessionSnapshot {
      * whole point of telling them.
      */
     readonly partialReason: "aborted" | "quota" | "disk" | null;
+    /**
+     * Why a failed export failed, or null when it did not fail.
+     *
+     * mac's finding: with no error field, the only place a reason could live was
+     * `export-log` frames — which a refresh discards entirely, because
+     * `GET /api/session/status` returns no logs, and which the ring buffer can
+     * evict on a long export. So a failed export was unrenderable after a
+     * refresh, and sometimes before one too.
+     *
+     * This is **user-facing text**. It must not carry the artifact path, the
+     * notebook name, or anything from the CLI's stderr, because it crosses to the
+     * frontend verbatim. `sanitiseExportError` is the only thing that should ever
+     * produce one of these.
+     */
+    readonly error: string | null;
     readonly id: string | null;
     readonly notebook: string | null;
     readonly progress: { pages: number; sections: number; assets: number } | null;
@@ -194,12 +209,60 @@ export interface StoredExportState {
   state: SessionSnapshot["export"]["state"];
   /** See SessionSnapshot.export.partialReason. */
   partialReason: "aborted" | "quota" | "disk" | null;
+  /** See SessionSnapshot.export.error. */
+  error: string | null;
   id: string | null;
   notebook: string | null;
   progress: { pages: number; sections: number; assets: number } | null;
   startedAt: number | null;
   finishedAt: number | null;
 }
+
+/**
+ * MAX_EXPORT_ERROR_CHARS caps an export error message.
+ *
+ * Long enough for a sentence, short enough that a stack trace or a CLI dump
+ * cannot ride along and fill the snapshot.
+ */
+export const MAX_EXPORT_ERROR_CHARS = 200;
+
+/**
+ * Display text per failure classification.
+ *
+ * Deliberately a closed set rather than a function of the thrown error. The
+ * exporter is a third-party CLI, so its failure text contains absolute paths and
+ * sometimes the notebook name — and this string crosses to the frontend and is
+ * rendered. A closed set means a new failure mode has to be *added* here, by
+ * someone deciding it is safe to display, rather than a raw `error.message`
+ * reaching a screen by default.
+ */
+const EXPORT_ERROR_MESSAGES: Readonly<Record<string, string>> = {
+  quota: "OneNote rejected the request or the export hit a service limit.",
+  disk: "The export ran out of disk space.",
+  auth: "Your Microsoft sign-in expired before the export finished.",
+  network: "The export lost its connection and could not continue.",
+  aborted: "The export was stopped before it finished.",
+  cli: "The export tool exited with an error.",
+};
+
+/**
+ * sanitiseExportError maps a runner's failure classification to display text.
+ *
+ * Returns null for anything unrecognised, and the caller substitutes
+ * `GENERIC_EXPORT_ERROR`. That is the safe default: an unknown failure gets a
+ * vague reason rather than a leaked filesystem path.
+ *
+ * Note it never passes the reason through — the input is looked up, never echoed.
+ * So there is no sanitisation of arbitrary text to get wrong here, because no
+ * arbitrary text is ever rendered.
+ */
+export function sanitiseExportError(reason: string | null | undefined): string | null {
+  if (typeof reason !== "string") return null;
+  return EXPORT_ERROR_MESSAGES[reason.trim().toLowerCase()] ?? null;
+}
+
+/** The message used when a failure cannot be classified. */
+export const GENERIC_EXPORT_ERROR: string = EXPORT_ERROR_MESSAGES["cli"] as string;
 
 /**
  * buildSnapshot renders the restore payload.
@@ -213,6 +276,7 @@ export function buildSnapshot(
   session: SessionRow,
   now: number,
   notebooks: { state: SessionSnapshot["notebooks"]["state"]; items: string[] },
+  publicOrigin: string,
 ): SessionSnapshot {
   const exportState = parseExportState(session.export_state);
 
@@ -244,6 +308,7 @@ export function buildSnapshot(
     export: {
       state: exportState?.state ?? "none",
       partialReason: exportState?.partialReason ?? null,
+      error: exportState?.error ?? null,
       id: exportState?.id ?? null,
       notebook: exportState?.notebook ?? null,
       progress: exportState?.progress ?? null,
@@ -260,7 +325,17 @@ export function buildSnapshot(
       partial: session.artifact_partial === 1,
       // The download URL carries the opaque artifact id and nothing else — no
       // GUID, no notebook name (PLAN-v3 §5, invariant 8).
-      downloadUrl: session.artifact_id === null ? null : `/files/${session.artifact_id}`,
+      //
+      // Absolute, and pointing at *this* origin, which is why `publicOrigin` is
+      // configured rather than derived. A relative URL would resolve against the
+      // frontend's origin, and the `__Host-msout` cookie cannot travel there — the
+      // `__Host-` prefix forbids a `Domain` attribute, so the browser would not
+      // attach it, and Caddy's `forward_auth` would see no cookie and refuse every
+      // download. `SameSite=None` does not help: SameSite governs site, not host.
+      downloadUrl:
+        session.artifact_id === null
+          ? null
+          : `${publicOrigin}/files/${session.artifact_id}`,
       // The notebook name comes from Content-Disposition at download time, not
       // from here, because putting it in the URL would leak it into Referer and
       // access logs.
@@ -309,6 +384,13 @@ export function parseExportState(raw: string | null): StoredExportState | null {
         parsed.partialReason === "quota" ||
         parsed.partialReason === "disk"
           ? parsed.partialReason
+          : null,
+      // Coerced to a string and length-capped rather than trusted. This value is
+      // rendered to the user, and a stored blob is not something a client should
+      // be asked to escape.
+      error:
+        typeof parsed.error === "string" && parsed.error.length > 0
+          ? parsed.error.slice(0, MAX_EXPORT_ERROR_CHARS)
           : null,
       id: parsed.id ?? null,
       notebook: parsed.notebook ?? null,

@@ -22,7 +22,7 @@
  */
 
 import type { Db, SessionRow } from "./db.js";
-import type { OrchestratorClient, OrchestratorStats } from "./orchestrator-client.js";
+import type { OrchestratorApi, OrchestratorResult, OrchestratorStats } from "./orchestrator-client.js";
 import type { SseHub } from "./sse.js";
 
 /** The TTLs from PLAN-v2 §2.1, in milliseconds. */
@@ -66,7 +66,7 @@ export interface SweepReport {
 /** Options for the sweeper. */
 export interface SweeperOptions {
   readonly db: Db;
-  readonly orchestrator: OrchestratorClient;
+  readonly orchestrator: OrchestratorApi;
   readonly sse: SseHub;
   readonly log?: SweeperLog;
   readonly now?: () => number;
@@ -114,7 +114,7 @@ export function idleExpiresAt(session: SessionRow, now: number): number | null {
  */
 export class PoolBinder {
   readonly #db: Db;
-  readonly #orchestrator: OrchestratorClient;
+  readonly #orchestrator: OrchestratorApi;
   readonly #log: SweeperLog;
   readonly #now: () => number;
 
@@ -356,6 +356,41 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
 }
 
 /**
+ * syncPool makes the `runners` table agree with the orchestrator's slot list.
+ *
+ * Why this exists, because it is not obvious: `runners` starts empty, and
+ * `claimRunner` only ever *moves* a row from idle to claimed. Nothing inserts.
+ * So without this the pool is permanently empty, `claimForLogin` always returns
+ * `pool-exhausted`, and every login 503s — a failure that presents as "the pool is
+ * busy" rather than as "the api was never seeded".
+ *
+ * The slot ids must be the orchestrator's, because `release` and `recycle` take a
+ * `slotId` and `sessions.runner_id` holds this table's id. An id invented here
+ * would be released against a slot that does not exist, and the orchestrator would
+ * answer 409 for a call that should have succeeded.
+ *
+ * Note what is *not* taken: container ids. §2.1 restricts the api from holding
+ * container identities it cannot verify, and a slot id is not that — it is a name
+ * the api has to know anyway to release anything at all.
+ *
+ * Upserts rather than clearing the table first, so a boot that overlaps a live
+ * claim cannot free a slot somebody is using.
+ */
+export function syncPool(
+  db: Db,
+  slotIds: readonly string[],
+): { added: number; total: number } {
+  let added = 0;
+  for (const id of slotIds) {
+    if (db.get<{ id: string }>(`SELECT id FROM runners WHERE id = ?`, id) === undefined) {
+      db.registerRunner(id, "", "idle");
+      added++;
+    }
+  }
+  return { added, total: db.all(`SELECT id FROM runners`).length };
+}
+
+/**
  * reconcile is the api's half of boot reconciliation (PLAN-v2 §2.5).
  *
  * Takes the orchestrator's view of the pool and reconciles the session table
@@ -376,7 +411,7 @@ export async function reconcile(options: SweeperOptions): Promise<{
   const log = options.log ?? { info: () => {}, warn: () => {} };
   const now = options.now?.() ?? Date.now();
 
-  const stats: OrchestratorResult<OrchestratorStats> = await options.orchestrator.stats();
+  const stats: StatsResult = await options.orchestrator.stats();
 
   if (!stats.ok) {
     // Not fatal, and specifically not "the pool is empty". Assuming an empty pool
@@ -424,7 +459,5 @@ export async function reconcile(options: SweeperOptions): Promise<{
   };
 }
 
-/** The orchestrator result type, re-declared locally to avoid a wide import. */
-type OrchestratorResult<T> = Awaited<ReturnType<OrchestratorClient["stats"]>> extends never
-  ? never
-  : { ok: true; value: T } | { ok: false; error: { kind: string } };
+/** The result of a stats call, used by the boot reconciler. */
+type StatsResult = OrchestratorResult<OrchestratorStats>;

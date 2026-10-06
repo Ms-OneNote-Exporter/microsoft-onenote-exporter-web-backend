@@ -653,13 +653,47 @@ Unchanged mechanics, three v3-specific changes.
    `X-Artifact-Partial: 1` and the filename is suffixed `.partial.zip`. A
    partial vault must not be mistakable for a complete one, and that must not
    depend on the UI being correct.
-3. **Direct authorised serving.** Unchanged: `forward_auth` to `api`, then
-   `file_server` with `sendfile` and `Range`. Multi-gigabyte downloads never
-   pass through Node. Because the download is a top-level navigation from the
-   frontend origin, the `SameSite=None` cookie is sent — which is correct and is
-   another reason `SameSite=None` is unavoidable rather than chosen.
+3. **Direct authorised serving.** `forward_auth` to `api`, then `file_server`
+   with `sendfile` and `Range`. Multi-gigabyte downloads never pass through Node.
+
+   **`/files/*` is served on the api's own origin, and `downloadUrl` is
+   absolute.** An earlier draft of this section made the download a top-level
+   navigation from the *frontend* origin, reasoning that `SameSite=None` would
+   carry the cookie. That is wrong, and mac's review question ("is Caddy serving
+   that exact path?") is what exposed it:
+
+   - The session cookie is `__Host-msout`. The `__Host-` prefix forbids a
+     `Domain` attribute, so the cookie is **host-only for the api origin**.
+   - A relative `/files/<id>` resolves against the *frontend's* origin, where the
+     browser will not attach that cookie.
+   - `SameSite=None` governs **site**, not **host**. It does not widen the cookie's
+     host scope, so it cannot help here.
+
+   So a relative download URL means `forward_auth` receives an empty `Cookie`
+   header and answers 401 — on every download, for every user, discovered only
+   after a completed export. Caddy therefore serves `/files/*` on the api origin,
+   and `artifact.downloadUrl` is `https://<api-host>/files/<artifactId>`.
+
+   The origin is operator configuration (`PUBLIC_ORIGIN`), validated at boot, and
+   never read from `X-Forwarded-Host`: a request header in this path would let a
+   second operator's proxy redirect a user's artifact download.
+
+   The frontend consumes `downloadUrl` verbatim and constructs nothing — which is
+   the point of putting the URL in the snapshot. A client-side relative fallback
+   would paper over exactly the mismatch this section now fixes.
+
+4. **A failed export explains itself.** `export.error` is a short, already-safe
+   message, present on every snapshot and non-null only when
+   `export.state === "failed"`. Without it the only place a reason could live was
+   an `export-log` frame, and that is not a place: `GET /api/session/status`
+   returns no logs, so a refresh discards them, and the ring buffer can evict
+   them on a long export. A failed export was therefore unrenderable after a
+   refresh. The value is a closed set of fixed strings keyed on a classification
+   the runner reports — never the exporter's own error text, which carries
+   absolute paths and sometimes the notebook name (mac's finding, §7.5).
 
 ```caddy
+# On the api's origin. Not on the frontend's — see above.
 handle /files/* {
   forward_auth api:3000 {
     uri /internal/authorize-download

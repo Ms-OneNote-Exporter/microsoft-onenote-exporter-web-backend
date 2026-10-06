@@ -33,6 +33,7 @@ const config: ApiConfig = {
   csrfKey: "C".repeat(43),
   sessionTtlHours: 12,
   minFreeDiskMb: 2048,
+  publicOrigin: "https://one-backend.example.com",
   orchestratorUrl: "http://orchestrator:9100",
   orchestratorSecret: "B".repeat(43),
   orchestratorReplayWindowSeconds: 60,
@@ -465,7 +466,9 @@ describe("GET /api/session/status", () => {
 
       expect(body.artifact.available).toBe(true);
       expect(body.artifact.partial).toBe(true);
-      expect(body.artifact.downloadUrl).toBe(`/files/${"A".repeat(43)}`);
+      expect(body.artifact.downloadUrl).toBe(
+        "https://one-backend.example.com/files/" + "A".repeat(43),
+      );
       expect(body.artifact.downloadUrl).not.toContain(GUID);
       expect(body.artifact.downloadUrl).not.toContain("Personal");
       // The name comes from Content-Disposition at download time.
@@ -525,12 +528,17 @@ describe("POST /api/session/credential", () => {
         .finally(() => app.close()),
     );
 
-  it("refuses a session with no runner bound", async () => {
-    // The password would have nowhere to go, so it must not travel.
+  it("answers 501 when no runner adapter is wired, before it binds anything", async () => {
+    // The unwired state. 501 rather than 409 because the missing thing *is* the
+    // wiring, and saying "no runner bound" would point an operator at the pool
+    // rather than at the absent adapter.
+    //
+    // 501 also comes first deliberately: claiming a container and then refusing
+    // would leak the expensive thing for nothing.
     seed(GUID, { runnerId: null });
     const response = await post({ "x-csrf-token": derive(csrfKey, GUID) });
-    expect(response.statusCode).toBe(409);
-    expect(response.json().error).toBe("no runner bound to this session");
+    expect(response.statusCode).toBe(501);
+    expect(response.json().error).toBe("credential forwarding not wired yet");
   });
 
   // T-C3, through the real route.
@@ -580,13 +588,16 @@ describe("POST /api/session/credential", () => {
     // caller which JSON-encodes is forwarded bytes-for-byte, quotes included —
     // a client bug rather than a server one. This asserts the type is *accepted*:
     // 415 here would mean the route had started caring.
+    //
+    // Reaches the unwired 501, which is what proves the content-type check ran
+    // first and passed rather than short-circuiting.
     seed(GUID, { runnerId: null });
     const response = await post({
       "content-type": "application/json",
       "x-csrf-token": derive(csrfKey, GUID),
     });
-    expect(response.statusCode).toBe(409);
-    expect(response.json().error).toBe("no runner bound to this session");
+    expect(response.statusCode).toBe(501);
+    expect(response.json().error).toBe("credential forwarding not wired yet");
   });
 });
 

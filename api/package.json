@@ -10,9 +10,10 @@
     "comment": "22.5 is the floor for node:sqlite, which is the api's database driver. A native addon (better-sqlite3) would mean a compilation step and a prebuilt-binary supply chain in the component that must not have either."
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
+    "mock": "tsx mock/server.ts",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

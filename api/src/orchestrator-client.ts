@@ -104,6 +104,29 @@ export type OrchestratorError =
   | { readonly kind: "unreachable"; readonly cause: string }
   | { readonly kind: "unexpected"; readonly status: number; readonly body: string };
 
+/**
+ * OrchestratorApi is the surface `api` needs from the orchestrator.
+ *
+ * A structural interface rather than the concrete `OrchestratorClient`, for one
+ * reason: `api` holds no Docker socket and must never do container work itself, so
+ * what it needs is six calls and nothing more. Naming that surface makes the
+ * authority explicit and lets a local mock satisfy it without inheriting signing
+ * code it would never use.
+ *
+ * The real client is the only production implementation. It is also the only
+ * implementation that signs anything — which is why this interface has no
+ * `secret` and no way to make an unsigned call.
+ */
+export interface OrchestratorApi {
+  claim(sessionGuid: string, sessionExpiresAt: Date): Promise<OrchestratorResult<ClaimResponse>>;
+  release(slotId: string): Promise<OrchestratorResult<{ released: boolean }>>;
+  recycle(slotId: string, reason: string): Promise<OrchestratorResult<{ recycled: boolean }>>;
+  remove(slotId: string): Promise<OrchestratorResult<{ removed: boolean }>>;
+  stat(artifactId: string): Promise<OrchestratorResult<StatResponse>>;
+  stats(): Promise<OrchestratorResult<OrchestratorStats>>;
+  healthz(): Promise<OrchestratorResult<{ ok: boolean; pool: OrchestratorStats }>>;
+}
+
 /** Options for the client. */
 export interface OrchestratorClientOptions {
   /** Base URL, e.g. http://orchestrator:9100. Validated at config load. */
@@ -129,7 +152,7 @@ export interface OrchestratorClientOptions {
  * re-reads, and unauthorized is a clock or secret problem that should page
  * someone.
  */
-export class OrchestratorClient {
+export class OrchestratorClient implements OrchestratorApi {
   readonly #baseUrl: string;
   readonly #secret: string;
   readonly #timeoutMs: number;

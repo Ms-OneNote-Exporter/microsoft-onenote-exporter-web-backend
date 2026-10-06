@@ -35,10 +35,12 @@ import type { Readable } from "node:stream";
 
 import { ApiConfig } from "./config.js";
 import { Db } from "./db.js";
-import { OrchestratorClient } from "./orchestrator-client.js";
+import type { OrchestratorApi } from "./orchestrator-client.js";
 import { SseHub } from "./sse.js";
 import { RateLimiter } from "./rate-limit.js";
 import type { EraseDeps } from "./erase.js";
+import type { RunnerAdapter } from "./runner-adapter.js";
+import type { PoolBinder } from "./sweep.js";
 import { registerRoutes, type RouteDeps } from "./routes.js";
 import { authenticate, authErrorBody, authStatus, PROTOCOL_VERSION, API_BUILD } from "./auth.js";
 import {
@@ -179,7 +181,7 @@ declare module "fastify" {
 /** Dependencies, injected rather than imported as singletons. */
 export interface ServerDeps {
   readonly db: Db;
-  readonly orchestrator: OrchestratorClient;
+  readonly orchestrator: OrchestratorApi;
   /** The SSE hub. One per process; sessions are multiplexed inside it. */
   readonly sse: SseHub;
   /** The rate limiter. One per process, since its counters are per-process. */
@@ -192,6 +194,26 @@ export interface ServerDeps {
    * pretending to have deleted anything.
    */
   readonly eraseRunner?: EraseDeps["runner"];
+  /**
+   * The api's route to a runner container.
+   *
+   * Optional, and absent in every real deployment until the runner sidecar lands
+   * (§12 steps 1–2). Without it the four runner-facing routes return 501, which
+   * is the current behaviour and the contract mac is building against — so adding
+   * this changes no route, status code or header a browser can see.
+   *
+   * A mock supplies one, which is how a frontend gets a backend to develop
+   * against without Docker.
+   */
+  readonly runner?: RunnerAdapter;
+  /**
+   * Binds a session to a container when it first needs one.
+   *
+   * Absent in the unwired state, in which case the credential route answers 409 —
+   * the same as before this existed. The absence is the thing that keeps the
+   * binding out of a deployment that has no pool to bind from.
+   */
+  readonly poolBinder?: PoolBinder;
 }
 
 /** Options for buildServer. */
@@ -229,6 +251,8 @@ export function buildServer(
   };
   if (options.knownProxies !== undefined) routeDeps.knownProxies = options.knownProxies;
   if (deps.eraseRunner !== undefined) routeDeps.eraseRunner = deps.eraseRunner;
+  if (deps.runner !== undefined) routeDeps.runner = deps.runner;
+  if (deps.poolBinder !== undefined) routeDeps.poolBinder = deps.poolBinder;
 
   registerRoutes(app, config, routeDeps);
   return app;

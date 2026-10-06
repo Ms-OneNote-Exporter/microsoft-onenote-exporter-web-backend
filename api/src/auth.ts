@@ -354,8 +354,32 @@ export function buildSnapshot(
  */
 export const PROTOCOL_VERSION = 3;
 
-/** The api build identifier, surfaced on /api/public/version. */
-export const API_BUILD = process.env.BUILD_ID ?? "dev";
+/**
+ * The api build identifier, surfaced on /api/public/version.
+ *
+ * **Descriptive only. It must never decide anything.**
+ *
+ * mac's point on a live deployment reporting `build: "dev"`: it was actively
+ * misleading — someone reading the response concludes it is a development
+ * deployment, and it is not, with a real certificate behind it. Worse, the day
+ * anything *consumes* `build` to branch on, the string becomes load-bearing, and
+ * then it has to be trustworthy. It was harmless only because nothing read it,
+ * which is not a property worth relying on.
+ *
+ * So it is made true rather than removed: the image bakes in the commit it was
+ * built from. A value that is accurate cannot mislead anyone, and if something
+ * does start consuming it, "which commit is running" is the right question and the
+ * right answer.
+ *
+ * The compatibility meaning stays in `protocol`, which is the field a client
+ * pins — the same split as the frontend's EXPECTED_PROTOCOL. `build` answers "what
+ * is this", `protocol` answers "can I talk to it".
+ *
+ * The `local` default is honest rather than a lie: an unset BUILD_ID does mean a
+ * local run. It cannot happen in a published image, because the Dockerfile sets
+ * the variable unconditionally.
+ */
+export const API_BUILD = process.env.BUILD_ID ?? "local";
 
 /** iso renders a millisecond timestamp as ISO-8601 UTC with milliseconds. */
 export function iso(ms: number): string {

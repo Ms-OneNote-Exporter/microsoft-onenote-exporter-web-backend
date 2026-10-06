@@ -171,6 +171,13 @@ const cases = [
     expectMessage: /POOL_SIZE, which its config never reads/,
   },
   {
+    name: "leaves the api image unstamped",
+    mutate: (c) => {
+      delete c.services.api.build.args.BUILD_ID;
+    },
+    expectMessage: /the api image has no BUILD_ID/,
+  },
+  {
     name: "stops dropping all capabilities on the api",
     mutate: (c) => {
       delete c.services.api.cap_drop;

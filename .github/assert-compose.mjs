@@ -256,7 +256,24 @@ for (const key of Object.keys(orchEnv)) {
   );
 }
 
-// 9. The api is not root and holds no extra capabilities.
+// 9. The api image is stamped with the commit it was built from.
+//
+// mac's point: `build` on /api/public/version read "dev" on a live deployment with
+// a real certificate. It was harmless only because nothing consumed it, which is
+// not a property to rely on — the day something branches on it, the string has to
+// be trustworthy. Made true instead: the image bakes in the commit.
+//
+// Asserted here rather than in the Dockerfile because a missing build arg produces
+// an image that looks fine and lies, and the Dockerfile cannot check what compose
+// passed it.
+const apiBuildArgs = cfg.services?.api?.build?.args ?? {};
+check(
+  typeof apiBuildArgs.BUILD_ID === "string" && apiBuildArgs.BUILD_ID.length > 0,
+  `the api image is stamped with BUILD_ID=${apiBuildArgs.BUILD_ID}`,
+  "the api image has no BUILD_ID, so it would report itself as a local run",
+);
+
+// 10. The api is not root and holds no extra capabilities.
 //
 // A `USER` directive does not survive `docker compose config` — it lives in the
 // image — so this is checked where it is actually true, in the Dockerfile, by CI

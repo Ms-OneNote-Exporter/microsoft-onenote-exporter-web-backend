@@ -1,0 +1,430 @@
+/**
+ * Pool binding and the background sweepers.
+ *
+ * PLAN-v2 §2.1–2.3 and §2.5, for the half of the pool that belongs to `api`.
+ *
+ * The division is deliberate and is the v3 restatement of v2's single
+ * reconciler: `api` reconciles **sessions** against SQLite, the orchestrator
+ * reconciles **containers** against their labels, and neither trusts the other's
+ * view alone. Neither process decides session expiry, because only `api` can see
+ * a session row.
+ *
+ * Two clocks, and they are independent (PLAN-v2 §2.1):
+ *
+ *   10 min   a GUID created with no login started
+ *   15 min   a login in progress
+ *   30 min   authenticated and idle
+ *
+ * The absolute 12-hour cap is separate from both. It is what the plan means by
+ * "the session survives 12 hours" — data, artifacts and countdown all persist for
+ * 12 hours — while a session that exports in ten minutes releases its runner
+ * within minutes. Throughput is bounded by concurrency, not by 12-hour holds.
+ */
+
+import type { Db, SessionRow } from "./db.js";
+import type { OrchestratorClient, OrchestratorStats } from "./orchestrator-client.js";
+import type { SseHub } from "./sse.js";
+
+/** The TTLs from PLAN-v2 §2.1, in milliseconds. */
+export const TTL = {
+  /** GUID created, no login started. */
+  unclaimedSession: 10 * 60 * 1000,
+  /** Login in progress — covers an MFA challenge the user walked away from. */
+  loginInProgress: 15 * 60 * 1000,
+  /** Authenticated and idle. */
+  authenticatedIdle: 30 * 60 * 1000,
+  /** Absolute session age. */
+  absolute: 12 * 60 * 60 * 1000,
+} as const;
+
+/** Why a session was reaped. Recorded so the log line is diagnosable. */
+export type ReapReason =
+  | "unclaimed-expired"
+  | "login-expired"
+  | "idle-expired"
+  | "absolute-cap-reached";
+
+/**
+ * What one sweep did.
+ *
+ * Mutable so `sweep` can accumulate into it; the fields are readonly to callers
+ * because a report is a record, not something to be edited after the fact.
+ */
+export interface SweepReport {
+  /** Sessions deleted because their absolute cap was reached. */
+  absoluteExpired: number;
+  /** Runners released because their session went idle past its TTL. */
+  idleReleased: number;
+  /** Sessions with no login started, deleted past 10 minutes. */
+  unclaimedExpired: number;
+  /** Logins in progress past 15 minutes, aborted. */
+  loginExpired: number;
+  /** Sessions left for the erase machine because they were mid-erase. */
+  skippedErasing: number;
+}
+
+/** Options for the sweeper. */
+export interface SweeperOptions {
+  readonly db: Db;
+  readonly orchestrator: OrchestratorClient;
+  readonly sse: SseHub;
+  readonly log?: SweeperLog;
+  readonly now?: () => number;
+}
+
+/** The log surface the sweeper uses. Narrow on purpose. */
+export interface SweeperLog {
+  info(msg: string, fields?: Record<string, unknown>): void;
+  warn(msg: string, fields?: Record<string, unknown>): void;
+}
+
+/**
+ * idleExpiresAt computes a session's idle deadline from its state.
+ *
+ * Null means "no idle deadline applies" — an export in flight has none, because
+ * §2.1 says an export gets no idle kill and only the absolute cap applies.
+ */
+export function idleExpiresAt(session: SessionRow, now: number): number | null {
+  switch (session.state) {
+    case "created":
+      // 10 minutes from creation. Not from last activity: the point is that a
+      // GUID nobody acted on stops costing a slot.
+      return session.created_at + TTL.unclaimedSession;
+    case "authenticating":
+      return session.last_activity_at + TTL.loginInProgress;
+    case "authenticated":
+      return session.last_activity_at + TTL.authenticatedIdle;
+    case "exporting":
+      // §2.1: "Export running — no idle kill; absolute 12h cap applies."
+      return null;
+    case "erasing":
+    case "erased":
+      return null;
+  }
+}
+
+/**
+ * PoolBinder owns the binding between a session and a runner slot.
+ *
+ * The atomic claim is in SQLite, not here: `db.claimRunner` takes the write lock
+ * at BEGIN IMMEDIATE and returns whether a row changed. That is the lock
+ * (PLAN-v2 §2.4), and doing it in two places would be doing it in the wrong one.
+ * What this type adds is the orchestrator call that turns a claimed slot into a
+ * running container, and the compensation when that call fails.
+ */
+export class PoolBinder {
+  readonly #db: Db;
+  readonly #orchestrator: OrchestratorClient;
+  readonly #log: SweeperLog;
+  readonly #now: () => number;
+
+  constructor(options: SweeperOptions) {
+    this.#db = options.db;
+    this.#orchestrator = options.orchestrator;
+    this.#log = options.log ?? { info: () => {}, warn: () => {} };
+    this.#now = options.now ?? (() => Date.now());
+  }
+
+  /**
+   * claimForLogin binds an idle runner to a session.
+   *
+   * Order matters and is not interchangeable:
+   *
+   *   1. SQLite claim — cheap, transactional, and if it fails the pool is full and
+   *      nothing has changed.
+   *   2. Orchestrator claim — expensive, creates a container, and if it fails the
+   *      slot has to be released or it leaks.
+   *
+   * Doing it the other way round would create a container for a session that
+   * cannot be given one, and a container is the expensive thing to leak.
+   */
+  async claimForLogin(
+    session: SessionRow,
+  ): Promise<
+    | { ok: true; runnerId: string; containerId: string }
+    | { ok: false; reason: "pool-exhausted" | "orchestrator-unreachable" }
+  > {
+    const now = this.#now();
+
+    if (!this.#db.claimRunner(session.guid)) {
+      // Pool exhaustion. §2.6: the caller shows the earliest of
+      // (idle_expires_at, expires_at) minus now, or says plainly that every
+      // session is busy rather than showing a countdown that will not move.
+      this.#log.info("pool exhausted", { session: session.guid });
+      return { ok: false, reason: "pool-exhausted" };
+    }
+
+    const claimed = this.#db.get<{ id: string }>(
+      `SELECT id FROM runners WHERE session_guid = ?`,
+      session.guid,
+    );
+    if (claimed === undefined) {
+      // Unreachable: claimRunner returned true, so a row changed. Made loud
+      // rather than assumed, because the alternative is a session that believes
+      // it has a runner it does not.
+      this.#log.warn("claim reported success but no runner row is bound", {
+        session: session.guid,
+      });
+      return { ok: false, reason: "orchestrator-unreachable" };
+    }
+
+    const result = await this.#orchestrator.claim(session.guid, new Date(session.expires_at));
+
+    if (!result.ok) {
+      // Compensate. A slot claimed in SQLite but never given a container is a
+      // slot that never becomes available again — the pool shrinks by one per
+      // failed call and nothing would notice.
+      this.#db.releaseRunner(claimed.id);
+      this.#log.warn("orchestrator claim failed, slot released", {
+        session: session.guid,
+        runner: claimed.id,
+        error: result.error.kind as string,
+      });
+      return { ok: false, reason: "orchestrator-unreachable" };
+    }
+
+    // The orchestrator returns its own container id; record it so boot
+    // reconciliation has something to compare against.
+    this.#db.run(
+      `UPDATE runners SET container_id = ?, status = 'active', health = 'unknown' WHERE id = ?`,
+      result.value.containerId,
+      claimed.id,
+    );
+    this.#db.run(
+      `UPDATE sessions SET runner_id = ?, state = 'authenticating', auth_state = 'authenticating',
+                          idle_expires_at = ?, last_activity_at = ?
+        WHERE guid = ?`,
+      claimed.id,
+      now + TTL.loginInProgress,
+      now,
+      session.guid,
+    );
+
+    this.#log.info("runner claimed", {
+      session: session.guid,
+      runner: claimed.id,
+      container: result.value.containerId,
+    });
+    return { ok: true, runnerId: claimed.id, containerId: result.value.containerId };
+  }
+
+  /**
+   * releaseForIdle returns a runner without ending the session.
+   *
+   * §2.3 step 3→4: "Idle TTL hit → container removed or recycled, session row
+   * retained. Activity again → new runner claimed, same session volume remounted,
+   * so auth.json, notebook cache and artifacts are all still there."
+   *
+   * The session row is deliberately kept. Deleting it would log the user out
+   * every time their runner idles, which is the opposite of what the TTL is for.
+   */
+  async releaseForIdle(session: SessionRow): Promise<boolean> {
+    if (session.runner_id === null) return false;
+
+    const released = await this.#orchestrator.release(session.runner_id);
+    if (!released.ok && released.error.kind !== "conflict") {
+      // The slot stays bound in SQLite, so the next sweep tries again. Better
+      // than releasing it here: a container that still exists must not be
+      // forgotten, or reconciliation will not find it.
+      this.#log.warn("orchestrator release failed, slot retained for retry", {
+        session: session.guid,
+        runner: session.runner_id,
+        error: released.error.kind,
+      });
+      return false;
+    }
+
+    this.#db.releaseRunner(session.runner_id);
+    this.#db.run(
+      `UPDATE sessions SET runner_id = NULL, state = 'authenticated',
+                          auth_state = CASE WHEN auth_state = 'authenticating' THEN 'valid' ELSE auth_state END,
+                          idle_expires_at = ?
+        WHERE guid = ?`,
+      this.#now() + TTL.authenticatedIdle,
+      session.guid,
+    );
+    this.#log.info("runner released, session retained", {
+      session: session.guid,
+      runner: session.runner_id,
+    });
+    return true;
+  }
+
+  /**
+   * releaseForAbsence returns a runner for a session that is going away.
+   *
+   * Distinct from `releaseForIdle`: the session row goes too, so the vault has to
+   * be erased rather than kept for a rebind. The erase machine does the deletion;
+   * this only returns the slot.
+   */
+  async releaseForAbsence(session: SessionRow): Promise<boolean> {
+    if (session.runner_id === null) return false;
+    const released = await this.#orchestrator.release(session.runner_id);
+    if (!released.ok && released.error.kind !== "conflict") {
+      this.#log.warn("release during session teardown failed, retained for retry", {
+        session: session.guid,
+        runner: session.runner_id,
+        error: released.error.kind,
+      });
+      return false;
+    }
+    this.#db.releaseRunner(session.runner_id);
+    return true;
+  }
+}
+
+/**
+ * sweep applies every TTL once.
+ *
+ * Called on a timer and at boot. Each rule is independent and a failure in one is
+ * logged and the rest continue, because the cost of a skipped cleanup is lower
+ * than the cost of a sweeper that stops.
+ */
+export async function sweep(options: SweeperOptions, binder: PoolBinder): Promise<SweepReport> {
+  const { db, sse } = options;
+  const log = options.log ?? { info: () => {}, warn: () => {} };
+  const now = options.now?.() ?? Date.now();
+
+  const report: SweepReport = {
+    absoluteExpired: 0,
+    idleReleased: 0,
+    unclaimedExpired: 0,
+    loginExpired: 0,
+    skippedErasing: 0,
+  };
+
+  // Every session, because each TTL depends on a different field.
+  const sessions = db.all<SessionRow>(`SELECT * FROM sessions`);
+
+  for (const session of sessions) {
+    // An erase in progress is the erase machine's business. §11 owns it, and a
+    // sweeper deleting the row mid-machine would strand the vault — the machine
+    // stops, and nothing records that it was meant to finish.
+    if (session.state === "erasing") {
+      report.skippedErasing++;
+      continue;
+    }
+
+    // The absolute cap first, because it subsumes the others: an expired session
+    // is gone regardless of what else is true of it.
+    if (session.expires_at <= now) {
+      await binder.releaseForAbsence(session);
+      db.deleteSession(session.guid);
+      sse.emit(session.guid, "session-status", { state: "expired" });
+      sse.drop(session.guid);
+      report.absoluteExpired++;
+      log.info("session expired at the absolute cap", { session: session.guid });
+      continue;
+    }
+
+    // A session with no login started holds nothing. §2.1: 10 minutes.
+    if (session.state === "created" && session.created_at + TTL.unclaimedSession <= now) {
+      await binder.releaseForAbsence(session);
+      db.deleteSession(session.guid);
+      sse.drop(session.guid);
+      report.unclaimedExpired++;
+      log.info("session expired without a login", { session: session.guid });
+      continue;
+    }
+
+    // A login that never finished — an MFA prompt the user walked away from, or
+    // a Microsoft interstitial that never resolved. 15 minutes.
+    if (session.state === "authenticating" && session.last_activity_at + TTL.loginInProgress <= now) {
+      // The runner is released rather than killed outright, so a user returning
+      // within the session's remaining life keeps their vault. What changes is
+      // auth_state: their auth.json may be half-written, and the next login
+      // should not trust it.
+      await binder.releaseForIdle(session);
+      db.run(`UPDATE sessions SET auth_state = 'expired' WHERE guid = ?`, session.guid);
+      sse.emit(session.guid, "challenge-expired", {});
+      sse.emit(session.guid, "auth-state", { state: "expired" });
+      report.loginExpired++;
+      log.info("login expired", { session: session.guid });
+      continue;
+    }
+
+    // Idle. 30 minutes, and only when the idle deadline has been set — an export
+    // in flight has none.
+    if (session.idle_expires_at !== null && session.idle_expires_at <= now) {
+      if (await binder.releaseForIdle(session)) {
+        report.idleReleased++;
+      }
+    }
+  }
+
+  return report;
+}
+
+/**
+ * reconcile is the api's half of boot reconciliation (PLAN-v2 §2.5).
+ *
+ * Takes the orchestrator's view of the pool and reconciles the session table
+ * against it. The orchestrator does the same for containers, in its own process,
+ * from its own view. Neither trusts the other alone — which is the v3 restatement
+ * of v2's single reconciler.
+ *
+ * `stats` is null when the orchestrator is unreachable, and that is not treated as
+ * "no runners exist". Assuming an empty pool would delete every runner row and
+ * every session binding on a transient network failure.
+ */
+export async function reconcile(options: SweeperOptions): Promise<{
+  reconciled: boolean;
+  runnerCount: number;
+  note: string;
+}> {
+  const { db } = options;
+  const log = options.log ?? { info: () => {}, warn: () => {} };
+  const now = options.now?.() ?? Date.now();
+
+  const stats: OrchestratorResult<OrchestratorStats> = await options.orchestrator.stats();
+
+  if (!stats.ok) {
+    // Not fatal, and specifically not "the pool is empty". Assuming an empty pool
+    // would delete every runner row and every session binding on a transient
+    // network failure.
+    log.warn("orchestrator unreachable at boot, reconciliation partial", {
+      error: stats.error.kind,
+    });
+
+    // Expired *session* rows are still deleted. They are this process's own
+    // state and need no corroboration — §2.5's rule is that an expired session is
+    // never resurrected, and that holds whether or not the orchestrator answered.
+    db.reconcileRunners(new Set(db.all<{ id: string }>(`SELECT id FROM runners`).map((r) => r.id)), now);
+
+    return {
+      reconciled: false,
+      runnerCount: db.all(`SELECT id FROM runners`).length,
+      note: "orchestrator unreachable; pool left as-is, expired sessions removed",
+    };
+  }
+
+  // The orchestrator reports counts, not identities — deliberately, since the
+  // api needs "how many runners exist" to reconcile counts and has no business
+  // holding container ids it cannot verify. A count mismatch is logged rather
+  // than acted on, because acting on it would destroy state on the orchestrator's
+  // say-so alone.
+  const rows = db.all<{ id: string }>(`SELECT id FROM runners`);
+  if (rows.length !== stats.value.size) {
+    log.warn("pool size disagrees with the orchestrator", {
+      api: rows.length,
+      orchestrator: stats.value.size,
+    });
+  }
+
+  // Expired session rows go; expired *containers* are the orchestrator's business.
+  db.reconcileRunners(
+    new Set(rows.map((r) => r.id)),
+    now,
+  );
+
+  return {
+    reconciled: true,
+    runnerCount: rows.length,
+    note: "reconciled against the orchestrator's pool size",
+  };
+}
+
+/** The orchestrator result type, re-declared locally to avoid a wide import. */
+type OrchestratorResult<T> = Awaited<ReturnType<OrchestratorClient["stats"]>> extends never
+  ? never
+  : { ok: true; value: T } | { ok: false; error: { kind: string } };

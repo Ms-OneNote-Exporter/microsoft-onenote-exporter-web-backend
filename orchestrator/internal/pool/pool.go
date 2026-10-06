@@ -16,6 +16,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -159,19 +160,42 @@ type Stats struct {
 	Size             int            `json:"size"`
 	ByState          map[string]int `json:"byState"`
 	RunnerTTLSeconds int            `json:"runnerTtlSeconds"`
+	// SlotIDs are the orchestrator's own names for its slots.
+	//
+	// The api stores one of these in sessions.runner_id and passes it back as a
+	// slotId to release and recycle, so it has to learn them rather than derive
+	// them. Deriving them identically on both sides was considered and rejected: a
+	// divergence — a renumbering, a sparse pool, an added state — would make the
+	// api release a slot the orchestrator considers someone else's. That is not a
+	// bookkeeping error, it is one session tearing down another's container while it
+	// has an export in flight.
+	//
+	// Ids only, never container ids. §2.1 restricts the api from holding container
+	// identities it cannot verify, and a slot name is not that: it is how the api
+	// asks for a slot, not a handle it can address a container with.
+	//
+	// mac's review, and he put the alternative's failure mode better than I did.
+	SlotIDs []string `json:"slotIds"`
 }
 
 // Stats summarises the pool.
 func (p *Pool) Stats() Stats {
 	slots := p.Slots()
 	byState := make(map[string]int, len(slots))
+	ids := make([]string, 0, len(slots))
 	for _, s := range slots {
 		byState[string(s.State)]++
+		ids = append(ids, s.ID)
 	}
+	// Sorted, so two calls against an unchanged pool produce byte-identical output.
+	// An unstable order would make a diff of two /stats responses meaningless, and
+	// would let the api's view churn for no reason.
+	sort.Strings(ids)
 	return Stats{
 		Size:             len(slots),
 		ByState:          byState,
 		RunnerTTLSeconds: int(p.cfg.RunnerTTL.Seconds()),
+		SlotIDs:          ids,
 	}
 }
 

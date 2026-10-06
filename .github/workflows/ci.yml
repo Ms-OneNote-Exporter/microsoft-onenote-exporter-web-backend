@@ -120,6 +120,66 @@ jobs:
       - name: test
         run: npm test
 
+      - name: the entrypoint the container runs exists
+        # `src/index.ts` was missing for the whole life of the project and 481 tests
+        # passed without it, because they all test `buildServer(config, deps)`
+        # directly. So `npm start`, `npm run dev` and the Dockerfile's CMD all named
+        # a file that was not there: the image built cleanly and then died on
+        # start, and `docker compose up` reported success while doing it.
+        #
+        # This is the assertion whose absence let that through. It checks the name
+        # in package.json and in the Dockerfile against what the build produced,
+        # rather than a hardcoded path — so renaming the entrypoint without moving
+        # the CMD fails here too.
+        run: |
+          npm run build
+          START_TARGET=$(node -p "require('./package.json').scripts.start.split(' ').pop()")
+          echo "package.json start runs: $START_TARGET"
+          test -f "$START_TARGET" || {
+            echo "$START_TARGET does not exist; npm start would fail"
+            exit 1
+          }
+          DOCKERFILE_CMD=$(grep -oE '"dist/[^"]+"' Dockerfile | tr -d '"' | head -1)
+          echo "Dockerfile CMD runs:  $DOCKERFILE_CMD"
+          test -f "$DOCKERFILE_CMD" || {
+            echo "$DOCKERFILE_CMD does not exist; the container would build and then die"
+            exit 1
+          }
+
+      - name: the entrypoint boots
+        # Not just "the file exists" — the process has to come up. A file that
+        # throws on import is the same failure with one more step in it.
+        run: |
+          mkdir -p /tmp/boot
+          printf '%s\n' "$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n' | cut -c1-43)" > /tmp/boot/csrf_key
+          chmod 400 /tmp/boot/csrf_key
+          cp /tmp/boot/csrf_key /tmp/boot/hmac
+          ALLOWED_ORIGINS=https://app.example.com \
+          PUBLIC_ORIGIN=https://one-backend.example.com \
+          CSRF_KEY_FILE=/tmp/boot/csrf_key \
+          ORCHESTRATOR_HMAC_SECRET_FILE=/tmp/boot/hmac \
+          ORCHESTRATOR_URL=http://127.0.0.1:9100 \
+          DATABASE_PATH=/tmp/boot/api.db \
+          LISTEN=127.0.0.1:0 \
+          LOG_LEVEL=error \
+          timeout 10 node -e '
+            const { boot } = require("./dist/index.js");
+            const fake = {
+              stats: async () => ({ ok: true, value: { size: 2, byState: {}, runnerTtlSeconds: 300, slotIds: ["slot-1", "slot-2"] } }),
+              healthz: async () => ({ ok: true, value: { ok: true, pool: { size: 2, byState: {}, runnerTtlSeconds: 300 } } }),
+              claim: async () => ({ ok: true, value: { slotId: "slot-1", containerId: "c" } }),
+              release: async () => ({ ok: true, value: { released: true } }),
+              recycle: async () => ({ ok: true, value: { recycled: true } }),
+              remove: async () => ({ ok: true, value: { removed: true } }),
+              stat: async () => ({ ok: true, value: { exists: false, size: 0 } }),
+            };
+            boot(process.env, fake).then((b) => {
+              console.log("booted, seeded slots:", b.db.listRunners().length);
+              b.db.close();
+              process.exit(0);
+            }).catch((e) => { console.error("BOOT FAILED:", e.message); process.exit(1); });
+          '
+
       - name: mock code cannot reach the build
         # The mock is a scripted runner that accepts any password and reports
         # success. There must be no path from `npm start` to it.

@@ -36,8 +36,24 @@ RUN node -e "require('node:sqlite'); console.log('node:sqlite ok, unflagged')"
 # ---- runtime -------------------------------------------------------------
 FROM node:22.13.0-bookworm-slim AS runtime
 
-# Not root. The api has no reason to be root and a compromise should not start
-# with it.
+# The volume directory, created while this stage is still root and then handed to
+# the unprivileged user. It has to be *here*, before the first `USER node`: a RUN
+# after that line executes as node, which cannot chown anything. The first attempt
+# at this line sat further down the file and failed the build with exit code 1 and
+# no message beyond it.
+#
+# Load-bearing: Docker creates a fresh named volume from the image's directory *and
+# its ownership*, so a path absent from the image yields a root-owned volume that
+# uid 1000 cannot write to, and the api dies with
+# `ERR_SQLITE_ERROR: unable to open database file`.
+#
+# Build-time root, not runtime root. Nothing after this line runs as root, which is
+# what §2.1 requires; the alternative — an entrypoint that chowns at startup and
+# drops privileges — would need the container itself to start as root.
+RUN mkdir -p /srv/msout/data && chown -R node:node /srv/msout
+
+# Not root from here on. The api has no reason to be root and a compromise should
+# not start with it.
 USER node
 
 WORKDIR /app
@@ -55,19 +71,6 @@ COPY --from=build /app/dist ./dist
 # `tsconfig.build.json` excludes mock/, so there is no scripted runner in this
 # image — the mock accepts any password and reports success. The control is CI's
 # grep of dist/ for MockRunner and FakeOrchestrator; this comment is not it.
-
-# The database directory, created here with the right ownership.
-#
-# Load-bearing, and missing on the first deploy, where the api died with
-# `ERR_SQLITE_ERROR: unable to open database file`. Docker creates a fresh named
-# volume from the image's directory *and its ownership*, so a path that does not
-# exist in the image yields a root-owned volume — and this container runs as uid
-# 1000 (node), so SQLite cannot create its file inside it.
-#
-# Declaring the path in the image is the fix, rather than an entrypoint that
-# chowns as root and drops privileges: that would need the container to start as
-# root, which is exactly what §2.1 says this component does not do.
-RUN mkdir -p /srv/msout/data && chown -R node:node /srv/msout
 
 # ---- the zero-dependency invariant, checked in the image ------------------
 #

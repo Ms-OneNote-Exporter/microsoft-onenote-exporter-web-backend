@@ -215,6 +215,21 @@ export class Db {
     );
   }
 
+  /**
+   * findByArtifact returns the session that owns an artifact id.
+   *
+   * Used by `/internal/authorize-download`. Deliberately keyed on the opaque
+   * artifact id rather than the session guid: PLAN-v3 §5 put the guid out of the
+   * download path precisely so it never reaches a proxy's access log, and a
+   * lookup that needed it would put it back.
+   *
+   * Returns undefined for an unknown id, and the caller must treat that exactly
+   * like "belongs to somebody else" — see the route for why.
+   */
+  findByArtifact(artifactId: string): SessionRow | undefined {
+    return this.get<SessionRow>(`SELECT * FROM sessions WHERE artifact_id = ?`, artifactId);
+  }
+
   /** getSession returns a session row by guid. */
   getSession(guid: string): SessionRow | undefined {
     return this.get<SessionRow>(`SELECT * FROM sessions WHERE guid = ?`, guid);

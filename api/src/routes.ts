@@ -21,10 +21,16 @@ import type { Readable } from "node:stream";
 
 import type { ApiConfig } from "./config.js";
 import type { Db, SessionRow } from "./db.js";
-import type { OrchestratorClient } from "./orchestrator-client.js";
+import type { OrchestratorApi } from "./orchestrator-client.js";
 import type { SseHub } from "./sse.js";
 import type { RateLimiter } from "./rate-limit.js";
-import { API_BUILD, PROTOCOL_VERSION, buildSnapshot } from "./auth.js";
+import {
+  API_BUILD,
+  PROTOCOL_VERSION,
+  buildSnapshot,
+  sanitiseExportError,
+  GENERIC_EXPORT_ERROR,
+} from "./auth.js";
 import { serialiseCookie, sessionCookie } from "./cookies.js";
 import { header as headerValue } from "./server.js";
 import {
@@ -42,6 +48,8 @@ import {
 import { resolveClientAddress } from "./client-ip.js";
 import { readJsonObject } from "./server.js";
 import { expireCookieHeaders, runErase, type EraseDeps } from "./erase.js";
+import type { RunnerAdapter } from "./runner-adapter.js";
+import type { PoolBinder } from "./sweep.js";
 
 /**
  * Dependencies the routes need beyond config.
@@ -51,11 +59,23 @@ import { expireCookieHeaders, runErase, type EraseDeps } from "./erase.js";
  */
 export interface RouteDeps {
   readonly db: Db;
-  readonly orchestrator: OrchestratorClient;
+  readonly orchestrator: OrchestratorApi;
   readonly sse: SseHub;
   readonly limiter: RateLimiter;
   knownProxies?: ReadonlySet<string>;
   eraseRunner?: EraseDeps["runner"];
+  /**
+   * The route to a runner container. Absent until the sidecar lands, or supplied
+   * by a mock — see runner-adapter.ts. Absent means 501, unchanged.
+   */
+  runner?: RunnerAdapter;
+  /**
+   * Binds a session to a container on demand.
+   *
+   * Absent until the entrypoint wires it, and absent whenever the pool manager
+   * should not be claiming anything — the unwired state answers 409, unchanged.
+   */
+  poolBinder?: PoolBinder;
   now?: () => number;
 }
 
@@ -96,6 +116,27 @@ async function parseJsonObject(
 /** asString returns a field as a string, or undefined. */
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value !== "" ? value : undefined;
+}
+
+/**
+ * classifyExportFailure maps a thrown error onto one of the classifications
+ * `sanitiseExportError` knows.
+ *
+ * It reads a `reason` property when the runner adapter provides one, and otherwise
+ * returns null — which becomes the generic message. That default is deliberate: a
+ * vague message, not a guessed one. Guessing `disk` from a string that merely
+ * contains the word "space" would tell a user to free disk when the real problem
+ * was a quota, and "free some space and try again" is precisely the advice that
+ * wastes a user's time when it is wrong.
+ *
+ * Kept beside the route rather than in auth.ts because this is the only place that
+ * knows what an adapter throws — and adding a classification here is a decision to
+ * show that cause to a user.
+ */
+function classifyExportFailure(error: unknown): string | null {
+  if (error === null || typeof error !== "object") return null;
+  const reason = (error as { reason?: unknown }).reason;
+  return typeof reason === "string" ? reason : null;
 }
 
 /** registerRoutes attaches every route to the instance. */
@@ -235,10 +276,12 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
 
     // A session whose auth expired is still readable, so the frontend can render
     // "please log in again" rather than a bare 401 (§13.2's accepted risk).
-    const snapshot = buildSnapshot(session, now(), {
-      state: "idle",
-      items: notebooksFor(session),
-    });
+    const snapshot = buildSnapshot(
+      session,
+      now(),
+      { state: "idle", items: notebooksFor(session) },
+      config.publicOrigin,
+    );
 
     // The CSRF token comes back on every mount, not just at creation. This is
     // what replaces the readable cookie across the split: §7.5's restore flow
@@ -306,7 +349,12 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
       deps.sse.sendSnapshot(
         session.guid,
         attached.subscriberId,
-        buildSnapshot(session, now(), { state: "idle", items: notebooksFor(session) }),
+        buildSnapshot(
+          session,
+          now(),
+          { state: "idle", items: notebooksFor(session) },
+          config.publicOrigin,
+        ),
         attached.hub.nextId,
       );
     } else {
@@ -355,27 +403,78 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
       return reply.code(415).send({ error: "unsupported content-type" });
     }
 
+    // A 501 must not claim a slot. The container is the expensive thing to leak
+    // and there is nothing here to hand the credential to, so the order is:
+    // refuse first, bind second. The stream is still created and destroyed so the
+    // 4 KB cap holds in the unwired state too.
+    if (deps.runner === undefined) {
+      capStream(request.body as Readable, MAX_CREDENTIAL_BYTES).destroy();
+      return reply.code(501).send({ error: "credential forwarding not wired yet" });
+    }
+
     // The credential reaches the runner through the orchestrator's claim, so a
-    // session with no bound runner cannot accept one. Refusing here means the
-    // password never travels anywhere it cannot be used.
+    // session needs a container before it can accept one. Binding is lazy —
+    // here, at login — rather than at session creation, so a session that is
+    // created and abandoned never holds a slot, and the §2.1 pool stays available
+    // to a session that is actually about to use it.
+    //
+    // It runs *after* the framing checks above on purpose: a request that is
+    // oversized, unframed or the wrong content type must not create a container.
     if (session.runner_id === null) {
-      return reply.code(409).send({ error: "no runner bound to this session" });
+      if (deps.poolBinder === undefined) {
+        // No pool manager wired, which is the unwired state. Honest, and the
+        // same 409 as before.
+        return reply.code(409).send({ error: "no runner bound to this session" });
+      }
+
+      const bound = await deps.poolBinder.claimForLogin(session);
+      if (!bound.ok) {
+        // §2.6: name the cause rather than showing a countdown to a slot that
+        // will not move. "Every session is busy" and "the control plane is
+        // unreachable" are different advice, and the user cannot tell them apart.
+        request.log.info({ reason: bound.reason }, "runner claim failed");
+        return reply
+          .code(bound.reason === "pool-exhausted" ? 503 : 502)
+          .send({
+            error:
+              bound.reason === "pool-exhausted"
+                ? "every session is busy"
+                : "runner control plane unreachable",
+            // Tells a client this is worth retrying rather than reporting a
+            // permanent failure for a condition that clears on its own.
+            retryable: true,
+          });
+      }
     }
 
     deps.sse.emit(session.guid, "login-started", {});
 
-    // Forwarding is not wired: it needs the runner's address and a streaming
-    // client, which arrives with the runner sidecar (PLAN-v3 §12 steps 1–2).
-    //
-    // The capped stream is created and destroyed here so the guarantees hold
-    // even in the unwired state: a caller who understates Content-Length and
-    // sends 4 MB has it cut off at 4 KB whether or not forwarding exists. Wiring
-    // the forward then becomes a change to where this stream goes, not a change
-    // to the credential path's limits.
+    // The capped stream is created here so the guarantee holds regardless of what
+    // happens next: a caller who understates Content-Length and sends 4 MB has it
+    // cut off at 4 KB whether or not anything consumes it. The handler below
+    // independently re-checks framing — that redundancy is load-bearing, and one
+    // refactor away from becoming a 4 KB → 256 KB hole.
     const forwardable = capStream(request.body as Readable, MAX_CREDENTIAL_BYTES);
-    forwardable.destroy();
 
-    return reply.code(501).send({ error: "credential forwarding not wired yet" });
+    try {
+      // Hands the stream over. Never buffers it, never decodes it, never logs it:
+      // the adapter reads the bytes and the password stops here.
+      await deps.runner.submitCredential({
+        sessionId: session.guid,
+        stream: forwardable,
+        correlationId: session.guid,
+      });
+    } catch (error) {
+      // A transport failure, not a login failure. The login outcome arrives over
+      // SSE; this is only "the credential never got there".
+      request.log.error({ session: session.guid }, "credential handoff failed");
+      deps.sse.emit(session.guid, "error", { message: "credential handoff failed" });
+      return reply.code(502).send({ error: "credential handoff failed" });
+    }
+
+    // Accepted, not succeeded. The outcome is a `challenge` / `login-success` /
+    // `login-failed` event on the session's stream.
+    return reply.code(202).send({ accepted: true });
   });
 
   // ---- POST /api/session/erase -------------------------------------------
@@ -469,8 +568,22 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
 
     deps.sse.emit(session.guid, "auth-state", { state: "authenticating" });
 
-    // Running the CLI needs the runner, which arrives with the runner sidecar.
-    return reply.code(501).send({ error: "notebook listing not wired yet" });
+    if (deps.runner === undefined) {
+      return reply.code(501).send({ error: "notebook listing not wired yet" });
+    }
+
+    try {
+      // Asynchronous by design: the CLI runs in a container, and the result
+      // arrives as a `notebooks-listed` event rather than in this response.
+      await deps.runner.listNotebooks(session.guid);
+    } catch (error) {
+      request.log.error({ session: session.guid }, "notebook listing failed");
+      deps.sse.emit(session.guid, "error", { message: "notebook listing failed" });
+      return reply.code(502).send({ error: "notebook listing failed" });
+    }
+
+    deps.sse.emit(session.guid, "session-status", { state: "authenticated" });
+    return reply.code(202).send({ listing: true });
   });
 
   // ---- POST /api/export ---------------------------------------------------
@@ -549,9 +662,73 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
     );
     deps.sse.emit(session.guid, "export-queued", { id: exportId, notebook });
 
-    // Spawning the CLI needs the runner.
+    if (deps.runner === undefined) {
+      // No slot leaked: the global slot taken above is returned, because nothing
+      // is going to run.
+      release();
+      return reply.code(501).send({ error: "export execution not wired yet" });
+    }
+
+    // The abort controller lives for the duration of the run. §8.2: abort
+    // preserves what is on disk and marks the artifact partial, so the only thing
+    // cancellation has to do is stop the traversal.
+    const controller = new AbortController();
+    deps.db.run(
+      `UPDATE sessions SET export_state = ? WHERE guid = ?`,
+      JSON.stringify({
+        state: "running",
+        partialReason: null,
+        id: exportId,
+        notebook,
+        progress: { pages: 0, sections: 0, assets: 0 },
+        startedAt: now(),
+        finishedAt: null,
+      }),
+      session.guid,
+    );
+
+    try {
+      await deps.runner.startExport({
+        sessionId: session.guid,
+        exportId,
+        notebook,
+        signal: controller.signal,
+      });
+    } catch (error) {
+      release();
+      deps.db.run(
+        `UPDATE sessions SET export_state = ? WHERE guid = ?`,
+        JSON.stringify({
+          state: "failed",
+          partialReason: null,
+          // The reason a user can be shown, and the reason it survives a refresh.
+          // `sanitiseExportError` returns null for an unclassifiable failure, so
+          // the generic message is the fallback — the user always gets a reason,
+          // and never a path from the exporter's own error text.
+          error: sanitiseExportError(classifyExportFailure(error)) ?? GENERIC_EXPORT_ERROR,
+          id: exportId,
+          notebook,
+          progress: null,
+          startedAt: now(),
+          finishedAt: now(),
+        }),
+        session.guid,
+      );
+      deps.sse.emit(session.guid, "error", {
+        id: exportId,
+        message: "export failed to start",
+      });
+      // The full error goes to the log, not to the browser: it is the operator's
+      // to read and may contain a path.
+      request.log.error({ session: session.guid, err: error }, "export start failed");
+      return reply.code(502).send({ error: "export failed to start" });
+    }
+
+    // The slot is released when the run finishes rather than being held for the
+    // export's duration — §2.1: "Export running — no idle kill", and throughput
+    // is bounded by concurrency rather than by how long exports take.
     release();
-    return reply.code(501).send({ error: "export execution not wired yet" });
+    return reply.code(202).send({ id: exportId, state: "running" });
   });
 
   // ---- POST /api/export/:id/abort ----------------------------------------
@@ -604,7 +781,22 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
     deps.sse.emit(session.guid, "export-aborted", { id });
     deps.sse.emit(session.guid, "export-partial", { id });
 
-    return reply.code(501).send({ error: "abort not wired yet" });
+    if (deps.runner === undefined) {
+      return reply.code(501).send({ error: "abort not wired yet" });
+    }
+
+    try {
+      await deps.runner.abortExport({ sessionId: session.guid, exportId: id });
+    } catch (error) {
+      // The state change above already recorded the partial, which is the part a
+      // refresh would read. A failed cancellation means the run may continue and
+      // write more into an artifact the user believes is finished — worth saying
+      // so, rather than reporting a success that did not happen.
+      request.log.error({ session: session.guid, exportId: id }, "abort handoff failed");
+      return reply.code(502).send({ error: "abort handoff failed" });
+    }
+
+    return reply.code(202).send({ id, state: "partial" });
   });
 
   // ---- GET /files/:artifactId --------------------------------------------

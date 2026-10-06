@@ -1,0 +1,18 @@
+{
+  "$comment": [
+    "The build config, separate from tsconfig.json so that the dev-only mock can be",
+    "typechecked without ever reaching dist/.",
+    "",
+    "`npm run typecheck` uses tsconfig.json, which covers src/ and mock/. `npm run",
+    "build` uses this file, which covers src/ alone. The consequence is that a mock",
+    "bug can never ship: dist/ has no dist/mock/ for a Dockerfile to copy, and there",
+    "is no code path from `npm start` to a scripted runner that accepts any password."
+  ],
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["dist", "node_modules", "mock", "tests"]
+}

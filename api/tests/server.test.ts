@@ -465,10 +465,11 @@ describe("csrf", () => {
     // inject computes content-length itself, so the missing-header case is a unit
     // test in credential.test.ts. What is asserted here is that a well-formed,
     // small credential passes framing and reaches the handler — where it is
-    // refused for a *different* reason: this session has no runner bound, so the
-    // password would have nowhere to go. 409, never 200 and never 501.
-    expect(response.statusCode).toBe(409);
-    expect(response.json().error).toBe("no runner bound to this session");
+    // refused for a *different* reason: this server has no runner adapter, so the
+    // password would have nowhere to go. 501, and specifically not 411 or 413,
+    // which is what would mean framing had refused it first.
+    expect(response.statusCode).toBe(501);
+    expect(response.json().error).toBe("credential forwarding not wired yet");
   });
 });
 

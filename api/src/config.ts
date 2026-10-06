@@ -42,12 +42,99 @@ export interface ApiConfig {
   readonly logLevel: "debug" | "info" | "warn" | "error";
   /** Listen address for the HTTP surface. */
   readonly listen: string;
+  /**
+   * The origin this service is reached at, e.g. `https://one-backend.phttp.com`.
+   *
+   * Artifact `downloadUrl`s are absolute and built from this. It is operator
+   * configuration, never a request header — see `validatePublicOrigin`.
+   */
+  readonly publicOrigin: string;
   /** Path to the SQLite database file. */
   readonly databasePath: string;
   /** SSE ring buffer size, in events. */
   readonly sseBufferEvents: number;
   /** SSE keepalive interval, in milliseconds. */
   readonly sseKeepaliveMs: number;
+}
+
+/**
+ * validatePublicOrigin checks the origin this service is reached at.
+ *
+ * This is the value `artifact.downloadUrl` is built from, and it must be an
+ * explicit configuration rather than something derived. Two reasons, and the
+ * second is why deriving it looks tempting and is still wrong:
+ *
+ *   1. **The download needs it.** The session cookie is `__Host-msout`, which the
+ *      `__Host-` prefix pins to this host with no `Domain`. A relative download
+ *      URL would resolve against the *frontend's* origin, where the browser will
+ *      not attach the cookie, so Caddy's `forward_auth` would receive no `Cookie`
+ *      at all and refuse every download. `SameSite=None` does not help: SameSite
+ *      governs site, not host. So the URL must be absolute and point here.
+ *   2. **Deriving it would put a proxy header in the trust path.** An
+ *      `X-Forwarded-Host` would make the download URL depend on a request header,
+ *      and therefore make a second operator's proxy able to redirect a user's
+ *      artifact download. The value is operator-supplied, validated once at boot,
+ *      and used for every URL this process emits.
+ *
+ * The rules match `ALLOWED_ORIGINS` deliberately: https unless loopback, bare
+ * origin with no path, no wildcard. A public origin carrying a path would make
+ * every `downloadUrl` wrong in a way that only shows after an export finishes.
+ */
+export function validatePublicOrigin(value: string): string {
+  const entry = value.trim();
+  if (entry === "") {
+    throw new ConfigError(
+      "PUBLIC_ORIGIN",
+      "is required. Artifact download URLs are absolute and point at this service; " +
+        "see cookies.ts for why they cannot be relative.",
+    );
+  }
+
+  let url: URL;
+  try {
+    url = new URL(entry);
+  } catch {
+    throw new ConfigError("PUBLIC_ORIGIN", `"${entry}" is not a URL`);
+  }
+
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopbackHostname(url.hostname))) {
+    throw new ConfigError(
+      "PUBLIC_ORIGIN",
+      `"${entry}" must be https, or http on loopback for development`,
+    );
+  }
+  if (url.pathname !== "/" || url.search !== "" || url.hash !== "") {
+    throw new ConfigError(
+      "PUBLIC_ORIGIN",
+      `"${entry}" must be a bare origin with no path, query or fragment`,
+    );
+  }
+  if (/[*?]/.test(url.hostname)) {
+    throw new ConfigError(
+      "PUBLIC_ORIGIN",
+      `"${entry}" contains a wildcard label; downloads need one exact host`,
+    );
+  }
+
+  return url.origin;
+}
+
+/**
+ * isLoopbackHostname reports whether a hostname can only resolve to this machine.
+ *
+ * Loopback names, not "private ranges": 10/8 and 192.168/16 are reachable over a
+ * real network, and a credential sent to a dev frontend on one of those would
+ * cross a wire in clear, which is the whole thing the https rule prevents.
+ */
+function isLoopbackHostname(hostname: string): boolean {
+  return (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "::1" ||
+    hostname === "[::1]" ||
+    // Any 127/8 address is loopback by definition, not just 127.0.0.1.
+    /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname)
+  );
 }
 
 /**
@@ -105,6 +192,24 @@ export function validateOrigins(raw: string | undefined): Set<string> {
     }
 
     if (url.protocol !== "https:") {
+      // The one exception is loopback, and it is narrow on purpose.
+      //
+      // A development frontend runs on http://localhost, and without this the
+      // allowlist could not name it — which would push the mock server toward
+      // bypassing config validation entirely, and a mock that skips validation
+      // stops exercising the thing that catches a misconfigured deployment.
+      //
+      // Loopback is not a weakening of "http would put the credential on the wire
+      // in clear", because a loopback address never reaches a wire: the bytes go
+      // from the browser to a process on the same machine, which is the same
+      // trust boundary as the api talking to a sidecar. What it *does* mean is
+      // that a credential is visible to anything on the host that can read loopback
+      // traffic, so it is scoped to the three loopback names rather than to
+      // "private ranges" or "no TLS".
+      if (url.protocol === "http:" && isLoopbackHostname(url.hostname)) {
+        out.add(url.origin);
+        continue;
+      }
       throw new ConfigError(
         "ALLOWED_ORIGINS",
         `"${entry}" must be https; http would put the credential on the wire in clear`,
@@ -237,6 +342,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
     ),
     logLevel: level,
     listen: env.LISTEN?.trim() || "0.0.0.0:3000",
+    publicOrigin: validatePublicOrigin(env.PUBLIC_ORIGIN ?? ""),
     databasePath: env.DATABASE_PATH?.trim() || "/srv/msout/data/api.db",
     sseBufferEvents: positiveInt(env, "SSE_BUFFER_EVENTS", 500),
     sseKeepaliveMs: positiveInt(env, "SSE_KEEPALIVE_MS", 15_000),

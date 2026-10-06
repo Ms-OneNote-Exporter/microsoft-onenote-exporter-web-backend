@@ -8,6 +8,9 @@ import {
   buildSnapshot,
   iso,
   parseExportState,
+  sanitiseExportError,
+  GENERIC_EXPORT_ERROR,
+  MAX_EXPORT_ERROR_CHARS,
   type SessionSnapshot,
 } from "../src/auth.js";
 import { Db, type SessionRow } from "../src/db.js";
@@ -25,6 +28,8 @@ const TTL = 43_200_000;
 const SECRET = "A".repeat(43);
 const OTHER_SECRET = "B".repeat(43);
 const GUID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+/** The configured public origin, as loadConfig would supply it. */
+const PUBLIC_ORIGIN = "https://one-backend.example.com";
 const OTHER_GUID = "00000000-0000-0000-0000-000000000000";
 
 let db: Db;
@@ -242,6 +247,7 @@ describe("buildSnapshot", () => {
       seed(GUID, { idle_expires_at: NOW + 900_000 }),
       NOW,
       notebooks,
+      PUBLIC_ORIGIN,
     );
     expect(snapshot.session.idleExpiresAt).toBe(iso(NOW + 900_000));
   });
@@ -266,10 +272,13 @@ describe("buildSnapshot", () => {
       }),
       NOW,
       notebooks,
+      PUBLIC_ORIGIN,
     );
     expect(snapshot.artifact.available).toBe(true);
     expect(snapshot.artifact.partial).toBe(true);
-    expect(snapshot.artifact.downloadUrl).toBe(`/files/${"A".repeat(43)}`);
+    expect(snapshot.artifact.downloadUrl).toBe(
+      `${PUBLIC_ORIGIN}/files/${"A".repeat(43)}`,
+    );
     expect(snapshot.artifact.downloadUrl).not.toContain(GUID);
     expect(snapshot.artifact.downloadUrl).not.toContain("Personal");
     // The name comes from Content-Disposition at download time, not from here.
@@ -320,6 +329,7 @@ describe("buildSnapshot", () => {
       seed(GUID, { export_state: "{not json" }),
       NOW,
       notebooks,
+      PUBLIC_ORIGIN,
     );
     expect(snapshot.export.state).toBe("none");
     expect(snapshot.export.id).toBeNull();
@@ -330,6 +340,7 @@ describe("buildSnapshot", () => {
       seed(GUID, { export_state: JSON.stringify({ id: "x" }) }),
       NOW,
       notebooks,
+      PUBLIC_ORIGIN,
     );
     expect(snapshot.export.state).toBe("none");
   });
@@ -351,6 +362,7 @@ describe("parseExportState", () => {
     expect(parsed).toEqual({
       state: "queued",
       partialReason: null,
+      error: null,
       id: null,
       notebook: null,
       progress: null,
@@ -392,5 +404,143 @@ describe("parseExportState", () => {
 describe("version", () => {
   it("exposes a build id", () => {
     expect(API_BUILD.length).toBeGreaterThan(0);
+  });
+});
+
+// ---- export errors: mac's finding ----------------------------------------
+
+describe("sanitiseExportError", () => {
+  it("maps a known classification to display text", () => {
+    expect(sanitiseExportError("quota")).toMatch(/limit/i);
+    expect(sanitiseExportError("disk")).toMatch(/disk/i);
+    expect(sanitiseExportError("auth")).toMatch(/sign-in/i);
+    // Case and surrounding whitespace, because the classification arrives from a
+    // runner and a stray capital would otherwise silently produce null.
+    expect(sanitiseExportError("  DISK  ")).toMatch(/disk/i);
+  });
+
+  it("returns null for anything it does not recognise, rather than echoing it", () => {
+    // The important one. This value is rendered on a page, and the raw failure
+    // text from a third-party CLI contains absolute paths and the notebook name.
+    // An unknown classification must therefore produce nothing at all, so the
+    // caller substitutes a generic message.
+    for (const hostile of [
+      "ENOENT: no such file or directory, open '/srv/msout/sessions/abc/Personal Notebook'",
+      "../../etc/passwd",
+      "<script>alert(1)</script>",
+      "failed for user alice@example.com",
+      "",
+      "   ",
+      null,
+      undefined,
+      42,
+    ]) {
+      expect(sanitiseExportError(hostile as string | null)).toBeNull();
+    }
+  });
+
+  it("never returns text containing a path or a notebook name", () => {
+    // Belt and braces on the closed-set design: whatever the input, the output is
+    // one of six fixed strings.
+    const outputs = ["quota", "disk", "auth", "network", "aborted", "cli"].map((r) =>
+      sanitiseExportError(r),
+    );
+    for (const out of outputs) {
+      expect(out).not.toBeNull();
+      expect(out).not.toMatch(/[/\\]/);
+      expect(out).not.toMatch(/@/);
+      expect(out!.length).toBeLessThanOrEqual(MAX_EXPORT_ERROR_CHARS);
+    }
+  });
+
+  it("offers a generic message for the unclassifiable case", () => {
+    // The caller always has something to show, so a failed export is never a
+    // dead end.
+    expect(GENERIC_EXPORT_ERROR.length).toBeGreaterThan(0);
+    expect(GENERIC_EXPORT_ERROR).not.toMatch(/[/\\]/);
+  });
+});
+
+describe("export error in the snapshot", () => {
+  it("carries the reason for a failed export", () => {
+    // The bug this fixes: with no error field, the only place a reason could live
+    // was export-log frames — which a refresh discards, because status returns no
+    // logs, and which the ring buffer can evict on a long export.
+    const session = seed(GUID, {
+      state: "exporting",
+      export_state: JSON.stringify({
+        state: "failed",
+        partialReason: null,
+        error: sanitiseExportError("disk"),
+        id: "x".repeat(43),
+        notebook: "Work",
+        progress: null,
+        startedAt: NOW - 1000,
+        finishedAt: NOW,
+      }),
+    });
+    const snapshot = buildSnapshot(
+      session,
+      NOW,
+      { state: "loaded", items: ["Work"] },
+      PUBLIC_ORIGIN,
+    );
+    expect(snapshot.export.state).toBe("failed");
+    expect(snapshot.export.error).toMatch(/disk/i);
+  });
+
+  it("is null on a successful export, so the key is always present", () => {
+    const session = seed(GUID, {
+      state: "authenticated",
+      export_state: JSON.stringify({ state: "done", partialReason: null, id: "x".repeat(43) }),
+    });
+    const snapshot = buildSnapshot(
+      session,
+      NOW,
+      { state: "loaded", items: ["Work"] },
+      PUBLIC_ORIGIN,
+    );
+    // Always present, so a client never branches on a missing key.
+    expect(snapshot.export.error).toBeNull();
+  });
+
+  it("caps a stored error that is far too long", () => {
+    // Defence in depth: parseExportState truncates, so even a row written by
+    // something else cannot flood the snapshot.
+    const session = seed(GUID, {
+      state: "exporting",
+      export_state: JSON.stringify({
+        state: "failed",
+        partialReason: null,
+        error: "x".repeat(10_000),
+        id: "x".repeat(43),
+      }),
+    });
+    const snapshot = buildSnapshot(
+      session,
+      NOW,
+      { state: "loaded", items: ["Work"] },
+      PUBLIC_ORIGIN,
+    );
+    expect(snapshot.export.error).toHaveLength(MAX_EXPORT_ERROR_CHARS);
+  });
+
+  it("drops a non-string error rather than rendering it", () => {
+    const session = seed(GUID, {
+      state: "exporting",
+      export_state: JSON.stringify({
+        state: "failed",
+        partialReason: null,
+        error: { message: "an object, not a string" },
+        id: "x".repeat(43),
+      }),
+    });
+    const snapshot = buildSnapshot(
+      session,
+      NOW,
+      { state: "loaded", items: ["Work"] },
+      PUBLIC_ORIGIN,
+    );
+    expect(snapshot.export.error).toBeNull();
   });
 });

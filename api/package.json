@@ -6,7 +6,8 @@
   "license": "MIT",
   "type": "commonjs",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.5",
+    "comment": "22.5 is the floor for node:sqlite, which is the api's database driver. A native addon (better-sqlite3) would mean a compilation step and a prebuilt-binary supply chain in the component that must not have either."
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -17,7 +18,7 @@
   },
   "dependencies": {
     "fastify": "5.12.5",
-    "undici": "7.3.0"
+    "undici": "8.11.2"
   },
   "devDependencies": {
     "@types/node": "22.13.5",

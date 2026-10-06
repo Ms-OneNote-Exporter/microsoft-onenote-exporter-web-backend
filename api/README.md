@@ -3,58 +3,84 @@
 Fastify + TypeScript. The public entry point, and the only component in this
 repository that a browser can address.
 
-## Owns
+## Status
 
-- **SQLite as authoritative state** (WAL). Labels are for recovery only, never
-  the other way round — PLAN-v2 §2, carried forward.
-- Pool manager with an **atomic slot claim** — PLAN-v2 §2.4.
-- Idle-TTL sweeper and orphan sweep — PLAN-v2 §2.1–2.3.
-- The **SSE hub**: ring buffer, replay via `Last-Event-ID`, keepalive,
-  multi-tab fan-out — PLAN-v2 §7, now cross-origin.
-- The **credential raw-stream forwarder**. No JSON body parser on that route,
-  no buffering, no accumulation, `Content-Length` checked before proxying with
-  a hard cap around 4 KB, stream destroyed immediately past the cap. This is
-  the hot path of the whole service — PLAN-v3 §3.1.
-- CORS allowlist, CSRF verification, session cookie verification, artifact
-  authorisation, rate limiting — PLAN-v3 §3.3, §3.5, §5, §10.
+Partially implemented — PLAN-v3 §12 step 5. **Not yet deployable.** The
+middleware and the security-critical primitives are done and tested; the routes
+that complete the flow are stubs returning 501.
+
+| Area | State |
+|---|---|
+| Config validation, fail-closed | done |
+| SQLite authority, atomic claim, both reconcilers | done |
+| Session secrets, CSRF derivation | done |
+| CORS + CSRF middleware | done |
+| Client IP resolution (§3.5) | done |
+| Credential path primitives | done |
+| Cookie serialisation | done |
+| Signed orchestrator client | done |
+| `GET /api/public/version` | done |
+| `POST /api/session` | validates, then 501 |
+| `POST /api/session/credential` | frames and caps, then 501 |
+| `GET /api/session/status`, `/events` | not started |
+| `POST /api/session/erase`, `/notebooks` | not started |
+| `POST /api/export`, `/export/:id/abort` | not started |
+| Pool binding, claim-on-login, sweepers | not started |
+
+`npm test` → 256 tests. `npm run typecheck` clean under `exactOptionalPropertyTypes`
+and `noUncheckedIndexedAccess`.
+
+## Three things in here that are controls, not wiring
+
+**No body parser is reachable from anywhere.** Fastify registers JSON and
+`text/plain` parsers at construction, and they run *before* any route handler and
+before any route-scoped opt-out. Leaving them in place makes "this route does not
+parse its body" true only until somebody adds a global hook. `server.ts` calls
+`removeAllContentTypeParsers()` and installs one catch-all that hands the handler
+the raw stream, so each route parses its own bytes with its own cap. The
+credential route therefore has nothing that could parse a password.
+
+**Cross-origin checks run in `onRequest`.** That hook fires before body parsing,
+so Origin, the CSRF token and the credential `Content-Length` cap are all settled
+before a single byte is read. A stream that starts and is then 403'd is worse
+than one that never starts — the runner may already have acted on a prefix.
+
+**The client address never comes from a header.** `trustProxy` is off; the
+address is the socket peer, with the rightmost `X-Forwarded-For` entry consulted
+only for a configured proxy (§3.5).
 
 ## Must never
 
-- **Touch the Docker socket.** No `/var/run/docker.sock` mount, no docker CLI,
-  no `dockerode`, no `DOCKER_HOST`. A CI test asserts the socket is absent from
-  the running container — `T-X1`.
-- **Read `vault/`.** It has no mount of that tree and cannot read a cookie jar
-  even if it wanted to. This is what lets Caddy hold a read-only mount of the
-  artifact tree only — §2.2.
-- **Reach the internet.** `internal: true` network, no published port. Asserted
-  by attempting a TCP connect from inside the container — `T-N1`.
-
-That is the whole point of the split in §2.1: no process in this design holds
-two of {Docker socket, credential bytes, vault read, egress}. A single Fastify
-RCE used to yield root on the host.
+- **Touch the Docker socket.** No mount, no CLI, no `dockerode`, no `DOCKER_HOST`.
+  Asserted by inspecting the running container — `T-X1`.
+- **Read `vault/`.** No mount of that tree. This is what lets Caddy hold a
+  read-only artifact mount and nothing else — §2.2.
+- **Reach the internet.** `internal: true` network, no published port — `T-N1`.
+- **Log a body.** `onSend` sets `no-store` on everything; the credential route's
+  audit fields carry request shape and never content.
 
 ## Cross-origin
 
-The browser reaches this component directly, on its own origin, and the
-frontend origin is a different origin entirely. Three things follow, and all
-three are v1 requirements rather than hardening:
+`SameSite=None` on `__Host-msout`, because the two origins are cross-site. `Lax`
+would break the app, and moving to `None` without noticing the CSRF implication
+is the failure §3.3 exists to prevent — so the `X-CSRF-Token` check is not
+optional.
 
-- `SameSite=None` on `__Host-msout` cookies, because the two origins are
-  cross-site. `Lax` would break the app, and the resulting "fix" of going to
-  `None` without noticing the CSRF implication is exactly the failure §3.3
-  exists to prevent.
-- `X-CSRF-Token` on **every** non-`GET`. A custom header is not
-  CORS-safelisted, so the browser must preflight, and a non-allowlisted origin
-  therefore cannot cause a request body to be transmitted at all.
-- Client IP derived from the **socket peer**, not from headers — §3.5. Without
-  this, every per-IP rate limit in PLAN-v2 §10 is decorative, because an
-  attacker behind the proxy can claim any address. This is specified before the
-  rate limiter is built, not retrofitted.
+## Dependency note
 
-The API is fully usable with **no frontend deployed at all** (`T-C7`). CORS is
-not an access control and is never treated as one; it constrains browsers, not
-`curl`. Every authorisation decision lives here.
+`undici` moved from the scaffold's 7.3.0 to 8.11.2. 7.3.0 carries 23 advisories,
+including an HTTP request-smuggling issue and a `Set-Cookie` `SameSite` downgrade
+via permissive substring matching — the latter is directly relevant to a service
+whose cross-site cookie handling is load-bearing. `npm audit` is clean at 8.11.2.
 
-## Not implemented yet
+SQLite is `node:sqlite` rather than `better-sqlite3`: a native addon means a
+compilation step and a prebuilt-binary supply chain in the component that holds
+the session secret. The cost is an experimental API, which is why `engines` pins
+`>=22.5`.
 
-This directory is a placeholder. See `PLANNING/PLAN-v3.md` §12 step 5.
+## Two reconcilers, not one
+
+SQLite is authoritative for sessions. The orchestrator is authoritative for
+containers. `db.reconcileRunners` and `pool.Reconcile` are separate functions in
+separate processes, and neither trusts the other's view alone — a rule from
+PLAN-v2 §2.5 restated for two reconcilers in §2.1.

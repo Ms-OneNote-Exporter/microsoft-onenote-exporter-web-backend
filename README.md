@@ -80,11 +80,14 @@ application.
 
 Not yet decided, and deliberately not decided by the scaffold:
 
-- **Orchestrator language.** §2.1 says "Go or Node". Go gives a small static
-  binary with no `node_modules` to audit, which suits a component whose entire
-  job is to hold the socket and refuse everything else. Node shares the
-  toolchain and the test runner with the rest of the repo. Either is
-  defensible; the fixed verb allowlist is the part that must not move.
+- **Orchestrator language — decided: Go.** C++ was considered and rejected; the
+  reasoning is in
+  [`orchestrator/README.md`](./orchestrator/README.md#language-go). It comes down
+  to the orchestrator being the root-equivalent component, where a
+  memory-safety bug is a host-root compromise that the verb allowlist never
+  sees. Go gives memory safety *and* a dependency-free static binary, because
+  the Docker Engine API is HTTP over a unix socket and everything else needed
+  is stdlib.
 - **Fronting the api.** §2.1 has Caddy and `api` on the same host on an internal
   compose network, so `api` derives the client address from the socket peer
   (§3.5). If a CDN or load balancer ever goes in front of Caddy, §3.5's rule has

@@ -479,10 +479,37 @@ each of which alone blocks classic CSRF, so no single failure is fatal:
 
    Token derivation: `csrf = base64url(HMAC-SHA256(csrf_key, session_id))`,
    where `csrf_key` is per-session, generated server-side, and stored alongside
-   the session row. The token is delivered in a **readable** cookie
-   `msout_csrf`; the browser echoes it in the header. `api` requires
+   the session row. The browser echoes the token in the header. `api` requires
    `timingSafeEqual` on the match. Not a random value stored per request —
    derived, so there is no server-side token table to keep consistent.
+
+   **Amendment, after implementation (cross-origin correction).** An earlier
+   draft of this section said the token is "delivered in a **readable** cookie
+   `msout_csrf`". That is a single-origin assumption and it does not survive the
+   split: a cookie set by Component B is host-only to Component B, so
+   `document.cookie` on Component A cannot see it, and **every** mutating route
+   fails closed with `403` — the app is non-functional across the split. This was
+   found in review by probing the actual browser reachability rather than reading
+   the spec.
+
+   The token is therefore returned in the **response body**, from the two
+   responses the frontend already reads: `POST /api/session` at creation and
+   `GET /api/session/status` on every mount (so a refresh re-arms the header, since
+   §7.5's restore flow calls `status` anyway). No cookie is set for it at all.
+
+   This is safe, and the reason is §3.3 layer 2 rather than anything new: an
+   attacker page *can* cause `GET /api/session/status` and the `SameSite=None`
+   session cookie rides along, but it **cannot read the response**, because `ACAO`
+   is emitted only for an allowlisted origin and never reflected. The token
+   carries no authority on its own — without the `HttpOnly` session cookie it is
+   worth nothing, and it stops validating the moment the row is erased, because
+   the per-session `csrf_key` it derives from is destroyed with the row.
+
+   Net effect: one fewer cookie, no `Domain` scope to reason about, and no
+   dependency on the two origins sharing a registrable domain. The alternative —
+   `Domain=<shared parent>` on the CSRF cookie — would have required exactly that
+   shared domain and would have made the token readable by every sibling
+   subdomain.
 
 2. **`Origin` allowlist, checked server-side, on every non-`GET`.** If `Origin`
    is present and not in `ALLOWED_ORIGINS`, reject. Independent of layer 1:

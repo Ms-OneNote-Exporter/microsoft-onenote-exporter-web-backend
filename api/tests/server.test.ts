@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import type { FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance } from "fastify";
+import { readFileSync } from "node:fs";
 
-import { buildServer, type ServerDeps } from "../src/server.js";
+import { buildServer, installRawBodyParser, type ServerDeps } from "../src/server.js";
 import { ApiConfig } from "../src/config.js";
 import { Db } from "../src/db.js";
 import { OrchestratorClient } from "../src/orchestrator-client.js";
@@ -88,13 +89,16 @@ describe("body parsing", () => {
   // The specific hazard mac flagged: a global parser runs before a route's
   // opt-out, so "I don't parse the credential" becomes false by accident.
   it("hands every content type to the handler as an untouched stream", async () => {
-    const app2 = buildServer(config, deps, { testOnlyAuthExemptPaths: ["/probe"] });
+    // The property is about the parser, not about authentication, so this asserts it
+    // against a bare instance with the same two lines production uses. The earlier
+    // approach — a `testOnlyAuthExemptPaths` option on buildServer — was an
+    // authentication bypass living in production code, guarded by a comment. mac
+    // was right that a comment is not a strong enough guard on one, and it is gone.
+    const bare = Fastify();
+    installRawBodyParser(bare);
 
     let seen: string | null = null;
-    // Registered before ready(): Fastify refuses to add routes to an already
-    // booted instance, which is the correct behaviour and not something to work
-    // around in a test.
-    app2.post("/probe", async (request, reply) => {
+    bare.post("/probe", async (request, reply) => {
       const chunks: Buffer[] = [];
       for await (const c of request.body as NodeJS.ReadableStream) {
         chunks.push(c as Buffer);
@@ -102,12 +106,12 @@ describe("body parsing", () => {
       seen = Buffer.concat(chunks).toString("utf8");
       return reply.send({ ok: true });
     });
-    await app2.ready();
+    await bare.ready();
 
     // application/json is the case that matters: Fastify parses JSON by default,
     // so if the built-in parser were still installed this body would arrive as an
     // object rather than as bytes.
-    const response = await app2.inject({
+    const response = await bare.inject({
       method: "POST",
       url: "/probe",
       headers: { "content-type": "application/json" },
@@ -118,7 +122,35 @@ describe("body parsing", () => {
     // Byte-for-byte: a parsed-then-restringified JSON body would reorder or
     // respace its keys.
     expect(seen).toBe('{"a":1}');
-    await app2.close();
+    await bare.close();
+  });
+
+  it("hands a multipart body over as bytes too", async () => {
+    // The built-in multipart parser would consume the body; this proves the
+    // catch-all is the only parser installed.
+    const bare = Fastify();
+    installRawBodyParser(bare);
+    let seen: string | null = null;
+    bare.post("/probe", async (request, reply) => {
+      const chunks: Buffer[] = [];
+      for await (const c of request.body as NodeJS.ReadableStream) {
+        chunks.push(c as Buffer);
+      }
+      seen = Buffer.concat(chunks).toString("utf8");
+      return reply.send({ ok: true });
+    });
+    await bare.ready();
+
+    const response = await bare.inject({
+      method: "POST",
+      url: "/probe",
+      headers: { "content-type": "multipart/form-data; boundary=x" },
+      payload: "raw-bytes",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(seen).toBe("raw-bytes");
+    await bare.close();
   });
 
   it("does not reject a JSON content type before the handler runs", async () => {
@@ -200,27 +232,31 @@ describe("cors", () => {
   });
 
   it("omits ACAO on a 500", async () => {
-    // The boom route needs no session, so it is named in the exemption list.
-    // Without that it would 401 before it could throw, and the test would be
-    // asserting about a 401 instead.
-    const failing = buildServer(config, deps, { testOnlyAuthExemptPaths: ["/boom"] });
+    // A real session, so the boom route is reached the way any other route is.
+    // The earlier version exempted it by path, which was the authentication
+    // bypass mac flagged; asserting a 500 now needs a legitimate caller. The
+    // session already exists from beforeEach, so it is reused rather than
+    // re-created.
+    const failing = buildServer(config, deps);
     // Force an internal failure: a route that throws. Registered before ready()
-    // for the same reason as the probe route above.
+    // because Fastify refuses to add routes to an already booted instance.
     failing.get("/boom", async () => {
       throw new Error("deliberate");
     });
     await failing.ready();
+
+    const authed = { cookie: `${SESSION_COOKIE}=${GUID}:${"A".repeat(43)}` };
     const response = await failing.inject({
       method: "GET",
       url: "/boom",
-      headers: { origin: ALLOWED },
+      headers: { origin: ALLOWED, ...authed },
     });
     expect(response.statusCode).toBe(500);
     // And for a foreign origin, still absent.
     const foreign = await failing.inject({
       method: "GET",
       url: "/boom",
-      headers: { origin: FOREIGN },
+      headers: { origin: FOREIGN, ...authed },
     });
     expect(foreign.headers["access-control-allow-origin"]).toBeUndefined();
     await failing.close();
@@ -433,6 +469,36 @@ describe("csrf", () => {
     // password would have nowhere to go. 409, never 200 and never 501.
     expect(response.statusCode).toBe(409);
     expect(response.json().error).toBe("no runner bound to this session");
+  });
+});
+
+// There is no way to exempt a path from authentication.
+//
+// The `testOnlyAuthExemptPaths` option existed so a test could register its own
+// probe route without a session. mac was right that an authentication bypass
+// guarded by a comment is not a guard: "production passes nothing" is a claim
+// about callers rather than a control, and it only fails if someone believes the
+// comment. Asserted against the source, because an option is invisible to a test
+// that does not look for it.
+describe("no path exemption", () => {
+  const source = readFileSync(new URL("../src/server.ts", import.meta.url), "utf8");
+
+  it("has no exemption option in the source", () => {
+    expect(source).not.toMatch(/AuthExempt|authExempt|exemptPaths/);
+  });
+
+  it("has no environment-conditional guard either", () => {
+    // A NODE_ENV === "test" check would be the obvious way to make the bypass
+    // safe-ish, and it is not used — because it moves the trust to a variable
+    // rather than removing the capability.
+    expect(source).not.toMatch(/NODE_ENV/);
+  });
+
+  it("names its exemptions as literal path sets", () => {
+    // Two sets, both short enough to read, both exact matches. A prefix rule
+    // would open whatever else began with the same characters.
+    expect(source).toMatch(/PUBLIC_PATHS = new Set\(\["\/api\/public\/version", "\/healthz"\]\)/);
+    expect(source).toMatch(/MINT_PATHS = new Set\(\["\/api\/session"\]\)/);
   });
 });
 

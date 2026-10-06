@@ -60,11 +60,38 @@ import {
 import { resolveClientAddress } from "./client-ip.js";
 
 /**
+ * installRawBodyParser removes every body parser and installs one that
+ * interprets nothing.
+ *
+ * Exported so a test can assert the property against a bare instance without
+ * needing a route it controls — which matters because the earlier way of doing
+ * that was an authentication bypass living in production code, and mac was right
+ * that a comment is not a strong enough guard on one.
+ */
+export function installRawBodyParser(app: FastifyInstance): void {
+  // The built-in parsers are the hazard this exists to remove: Fastify registers
+  // JSON and text/plain at construction, and they run before any route handler
+  // and before any route-scoped opt-out. See the file header.
+  app.removeAllContentTypeParsers();
+  app.addContentTypeParser("*", (_request, payload, done) => {
+    // Hand over the stream. Interpreting it — even into a Buffer — is the
+    // decision each route makes for itself.
+    done(null, payload);
+  });
+}
+
+/**
  * PUBLIC_PATHS are the two reads that need no session.
  *
  * Exact matches, not prefixes. A prefix rule would open whatever else began with
  * the same characters, and the whole point of naming them is that the list is
  * short enough to read.
+ *
+ * Matched against the *route pattern*, not `request.url`. mac caught this: a
+ * request to `/api/public/version?cb=123` carries the query in `request.url`, so a
+ * `Set.has(request.url)` test fails and the handshake 401s on a cache-buster —
+ * and, worse, the credential route's framing checks in this hook were being
+ * skipped for the same reason.
  */
 const PUBLIC_PATHS = new Set(["/api/public/version", "/healthz"]);
 
@@ -107,16 +134,40 @@ export interface RequestContext {
 }
 
 /**
- * header returns a single header value.
+ * header returns a single header value, or undefined for a repeated header.
  *
- * Node types a repeated header as `string[]`. A repeated `Origin` or
- * `X-Forwarded-For` is not something to silently pick a value from, so this
- * returns undefined for a repeated header and lets the caller's checks treat it as
- * absent or invalid — never as "the first one, probably".
+ * Node types a repeated header as `string[]`. Picking one value from a repeated
+ * header is guessing, so this refuses: the caller treats undefined as "absent",
+ * and each caller's absence handling is chosen to fail closed.
+ *
+ * `repeatedHeader` exists for the two headers where "absent" would fail *open*,
+ * which is not acceptable and so is called out explicitly rather than left to a
+ * reader to notice.
  */
-function header(request: FastifyRequest, name: string): string | undefined {
+export function header(request: FastifyRequest, name: string): string | undefined {
   const value = request.headers[name];
   return typeof value === "string" ? value : undefined;
+}
+
+/** isRepeatedHeader reports whether a header arrived more than once. */
+export function isRepeatedHeader(request: FastifyRequest, name: string): boolean {
+  return Array.isArray(request.headers[name]);
+}
+
+/**
+ * routePath is the matched route pattern, with no query string.
+ *
+ * `request.url` carries the query, so `Set.has(request.url)` fails for
+ * `/api/public/version?cb=123` — which made the handshake 401 on a cache-buster
+ * and, more seriously, skipped the credential route's framing checks. mac found
+ * this by probing fastify directly rather than trusting the docs.
+ *
+ * `request.routeOptions.url` is the registered pattern and is clean. It is
+ * undefined when no route matched, which is exactly the signal the unmatched-path
+ * log needs.
+ */
+function routePath(request: FastifyRequest): string | undefined {
+  return request.routeOptions.url;
 }
 
 declare module "fastify" {
@@ -151,17 +202,6 @@ export interface BuildServerOptions {
    */
   readonly knownProxies?: ReadonlySet<string>;
   readonly logger?: boolean;
-  /**
-   * Paths exempt from session authentication, for routes a test registers on a
-   * live instance.
-   *
-   * Production passes nothing: `POST /api/session` is the only exempt route and
-   * it is named explicitly in the hook rather than configurable. This exists
-   * because a test that asserts the body-parsing property needs a route it
-   * controls, and the alternative — weakening the hook for the test — would be
-   * the worse trade.
-   */
-  readonly testOnlyAuthExemptPaths?: readonly string[];
 }
 
 /** buildServer constructs the api. */
@@ -222,14 +262,7 @@ export function baseServer(
     bodyLimit: 256 * 1024,
   });
 
-  // The built-in parsers are the hazard this file exists to remove. See the
-  // header comment.
-  app.removeAllContentTypeParsers();
-  app.addContentTypeParser("*", (_request, payload, done) => {
-    // Hand over the stream. Interpreting it — even into a Buffer — is the
-    // decision each route makes for itself.
-    done(null, payload);
-  });
+  installRawBodyParser(app);
 
   // Fastify 5 rejects a reference-type decorator with a plain object, because a
   // shared object across requests would leak one request's session into another.
@@ -256,6 +289,23 @@ export function baseServer(
     };
 
     const origin = header(request, "origin");
+    const path = routePath(request);
+
+    // A repeated Origin is refused outright rather than treated as absent.
+    //
+    // Everywhere else, `header()` returning undefined for a repeated header means
+    // "absent", and absent fails closed: a missing X-Forwarded-For falls back to
+    // the socket peer, a missing CSRF token is a 403. A missing Origin is the one
+    // case where "absent" is *permissive* — `isOriginAllowed(undefined)` is true,
+    // because a non-browser client legitimately sends no Origin at all.
+    //
+    // So a duplicate Origin, which no browser produces, must not be allowed to
+    // borrow that permissiveness. Only the frontend's own browser sends Origin on
+    // a cross-origin request, and it sends exactly one.
+    if (isRepeatedHeader(request, "origin")) {
+      request.log.warn({ url: path }, "repeated Origin header refused");
+      return reply.code(403).send({ error: "forbidden" });
+    }
 
     // Vary: Origin on every response, including the ones that set nothing else.
     // A cache that served one origin's ACAO to another would turn the allowlist
@@ -298,9 +348,7 @@ export function baseServer(
     // Both sets are exact matches: a prefix rule would open whatever else began
     // with the same characters.
     const skipsAuth =
-      PUBLIC_PATHS.has(request.url) ||
-      MINT_PATHS.has(request.url) ||
-      options.testOnlyAuthExemptPaths?.includes(request.url) === true;
+      PUBLIC_PATHS.has(path ?? "") || MINT_PATHS.has(path ?? "");
 
     let authenticated: ReturnType<typeof authenticateFromCookies> | undefined;
 
@@ -310,6 +358,20 @@ export function baseServer(
       // control, so nothing about a GET is exempt from authentication.
       authenticated = authenticateFromCookies(request, deps.db);
       if (!authenticated.ok) {
+        // An unmatched path gets the same 401 as an unmatched credential, so the
+        // response reveals nothing about which paths exist (see mac's review:
+        // 404-for-unknown is a path oracle).
+        //
+        // The log is where the distinction is made instead, because debuggability
+        // is an operator concern and losing it to a security property is a bad
+        // trade. `routeOptions.url` is undefined exactly when no route matched,
+        // so this line is filterable and unambiguous.
+        if (path === undefined) {
+          request.log.warn(
+            { url: request.url, method: request.method },
+            "no such route",
+          );
+        }
         return reply.code(authStatus(authenticated.failure)).send(authErrorBody());
       }
       request.ctx.session = authenticated.session;
@@ -322,10 +384,7 @@ export function baseServer(
     //
     // The test-only exemptions leave here too, for the same mechanical reason: a
     // route a test registered has no session and no token to present.
-    if (
-      MINT_PATHS.has(request.url) ||
-      options.testOnlyAuthExemptPaths?.includes(request.url) === true
-    ) {
+    if (MINT_PATHS.has(path ?? "")) {
       return;
     }
 
@@ -368,7 +427,7 @@ export function baseServer(
 
     // The credential route's own framing checks, here so they run before any byte
     // is read. A stream that starts and is then refused is the worse failure.
-    if (request.url === "/api/session/credential") {
+    if (path === "/api/session/credential") {
       const refused = checkCredentialRequest(request, reply);
       if (refused) return refused;
     }

@@ -72,22 +72,51 @@ split does not reduce them. The one reordering is that `orchestrator` comes
 before `api`, because `api` cannot be tested end-to-end without it and testing
 it against a mock would validate the wrong boundary.
 
-Nothing in this repository is implemented yet. This scaffold is the layout, the
-licence, the design documents and the environment contract — not the
-application.
+This repository is mid-build against that order. Where it stands:
+
+| Step | Component | State |
+|---|---|---|
+| 4 | `orchestrator` | **done** — 92 tests, zero third-party deps |
+| 5 | `api` | **partly done** — 422 tests; middleware, primitives, routes and pool binding complete, the runner-facing routes return 501 |
+| 1–2 | `runner` | not started |
+| 6 | Caddy, compose, GHCR, CI | not started |
+
+Each directory's own README carries the detail for that component. The `api` one
+has a table of what is wired and what is not, because "partly done" is not a
+useful thing to read.
+
+**Nothing here is deployed.** There is no compose file, no Dockerfile for the `api`
+or the runner, and no CI yet, so the test suites are the only evidence any of it
+works — which is a real limitation of the current state and the reason step 6 is
+next. The orchestrator's Dockerfile exists and asserts its zero-dependency
+property at build time, but has not been built.
 
 ## Open decisions
 
-Not yet decided, and deliberately not decided by the scaffold:
+Some settled, some not. The settled ones are recorded here because a reader who
+finds the reasoning in a component README should not have to assume it was still
+open.
 
-- **Orchestrator language — decided: Go.** C++ was considered and rejected; the
-  reasoning is in
+- **Orchestrator language — decided: Go, and now implemented.** C++ was
+  considered and rejected; the reasoning is in
   [`orchestrator/README.md`](./orchestrator/README.md#language-go). It comes down
   to the orchestrator being the root-equivalent component, where a
   memory-safety bug is a host-root compromise that the verb allowlist never
   sees. Go gives memory safety *and* a dependency-free static binary, because
   the Docker Engine API is HTTP over a unix socket and everything else needed
-  is stdlib.
+  is stdlib. The zero-dependency property is now enforced by the build rather
+  than asserted in a README.
+- **SQLite driver — decided: `node:sqlite`.** A native addon
+  (`better-sqlite3`) would mean a compilation step and a prebuilt-binary
+  supply chain in the component that holds the session secret. The cost is an
+  experimental API, which is why `api/package.json` pins `engines.node >=22.5`.
+- **CSRF token delivery — decided: response body, not a readable cookie.**
+  PLAN-v3 §3.3 originally specified a readable cookie, which is a
+  single-origin assumption. Under the split it is unreachable: a cookie set by
+  Component B is invisible to `document.cookie` on Component A's host, and
+  every mutating route failed closed on a token no page could read. The token
+  now travels in the bodies of `POST /api/session` and
+  `GET /api/session/status`. See `api/README.md` and the amendment in §3.3.
 - **Fronting the api.** §2.1 has Caddy and `api` on the same host on an internal
   compose network, so `api` derives the client address from the socket peer
   (§3.5). If a CDN or load balancer ever goes in front of Caddy, §3.5's rule has
@@ -95,7 +124,7 @@ Not yet decided, and deliberately not decided by the scaffold:
 - **Dependency isolation.** The archived POC used npm workspaces with a
   `shared` package, because its app and runner consumed the same types. v3 has
   no shared package — `api` and `runner` talk over HTTP and share nothing — so
-  this scaffold gives each component its own `package.json` and its own
+  each component has its own `package.json` and its own
   lockfile rather than a root workspace. That keeps Playwright out of the
   `api` image and keeps the `api`'s dependency tree out of the runner's,
   which is the same "no component holds another's capabilities" property as the

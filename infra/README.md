@@ -2,6 +2,9 @@
 
 Caddy, compose, and the host paths. Everything that is not application code.
 
+**Deployed at `https://one-backend.phttp.com`.** For the runbook, the host state and
+the two values an operator has to supply, see [`DEPLOYMENT.md`](./DEPLOYMENT.md).
+
 ## Topology
 
 ```
@@ -121,19 +124,63 @@ so repointing the source passed; and the capability check short-circuited on
 silently checks the wrong half of a thing is worse than none, because it reads as
 coverage.
 
-## Not verified
+## Verified against running containers
 
-**No capability assertion has run against a running container.** There is no
-`/var/run/docker.sock` access on the machine this was written on, so nothing in
-this directory has been started. What is checked here is the *shape* of the
-deployment; what is not checked is whether a running container can see what it
-should not.
+`.github/workflows/capability.yml` brings the stack up and asserts §2.1's claims
+against **running containers**, not against the compose file. It runs on every pull
+request.
 
-Per mac's argument, `.github/workflows/capability.yml` will land with its tests
-present but `it.skip`ped and the reason attached — unproven assertions create the
-*appearance* of coverage, and a test asserting mount isolation that never ran
-passes if it is written against the compose file rather than against containers.
+| assertion | what it proves |
+|---|---|
+| **T-X1** | the api sees no host path but its own writable volume |
+| **T-X2** | only the orchestrator holds the Docker socket |
+| **T-N1** | the control network cannot resolve DNS, let alone reach the internet |
+| **T-N4** | the api cannot fetch an external URL |
+| **T-P\*** | only Caddy publishes a port |
+| **T-C7** | `/files/` never reaches Node |
+| — | no service carries a secret inline; the api's is a path |
+| — | nothing logs a request header (`.github/check-no-header-logging.sh`) |
 
-The runner service also does not exist yet: it depends on `@msout/*` packages that
-are not published (§12 steps 1–2). This is a three-service deployment, not a
-four-service one.
+| also checked | by |
+|---|---|
+| the compose file parses and resolves | `docker compose config` — no daemon needed |
+| `PUBLIC_HOST` is genuinely required | asserting the guard fails when empty |
+| 29 static capability assertions | `.github/assert-compose.mjs` |
+| those assertions can actually fail | `.github/assert-compose.test.mjs` — 18 violations |
+| `node:sqlite` loads unflagged in the image | smoke test, in `api` CI |
+| `dist/` contains no mock code | grep, in `api` CI |
+
+The meta-test earns its place. It found four real defects in the assertions
+themselves: the socket check matched a mount's **target** rather than its source, so
+repointing the source passed; the capability check short-circuited on
+`svc !== "caddy"`, so `cap_add: [SYS_ADMIN]` on the api passed; an orphaned network
+check never fired; and five exec-based assertions passed *vacuously* because a
+container that never started returns non-zero. **A static check that silently checks
+the wrong half of a thing is worse than none, because it reads as coverage.**
+
+## This has been deployed
+
+It runs at `https://one-backend.phttp.com` with a real Let's Encrypt certificate.
+See `infra/DEPLOYMENT.md` for the runbook, the VPS state, and the two things an
+operator has to supply (`PUBLIC_HOST` and a real `ACME_EMAIL`).
+
+Nine of the bugs fixed during deployment were **config bugs, not logic bugs** — a
+`CMD` naming a file that did not exist, a healthcheck naming a flag that did not
+exist, a Dockerfile that did not parse, a secret variable in the api's namespace
+given to the orchestrator, two more variables in the wrong namespace, a missing
+docker group, a volume the container could not write to, a Caddy directive that does
+not exist, and a global `ARG` used without being re-declared in its stage.
+
+Every one was found by something executing the deployment. None was found by a test,
+a static assertion, or a read of the file.
+
+## Still not deployed
+
+The **runner service** does not exist: it depends on `@msout/*` packages that are not
+published (§12 steps 1–2). This is a three-service deployment, not a four-service
+one, and `msout-runner` is declared with no service attached — which also means
+`docker compose config` prunes it, so it is documentation rather than a live
+network.
+
+The four runner-facing routes answer **501** and name what is missing. That is the
+honest answer and it is what a client sees.

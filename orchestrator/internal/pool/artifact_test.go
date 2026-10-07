@@ -180,26 +180,41 @@ func TestFinalizeRefusesAnIdThatCouldEscapeTheArtifactRoot(t *testing.T) {
 	// tree, which is the one tree Caddy must not be able to serve.
 	cfg := testConfig(t, 1)
 	p := noDockerPool(t, cfg)
-	stagedInto(t, cfg, strings.Repeat("../", 10)+"escaped", 16)
 
 	for _, bad := range []string{
 		"..",
 		"../" + testID,
 		strings.Repeat("../", 12) + "etc",
+		strings.Repeat("../", 12) + "escaped",
 		"short",
 		strings.Repeat("a", 42),
 		strings.Repeat("a", 44),
 		testID + "/",
 		"/" + testID,
+		testID + "\x00",
+		"." + testID,
+		testID + ".",
 	} {
 		_, err := p.Finalize(FinalizeInput{ArtifactID: bad, SessionGUID: testGUID})
 		if !errors.Is(err, ErrArtifactIDInvalid) {
 			t.Errorf("id %q: err = %v, want ErrArtifactIDInvalid", bad, err)
 		}
 	}
-	// Nothing escaped.
-	if _, err := os.Stat(filepath.Join(filepath.Dir(cfg.ArtifactRoot), "escaped")); err == nil {
-		t.Error("a traversal published outside the artifact root")
+
+	// Nothing escaped, and nothing landed inside the artifact root either. The
+	// first version of this staged a `../../../escaped` archive so that a
+	// successful publish would have somewhere obvious to appear — which meant the
+	// *test setup* tried to mkdir at `/escaped`, and failed with "permission
+	// denied" on a container running as non-root. The assertion did not need it:
+	// the refusal happens before any path is built, so a non-existent staging
+	// directory is the stronger input, not the weaker one.
+	for _, probe := range []string{
+		filepath.Join(filepath.Dir(cfg.ArtifactRoot), "escaped"),
+		filepath.Join(cfg.ArtifactRoot, "escaped"),
+	} {
+		if _, err := os.Stat(probe); err == nil {
+			t.Errorf("a traversal published to %s", probe)
+		}
 	}
 }
 

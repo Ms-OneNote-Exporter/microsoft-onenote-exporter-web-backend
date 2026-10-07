@@ -62,6 +62,20 @@ function orchestratorStub(opts: {
             JSON.stringify({ size: 0, byState: {}, runnerTtlSeconds: 300 }),
           );
         }
+        if (opts.stats === "cannot-fill") {
+          // What the orchestrator reports when its top-up is failing: a pool with
+          // no idle slot *and* a reason it will not get one.
+          return new Response(
+            JSON.stringify({
+              size: 0,
+              byState: {},
+              runnerTtlSeconds: 300,
+              slotIds: [],
+              fillError: "Range of CPUs is from 0.01 to 1.00, as there are only 1 CPUs available",
+              fillFailures: 7,
+            }),
+          );
+        }
         throw new Error("ECONNREFUSED");
       }
       return new Response("{}", { status: 404 });
@@ -193,6 +207,44 @@ describe("PoolBinder.claimForLogin", () => {
     expect(result).toEqual({ ok: false, reason: "pool-exhausted" });
     // The expensive call must not happen when the cheap one already failed.
     expect(calls).not.toContain("/claim");
+  });
+
+  // A pool that is *full* and a pool that *cannot fill* both have no idle slot, and
+  // only one of them is helped by waiting. Reporting both as "every session is
+  // busy" tells a user to wait for something that will never arrive — which is
+  // what a 1-CPU VPS did, silently, with `/healthz` reporting ok throughout.
+  it("distinguishes a busy pool from a pool that cannot fill", async () => {
+    db.registerRunner("slot-1", "ctr1", "claimed");
+    seedSession(GUID);
+    const { client, calls } = orchestratorStub({ claim: "ok", stats: "cannot-fill" });
+    const binder = new PoolBinder(options(client));
+
+    const result = await binder.claimForLogin(db.getSession(GUID)!);
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("pool-exhausted");
+    // The reason travels with the answer, so the route can name the cause rather
+    // than send the user back to wait.
+    expect(result.fillError).toMatch(/Range of CPUs/);
+    // And the orchestrator was asked, which is the whole mechanism.
+    expect(calls).toContain("/stats");
+    // Still no container claim: nothing would succeed.
+    expect(calls).not.toContain("/claim");
+  });
+
+  // The absence of a reported reason must not be read as "healthy". An
+  // orchestrator predating the field reports none, and that is the plain
+  // busy case — not a reason invented to fill the gap.
+  it("reports a plain busy pool when the orchestrator gives no reason", async () => {
+    db.registerRunner("slot-1", "ctr1", "claimed");
+    seedSession(GUID);
+    const { client } = orchestratorStub({ claim: "ok", stats: "ok" });
+    const binder = new PoolBinder(options(client));
+
+    const result = await binder.claimForLogin(db.getSession(GUID)!);
+
+    expect(result).toEqual({ ok: false, reason: "pool-exhausted" });
   });
 
   // A slot claimed in SQLite but never given a container never becomes available

@@ -475,6 +475,11 @@ const ORCH_VARS_ACTUALLY_READ = new Set([
   // config.go and used only as a bind source — the value is never read here, so
   // the token is not in this container's environment.
   "ORCH_RUNNER_TOKEN_FILE",
+  // A runner's CPU allowance, in billionths of a core. Exists because a hardcoded
+  // 2e9 made the orchestrator unable to create any container on a host with fewer
+  // than two cores — found by deploying to a 1-CPU VPS, where the pool stayed empty
+  // and the api reported it as "every session is busy".
+  "ORCH_RUNNER_NANO_CPUS",
   // Not read by the orchestrator; Docker's own group_add interpolation.
   "_DOCKER_GID",
 ]);

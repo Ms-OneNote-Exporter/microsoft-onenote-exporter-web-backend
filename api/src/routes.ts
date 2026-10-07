@@ -550,19 +550,32 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
       const bound = await deps.poolBinder.claimForLogin(session);
       if (!bound.ok) {
         // §2.6: name the cause rather than showing a countdown to a slot that
-        // will not move. "Every session is busy" and "the control plane is
-        // unreachable" are different advice, and the user cannot tell them apart.
-        request.log.info({ reason: bound.reason }, "runner claim failed");
+        // will not move. "Every session is busy" and "the control plane cannot
+        // start runners" are different advice, and the user cannot tell them apart.
+        //
+        // Three outcomes now, and `retryable` is the honest answer for each:
+        //
+        //   busy             -> wait; a slot frees up
+        //   pool cannot fill -> wait does NOT help; something is misconfigured
+        //   control plane unreachable -> transient, retry
+        request.log.info(
+          { reason: bound.reason, fillError: bound.fillError ?? null },
+          "runner claim failed",
+        );
+        const cannotFill = bound.reason === "pool-exhausted" && bound.fillError !== undefined;
         return reply
           .code(bound.reason === "pool-exhausted" ? 503 : 502)
           .send({
-            error:
-              bound.reason === "pool-exhausted"
+            error: cannotFill
+              ? "the service cannot start a browser right now"
+              : bound.reason === "pool-exhausted"
                 ? "every session is busy"
                 : "runner control plane unreachable",
-            // Tells a client this is worth retrying rather than reporting a
-            // permanent failure for a condition that clears on its own.
+            // Still retryable: a misconfiguration gets fixed and the pool refills.
+            // But a client that has been told "busy" and is still failing after a
+            // few attempts now has something to escalate with.
             retryable: true,
+            ...(cannotFill ? { cause: "pool-unfillable" } : {}),
           });
       }
     }

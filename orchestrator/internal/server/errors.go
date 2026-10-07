@@ -56,6 +56,23 @@ func (s *Server) writeHandlerError(w http.ResponseWriter, r *http.Request, err e
 	case errors.As(err, &he):
 		writeError(w, he.status, he.code)
 	case errors.Is(err, pool.ErrNoSlot):
+		// A 503 that says *why*, because "no idle slot" is true in both cases and
+		// only one of them is helped by waiting.
+		//
+		// A pool that is merely full clears when a session ends. A pool whose
+		// top-up is failing has no slots coming, ever, and the caller's correct
+		// response is to escalate rather than retry — which it cannot infer from a
+		// status code. This was found by deploying to a 1-CPU host, where every
+		// create failed and the api told users to wait for a busy session.
+		if fault := s.pool.LastFillFault(); fault != nil {
+			s.log.Error("pool cannot fill; reporting the cause", "error", fault)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"error":        "no idle slot and the pool cannot be filled",
+				"fillError":    fault.Error(),
+				"fillFailures": s.pool.FillFailures(),
+			})
+			return
+		}
 		writeError(w, http.StatusServiceUnavailable, "no idle slot")
 	case errors.Is(err, pool.ErrUnknownSlot):
 		writeError(w, http.StatusConflict, "unknown slot")

@@ -70,6 +70,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Lowercased once, into an env var, rather than `github.repository_owner`
+      # inline in every tag.
+      #
+      # The owner is `Ms-OneNote-Exporter` and an OCI repository name must be
+      # lowercase, so the first version of this workflow failed on its very first
+      # push with `repository name must be lowercase` — on the tag, before any
+      # build. Docker accepts the mixed-case name as an *alias* on pull and
+      # normalises it, which is exactly why it looked right everywhere else and
+      # only failed here.
+      - name: resolve the registry prefix
+        run: echo "REGISTRY_PREFIX=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+
       # The runner is the one that matters and the slowest: it installs
       # Playwright's Chromium, which is the largest layer and the one a
       # cross-platform build would be slowest to produce. Built on the native
@@ -82,8 +94,8 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/msout-runner:${{ github.sha }}
-            ghcr.io/${{ github.repository_owner }}/msout-runner:${{ github.sha }}-short
+            ${{ env.REGISTRY_PREFIX }}/msout-runner:${{ github.sha }}
+            ${{ env.REGISTRY_PREFIX }}/msout-runner:${{ github.sha }}-short
           build-args: |
             BUILD_ID=${{ github.sha }}
           # Provenance and SBOM, because a container that holds credential bytes is
@@ -101,7 +113,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/msout-api:${{ github.sha }}
+            ${{ env.REGISTRY_PREFIX }}/msout-api:${{ github.sha }}
           build-args: |
             BUILD_ID=${{ github.sha }}
           provenance: true
@@ -117,7 +129,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/msout-orchestrator:${{ github.sha }}
+            ${{ env.REGISTRY_PREFIX }}/msout-orchestrator:${{ github.sha }}
           provenance: true
           sbom: true
           cache-from: type=gha,scope=orchestrator
@@ -136,5 +148,5 @@ jobs:
             echo "- \`msout-orchestrator:${{ github.sha }}\`"
             echo
             echo "A deploy host sets \`IMAGE_TAG=${{ github.sha }}\` and"
-            echo "\`ORCH_RUNNER_IMAGE=ghcr.io/\${{ github.repository_owner }}/msout-runner:\${{ github.sha }}\`."
+            echo "\`ORCH_RUNNER_IMAGE=${{ env.REGISTRY_PREFIX }}/msout-runner:${{ github.sha }}\`."
           } >> "$GITHUB_STEP_SUMMARY"

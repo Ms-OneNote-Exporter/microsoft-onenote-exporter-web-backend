@@ -94,9 +94,17 @@ jobs:
       - name: static assertions first
         # Cheap, and they gate the expensive half. If the compose file does not
         # resolve there is no point starting anything.
+        #
+        # `--profile runner` on both calls. The runner service sits behind that
+        # profile so `docker compose up` does not start it, which means a plain
+        # `config` **prunes the service out of the resolved file entirely** — and
+        # the runner's isolation assertions then run against `undefined`. They
+        # failed here for exactly that reason, which is the correct behaviour of a
+        # check that has nothing to check: the profile has to be enabled for the
+        # resolved config to contain the thing being asserted.
         run: |
-          docker compose config --quiet
-          docker compose config --format json | node .github/assert-compose.mjs
+          docker compose --profile runner config --quiet
+          docker compose --profile runner config --format json | node .github/assert-compose.mjs
 
       - name: throwaway secrets
         # Generated here, never taken from the repository and never a real value.

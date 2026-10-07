@@ -101,6 +101,16 @@ for (const svc of ["api", "caddy", "runner"]) {
 
 // 3a. The runner takes no host path and carries no session secret.
 //
+// **Presence is asserted first, and on its own.** Every check below reads
+// `services.runner`, and a service that is absent from the resolved config makes
+// each of them pass vacuously — `undefined ?? {}` is empty, so "no bind mounts"
+// and "no socket" and "publishes no port" are all true of nothing at all. That is
+// the worst shape an assertion can have: green, and checking nothing.
+//
+// It was not hypothetical. The runner sits behind a compose profile, so
+// `docker compose config` *without* `--profile runner` prunes the service out
+// entirely, and the first run of this file did exactly that.
+//
 // §2.1's rule, and the sharpest form of it here: the runner is the only component
 // that sees the credential bytes, so every additional capability it holds is a
 // capability an attacker reaches *after* the password. No bind mounts — its data
@@ -112,6 +122,13 @@ for (const svc of ["api", "caddy", "runner"]) {
 // starting work in a container the orchestrator created, and never carries or
 // reveals a password. So it is asserted separately rather than swept into the
 // no-secrets check, where it would be indistinguishable from a mistake.
+check(
+  "runner" in services,
+  "the runner service is present in the resolved config",
+  "FAIL: there is no `runner` service. Run this with `--profile runner` — the service " +
+    "is behind a profile so `docker compose up` does not start it, and without the " +
+    "profile every runner assertion below would pass against nothing.",
+);
 check(
   bindsFor("runner").length === 0,
   "runner has no bind mounts at all",

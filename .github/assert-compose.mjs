@@ -138,6 +138,33 @@ check(
     "is behind a profile so `docker compose up` does not start it, and without the " +
     "profile every runner assertion below would pass against nothing.",
 );
+
+// 3b. The orchestrator can actually hand a runner its token.
+//
+// The orchestrator bind-mounts a *file* from its own container into each runner.
+// If the file is not mounted **in the orchestrator**, Docker creates the
+// destination as an empty directory — so the runner mounts a directory over its
+// own secret path, tries to read a file inside it, and exits 1. Every container
+// starts, every orchestrator check passes, and no runner ever becomes healthy.
+//
+// That is not hypothetical: the orchestrator gained a runner_token mount in the
+// same commit as this assertion, and the two are asserted together so the second
+// cannot be dropped without the first.
+const orchSecrets = (services.orchestrator?.secrets ?? []).map((s) => s.source);
+check(
+  orchSecrets.includes("runner_token"),
+  "the orchestrator holds runner_token, to mount into each runner",
+  `the orchestrator's secrets are [${orchSecrets.join(", ")}]. It bind-mounts that file ` +
+    "into every runner, so without it Docker creates an empty directory at the " +
+    "destination and each runner exits 1 at startup",
+);
+check(
+  services.orchestrator?.environment?.ORCH_RUNNER_TOKEN_FILE === "/run/secrets/runner_token",
+  "orchestrator: ORCH_RUNNER_TOKEN_FILE points at the mounted secret",
+  `orchestrator ORCH_RUNNER_TOKEN_FILE is ${JSON.stringify(
+    services.orchestrator?.environment?.ORCH_RUNNER_TOKEN_FILE,
+  )}; it must name the path the token is mounted at, or the mount source is wrong`,
+);
 const runnerBinds = bindsFor("runner").map((v) => String(v.source));
 check(
   runnerBinds.every((src) => src.endsWith("runner_token")),
@@ -329,6 +356,10 @@ const ORCH_VARS_ACTUALLY_READ = new Set([
   "ORCH_RUNNER_NETWORK",
   "ORCH_VAULT_ROOT",
   "ORCH_ARTIFACT_ROOT",
+  // The host path of the bearer token each runner mounts read-only. Read in
+  // config.go and used only as a bind source — the value is never read here, so
+  // the token is not in this container's environment.
+  "ORCH_RUNNER_TOKEN_FILE",
   // Not read by the orchestrator; Docker's own group_add interpolation.
   "_DOCKER_GID",
 ]);

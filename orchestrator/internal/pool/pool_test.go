@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Ms-OneNote-Exporter/microsoft-onenote-exporter-web-backend/orchestrator/internal/config"
+	"github.com/Ms-OneNote-Exporter/microsoft-onenote-exporter-web-backend/orchestrator/internal/dockerapi"
 )
 
 // testConfig returns a config rooted in a temp dir, with the pool sized for the
@@ -28,11 +29,28 @@ func testConfig(t *testing.T, poolSize int) *config.Config {
 		ArtifactRoot:    filepath.Join(root, "artifacts"),
 		RunnerImage:     "ghcr.io/ms-one-note-exporter/runner:test",
 		RunnerNetwork:   "msout-runner",
+		RunnerTokenFile: filepath.Join(root, "runner_token"),
 		PoolSize:        poolSize,
 		RunnerTTL:       5 * time.Minute,
 		SlotIdleTimeout: 30 * time.Minute,
 		RequestTimeout:  time.Second,
 	}
+}
+
+// mountFor returns the mount at a destination, or nil.
+//
+// A lookup rather than an index, because a runner's mount list is no longer a
+// fixed shape: it carries the session vault, the artifact tree and the bearer
+// token, and which of those are present depends on whether the slot is bound.
+// Tests that assert "the mount at index 0" were asserting the length of an
+// unrelated list.
+func mountFor(req dockerapi.CreateRequest, destination string) *dockerapi.CreateMount {
+	for i := range req.Mounts {
+		if req.Mounts[i].Destination == destination {
+			return &req.Mounts[i]
+		}
+	}
+	return nil
 }
 
 func discardLog() *slog.Logger {
@@ -151,6 +169,12 @@ func TestRunnerIsOnExactlyOneNetwork(t *testing.T) {
 // An idle runner must not hold a credential-bearing mount. This is the
 // difference between "a container waiting for a session" and "a container one
 // claim away from auth.json".
+//
+// The mount *count* is no longer one. The artifact tree and the bearer token are
+// mounted unconditionally, because the root filesystem is read-only and the
+// runner refuses to start without the token. What the test now pins is the
+// property rather than the total: no mount may come from the vault, and the
+// /data mount must be writable or the sidecar cannot start.
 func TestIdleRunnerHoldsNoVaultMount(t *testing.T) {
 	cfg := testConfig(t, 1)
 	p := noDockerPool(t, cfg)
@@ -164,15 +188,37 @@ func TestIdleRunnerHoldsNoVaultMount(t *testing.T) {
 			t.Errorf("idle runner has a vault mount: %+v", m)
 		}
 	}
-	if len(req.Mounts) != 1 || req.Mounts[0].Destination != "/data" {
-		t.Fatalf("idle mounts = %+v, want a single /data", req.Mounts)
+	data := mountFor(req, "/data")
+	if data == nil {
+		t.Fatalf("idle mounts = %+v, want a /data mount", req.Mounts)
 	}
-	if req.Mounts[0].ReadOnly {
+	if data.Type != "tmpfs" {
+		t.Errorf("idle /data is a %s mount; a tmpfs is what makes an idle slot "+
+			"carry no credential", data.Type)
+	}
+	if data.ReadOnly {
 		t.Error("the idle /data must be writable or the sidecar cannot start")
+	}
+
+	// The two mounts every runner carries, asserted rather than left implicit.
+	// Both are new since this test was written, and both were found by the
+	// runner refusing to start: the token is required, and the artifact tree is
+	// unwritable without it under a read-only rootfs.
+	if mountFor(req, "/artifacts") == nil {
+		t.Error("no /artifacts mount; the runner cannot write an archive without it")
+	}
+	token := mountFor(req, "/run/secrets/runner_token")
+	if token == nil {
+		t.Fatal("no runner_token mount; the runner refuses to start without it")
+	}
+	if !token.ReadOnly {
+		t.Error("the token mount must be read-only")
 	}
 }
 
-// A bound runner holds exactly the session's vault, read-write, and nothing else.
+// A bound runner holds exactly the session's vault, read-write, and nothing else
+// from the vault tree. The artifact and token mounts are shared with the idle
+// case and are asserted there.
 func TestBoundRunnerHoldsOnlyTheSessionVault(t *testing.T) {
 	cfg := testConfig(t, 1)
 	p := noDockerPool(t, cfg)
@@ -182,12 +228,26 @@ func TestBoundRunnerHoldsOnlyTheSessionVault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(req.Mounts) != 1 {
-		t.Fatalf("bound mounts = %+v, want exactly one", req.Mounts)
+
+	// Exactly one mount may come from the vault, and it must be this session's.
+	// Counting by source rather than by total is what makes the new mounts a
+	// non-event for the property this test exists to protect.
+	fromVault := 0
+	for _, mt := range req.Mounts {
+		if strings.HasPrefix(mt.Source, cfg.VaultRoot) {
+			fromVault++
+			if !strings.Contains(mt.Source, guid) {
+				t.Errorf("bound runner mounts another session's vault: %+v", mt)
+			}
+		}
 	}
-	m := req.Mounts[0]
-	if m.Destination != "/data" {
-		t.Errorf("mount destination = %q, want /data", m.Destination)
+	if fromVault != 1 {
+		t.Errorf("bound runner has %d vault mounts, want exactly 1: %+v", fromVault, req.Mounts)
+	}
+
+	m := mountFor(req, "/data")
+	if m == nil {
+		t.Fatalf("bound mounts = %+v, want a /data mount", req.Mounts)
 	}
 	if m.ReadOnly {
 		t.Error("the session vault must be rw: it holds auth.json, which login writes")

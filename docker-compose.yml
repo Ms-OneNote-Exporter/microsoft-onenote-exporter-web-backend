@@ -220,6 +220,17 @@ services:
       # assert-compose.mjs checks the whole set, so a name that drifts out of the
       # namespace fails a test rather than a deployment.
       ORCH_POOL_SIZE: ${POOL_SIZE:-2}
+      # The host path of the bearer token every runner mounts read-only.
+      #
+      # A *path*, like every other secret here: the orchestrator never reads the
+      # value, it bind-mounts the file into each runner, and the runner reads it
+      # from its own /run/secrets. So the value is never in this container's
+      # environment, and never in `docker inspect`.
+      #
+      # It defaults to /run/secrets/runner_token, which is where the `runner_token`
+      # secret below is mounted in the orchestrator — so the default is correct
+      # and the variable exists only for a deployment that puts secrets elsewhere.
+      ORCH_RUNNER_TOKEN_FILE: /run/secrets/runner_token
 
       # No PUBLIC_HOST, no ALLOWED_ORIGINS, no CSRF key. The orchestrator is not a
       # component that should know any of them, and its absence here is a property
@@ -244,6 +255,18 @@ services:
       - "${_DOCKER_GID:?set _DOCKER_GID to the host docker group gid; see infra/README.md}"
     secrets:
       - orchestrator_hmac_secret
+      # The runner's bearer token. The orchestrator never reads the *value* — it
+      # bind-mounts this file into each runner it creates, and the runner reads it
+      # from its own /run/secrets. So the orchestrator can hand out a token it
+      # presents without the token ever being in its environment or in
+      # `docker inspect`.
+      #
+      # Without this mount, `buildCreateRequest` names
+      # /run/secrets/runner_token as a bind source that does not exist in the
+      # orchestrator container, and Docker creates the *directory* — so the runner
+      # mounts an empty directory over its secret path, reads a path, and exits 1.
+      # That is the shape of failure this whole entry exists to prevent.
+      - runner_token
     volumes:
       # The ONLY docker socket in the stack. This is the entire reason the
       # orchestrator is a separate component: it is the only process whose

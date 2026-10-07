@@ -36,7 +36,19 @@ RUN if go list -m all | tail -n +2 | grep -q .; then \
 
 # The directory tree copied into the runtime image below. Built here because the
 # runtime stage has no shell to create it with.
-RUN mkdir -p /out/srv/artifacts /out/srv/vault
+#
+# The paths must be exactly `ORCH_VAULT_ROOT` and `ORCH_ARTIFACT_ROOT`'s parent, or
+# exactly where `docker-compose.yml` mounts the volumes — all three agree on
+# `/srv/msout/{vault,artifacts}`, and this line **was `/out/srv/{vault,artifacts}`**.
+# So the directories below were never the ones being mounted, Docker had nothing to
+# seed a fresh volume from, and the first real login failed:
+#
+#     mkdir /srv/msout/vault: permission denied
+#
+# with `/healthz` reporting `ok` throughout. `.github/assert-compose.mjs` now
+# cross-checks this line against the compose mount targets, because three files
+# naming the same path independently is how it drifted.
+RUN mkdir -p /out/srv/msout/vault /out/srv/msout/artifacts
 
 # ---- runtime --------------------------------------------------------------
 # distroless/static has no shell and no package manager. The orchestrator never
@@ -59,6 +71,10 @@ COPY --from=build /out/orchestrator /usr/local/bin/orchestrator
 # runtime.
 
 # `nonroot` is distroless's uid 65532, the same user the container runs as.
+#
+# Copied to `/srv`, so the image's directories land at `/srv/msout/{vault,artifacts}`
+# — the paths `ORCH_VAULT_ROOT` and `ORCH_ARTIFACT_ROOT` default to and the paths
+# `docker-compose.yml` mounts. All three names must agree; CI asserts it.
 COPY --from=build --chown=nonroot:nonroot /out/srv /srv
 
 # Non-root. The Docker socket is the privilege here, not the uid; running as

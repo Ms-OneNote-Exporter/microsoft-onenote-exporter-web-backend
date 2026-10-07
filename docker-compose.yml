@@ -419,6 +419,25 @@ services:
       # orchestrator no egress at all.
       - /var/run/docker.sock:/var/run/docker.sock
       - artifacts:/srv/msout/artifacts
+      # The session vault, `/srv/msout/vault/<guid>` — a **named volume**, and it
+      # has to be.
+      #
+      # It was not mounted at all, so the orchestrator created it *inside the
+      # container's writable layer*. The plan's host-path table says this data is
+      # at `/srv/msout/vault/<guid>`; in practice every session's auth.json, its
+      # exported vault and its logs were one `docker compose up -d
+      # --force-recreate orchestrator` away from being deleted, mid-export. Nothing
+      # lost it, so nothing reported it.
+      #
+      # A named volume rather than a bind mount for the reason `runner-data` gives:
+      # erase becomes one directory removal, and no host path has to be created with
+      # the right ownership before the first login.
+      #
+      # The image prepares this directory owned by `nonroot`, and Docker seeds a
+      # fresh named volume from the image's directory *and its ownership* — so the
+      # orchestrator can create `<guid>` inside it. Without that, the first login
+      # failed with `mkdir /srv/msout/vault: permission denied`.
+      - vault:/srv/msout/vault
     cap_drop:
       - ALL
     security_opt:
@@ -521,6 +540,9 @@ services:
 volumes:
   api-data:
   artifacts:
+  # The orchestrator's session vault. See the `vault:` mount above for why it is a
+  # volume and why it was a bug that it was not one.
+  vault:
   caddy-data:
   caddy-config:
   # The runner's session data: one subdirectory per session guid, holding the auth

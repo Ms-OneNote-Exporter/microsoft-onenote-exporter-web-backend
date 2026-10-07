@@ -17,14 +17,32 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const SCRIPT = ".github/assert-compose.mjs";
 
 /** Runs the assertion script against a config object; returns its exit code. */
 function run(cfg) {
+  return runScript(SCRIPT, cfg);
+}
+
+/**
+ * runScript runs the assertion script from *some* directory.
+ *
+ * Two cases need the script and the Dockerfile to be read from a scratch tree: the
+ * assertion reads `../orchestrator/Dockerfile` relative to itself, so a Dockerfile
+ * violation can only be staged if the script sits next to a mutated copy of it.
+ *
+ * Deliberately **not** a `dockerfile` field on the config passed to the script. That
+ * would be a test-only backdoor in the assertion — the thing being tested would gain
+ * a way to be told what to check, which is exactly the shape of an assertion that
+ * cannot be trusted.
+ */
+function runScript(scriptPath, cfg) {
   try {
-    execFileSync("node", [SCRIPT], {
+    execFileSync("node", [scriptPath], {
       input: JSON.stringify(cfg),
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -32,6 +50,30 @@ function run(cfg) {
   } catch (error) {
     return error.status ?? 1;
   }
+}
+
+/**
+ * stages a mutated copy of the orchestrator Dockerfile beside a copy of the script,
+ * and returns the path to that copy of the script.
+ *
+ * A temp tree rather than an in-place edit-and-restore: restoring in a `finally`
+ * means an interrupt leaves the repository broken, and a broken repository is a
+ * worse outcome than a failed harness.
+ */
+function stageDockerfile(find, replace) {
+  const root = mkdtempSync(join(tmpdir(), "assert-compose-"));
+  mkdirSync(join(root, ".github"));
+  mkdirSync(join(root, "orchestrator"));
+  writeFileSync(
+    join(root, ".github", "assert-compose.mjs"),
+    readFileSync(SCRIPT),
+  );
+  const original = readFileSync("orchestrator/Dockerfile", "utf8");
+  if (!original.includes(find)) {
+    throw new Error(`orchestrator/Dockerfile no longer contains ${JSON.stringify(find)}`);
+  }
+  writeFileSync(join(root, "orchestrator", "Dockerfile"), original.split(find).join(replace));
+  return join(root, ".github", "assert-compose.mjs");
 }
 
 /** A deep clone, so each case starts from the real config untouched. */
@@ -405,6 +447,49 @@ const cases = [
     expectMessage: /orchestrator's secrets are \[/,
   },
   {
+    // The shipped bug: the vault was not a volume at all, so every session's
+    // auth.json and exported vault lived in the orchestrator container's writable
+    // layer and one `--force-recreate` deleted them. Nothing failed until the data
+    // was gone, which is to say nothing ever reported it.
+    name: "leaves the session vault in the container's writable layer",
+    mutate: (c) => {
+      c.services.orchestrator.volumes = (c.services.orchestrator.volumes ?? []).filter(
+        (v) => (typeof v === "string" ? v : v?.target) !== "/srv/msout/vault",
+      );
+    },
+    expectMessage: /writable layer/,
+  },
+  {
+    // The other half: the volume was mounted, but the *image* prepared
+    // `/srv/vault` rather than `/srv/msout/vault`, so Docker seeded nothing, the
+    // volume came out root-owned, and `mkdir /srv/msout/vault` failed for uid
+    // 65532. Both assertions are needed — either alone passes the other bug.
+    name: "seeds the vault volume from an unrelated image path",
+    mutateFile: { file: "orchestrator/Dockerfile", find: "/out/srv/msout/vault", replace: "/out/srv/vault" },
+    expectMessage: /nothing seeds \/srv\/msout\/vault/,
+  },
+  {
+    // `mkdir -p a b` is one instruction with two paths. An assertion that matched
+    // a single path per line would find only the first and pass while `artifacts`
+    // was broken.
+    name: "prepares only the first path of a multi-path mkdir",
+    mutateFile: {
+      file: "orchestrator/Dockerfile",
+      find: "RUN mkdir -p /out/srv/msout/vault /out/srv/msout/artifacts",
+      replace: "RUN mkdir -p /out/srv/msout/vault",
+    },
+    expectMessage: /nothing seeds \/srv\/msout\/artifacts/,
+  },
+  {
+    // §2.1: only the orchestrator and the runners it creates may read a vault.
+    // A vault mount on the api would hand it every session's cookie jar.
+    name: "gives the api the session vault",
+    mutate: (c) => {
+      c.services.api.volumes = [...(c.services.api.volumes ?? []), { target: "/srv/msout/vault" }];
+    },
+    expectMessage: /api mounts \/srv\/msout\/vault/,
+  },
+  {
     name: "points the orchestrator's token path at nothing",
     mutate: (c) => {
       c.services.orchestrator.environment.ORCH_RUNNER_TOKEN_FILE = "/etc/passwd";
@@ -435,9 +520,16 @@ let missed = 0;
 
 for (const testCase of cases) {
   const cfg = clone(base);
-  testCase.mutate(cfg);
+  // `mutateFile` cases stage the *other* half of the violation — the Dockerfile —
+  // and still need a config mutation, so a no-op is allowed rather than each of
+  // them having to invent one. A required `mutate` would push every file-level case
+  // towards a filler function that looks like it is asserting something.
+  testCase.mutate?.(cfg);
+  const script = testCase.mutateFile
+    ? stageDockerfile(testCase.mutateFile.find, testCase.mutateFile.replace)
+    : SCRIPT;
 
-  if (run(cfg) === 0) {
+  if (runScript(script, cfg) === 0) {
     console.error(`FAIL  not caught: ${testCase.name}`);
     missed++;
     continue;
@@ -447,7 +539,7 @@ for (const testCase of cases) {
   // non-zero for an unrelated reason is no better than one that passes.
   let output = "";
   try {
-    execFileSync("node", [SCRIPT], { input: JSON.stringify(cfg), stdio: ["pipe", "pipe", "pipe"] });
+    execFileSync("node", [script], { input: JSON.stringify(cfg), stdio: ["pipe", "pipe", "pipe"] });
   } catch (error) {
     output = String(error.stderr ?? "");
   }

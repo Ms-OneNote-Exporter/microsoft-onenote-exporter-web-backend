@@ -158,6 +158,82 @@ check(
     "into every runner, so without it Docker creates an empty directory at the " +
     "destination and each runner exits 1 at startup",
 );
+// The vault and artifact roots are named in **three** places that cannot see each
+// other: the orchestrator's config defaults, the compose mount targets, and the
+// directories the image prepares so a fresh named volume inherits `nonroot`
+// ownership.
+//
+// They drifted, and the drift is invisible at every layer that could have looked:
+//   - the config said `/srv/msout/vault`
+//   - compose mounted a volume at `/srv/msout/vault`
+//   - and the image prepared `/srv/vault`
+//
+// So the volume had nothing to inherit, was created root-owned, and the first real
+// login failed with `mkdir /srv/msout/vault: permission denied` — while `/healthz`
+// said `ok`, because a healthcheck that touches no data path cannot see this.
+//
+// The Dockerfile is read rather than trusted: a `RUN mkdir` that names the wrong
+// path is precisely the bug, and reading it is what turns three independent names
+// into something checkable.
+const orchestratorDockerfile = readFileSync(
+  new URL("../orchestrator/Dockerfile", import.meta.url),
+  "utf8",
+);
+// `mkdir -p a b c` takes a *list*, and the real line has two arguments. Matching
+// one path per line would have found only the first — a check that reads as if it
+// covers the tree and quietly covers half of it, which is how this class of
+// assertion gets trusted.
+const preparedRoots = [
+  ...orchestratorDockerfile.matchAll(/^\s*RUN mkdir\b(.*)$/gm),
+]
+  .flatMap((m) => m[1].trim().split(/\s+/).slice(1))
+  .filter((p) => p.startsWith("/out/srv/"))
+  .map((p) => p.replace("/out/srv/", "/srv/"))
+  .sort();
+
+for (const [volume, envVar, role] of [
+  ["vault", "ORCH_VAULT_ROOT", "session vault"],
+  ["artifacts", "ORCH_ARTIFACT_ROOT", "finalized exports"],
+]) {
+  const target = `/srv/msout/${volume}`;
+  const mounted = (services.orchestrator?.volumes ?? [])
+    .map((v) => (typeof v === "string" ? v : v?.target))
+    .filter((t) => t === target);
+
+  check(
+    mounted.length === 1,
+    `orchestrator: the ${role} path is a volume at ${target}`,
+    `the orchestrator mounts nothing at ${target} (${envVar} defaults to it). Without ` +
+      `a volume the data lives in the container's writable layer and a single ` +
+      `\`docker compose up -d --force-recreate orchestrator\` deletes it mid-session`,
+  );
+
+  check(
+    preparedRoots.includes(target),
+    `orchestrator image: prepares ${target} so a fresh volume is writable`,
+    `orchestrator/Dockerfile prepares [${preparedRoots.join(", ")}] but nothing seeds ` +
+      `${target}, which the orchestrator writes to. Docker copies a new named volume's ` +
+      `ownership from the image's directory at that path, so a path missing from the ` +
+      `image produces a root-owned volume and \`mkdir ${target}: permission denied\``,
+  );
+}
+
+// The vault must not be mounted anywhere else. §2.1 forbids the api from reading a
+// cookie jar, and it forbids Caddy reading a vault path; both are asserted
+// elsewhere, but a volume that is *not* where the plan says it is can be mounted in
+// the wrong place without either assertion noticing.
+const vaultTarget = "/srv/msout/vault";
+for (const svc of ["api", "caddy"]) {
+  check(
+    !(services[svc]?.volumes ?? []).some(
+      (v) => (typeof v === "string" ? v : v?.target) === vaultTarget,
+    ),
+    `${svc} has no vault mount`,
+    `${svc} mounts ${vaultTarget}; §2.1 requires that only the orchestrator and the ` +
+      `runners it creates can read a vault`,
+  );
+}
+
 // ORCH_RUNNER_TOKEN_FILE must be a **host** path, not the container path the
 // orchestrator mounts the secret at.
 //

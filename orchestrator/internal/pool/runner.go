@@ -38,6 +38,38 @@ func (p *Pool) buildCreateRequest(slotID, containerID, sessionGUID string, sessi
 
 	lbl := labels.Base(slotID, containerID, p.cfg.RunnerImage)
 
+	// The artifact mount is unconditional, bound or not.
+	//
+	// The runner streams a finished vault into its artifact directory, and the
+	// root filesystem is read-only — so without this mount the archive has
+	// nowhere to go and every export fails at the last step, after all the work
+	// of doing it. It is the same directory `ArtifactStat` reads and the same one
+	// Caddy is given read-only, so the staged file and the published one cannot
+	// drift apart.
+	//
+	// An idle runner gets it too, and holding an empty artifact directory is not
+	// a capability: the vault bind is what makes a container credential-bearing,
+	// and that is still only added on bind.
+	artifactMount := dockerapi.CreateMount{
+		Type:        "bind",
+		Source:      p.cfg.ArtifactRoot,
+		Destination: "/artifacts",
+		ReadOnly:    false,
+	}
+
+	// The bearer token, mounted from the orchestrator's own secret file.
+	//
+	// Read-only, and named for what it is: a token that lets this orchestrator
+	// authenticate to a container it created. It never carries or reveals a
+	// session credential, so it is not the §2.1 prohibition on secrets — but it is
+	// still a file rather than an env var, for the reason given on the Env entry.
+	tokenMount := dockerapi.CreateMount{
+		Type:        "bind",
+		Source:      p.cfg.RunnerTokenFile,
+		Destination: "/run/secrets/runner_token",
+		ReadOnly:    true,
+	}
+
 	var mounts []dockerapi.CreateMount
 	if sessionGUID == "" {
 		// An idle runner holds no session volume. Mounting one speculatively
@@ -46,6 +78,8 @@ func (p *Pool) buildCreateRequest(slotID, containerID, sessionGUID string, sessi
 		// what an idle TTL is for.
 		mounts = []dockerapi.CreateMount{
 			{Type: "tmpfs", Source: "", Destination: "/data"},
+			artifactMount,
+			tokenMount,
 		}
 	} else {
 		bound, err := p.bindSession(sessionGUID)
@@ -53,7 +87,7 @@ func (p *Pool) buildCreateRequest(slotID, containerID, sessionGUID string, sessi
 			return dockerapi.CreateRequest{}, err
 		}
 		lbl = mergeLabels(lbl, labels.Bind(sessionGUID, sessionExpiresAt))
-		mounts = bound
+		mounts = append(bound, artifactMount, tokenMount)
 	}
 
 	req := dockerapi.CreateRequest{
@@ -116,6 +150,17 @@ func (p *Pool) buildCreateRequest(slotID, containerID, sessionGUID string, sessi
 			// Every @msout package log and HTML dump lands inside the session
 			// directory and dies with it on erase (PLAN-v2 §5.6).
 			"ONENOTE_EXPORT_LOG_DIR=/data/logs",
+			// Where the token the orchestrator presents lives. A *path*, never the
+			// value: an env var is visible in `docker inspect` and in
+			// `/proc/<pid>/environ` to anything that can read the container's
+			// config, including a container that has no business knowing it.
+			//
+			// The runner refuses to start without this. That is deliberate on its
+			// side — a default token would accept requests from anything that can
+			// reach the container, and this process holds credential bytes — and it
+			// means the mount below is not optional. See runner/tests/contract.test.ts,
+			// which is what caught this being absent.
+			"MSOUT_RUNNER_TOKEN_FILE=/run/secrets/runner_token",
 		},
 		Mounts: mounts,
 	}

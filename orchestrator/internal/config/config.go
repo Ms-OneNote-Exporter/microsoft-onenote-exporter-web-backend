@@ -64,6 +64,15 @@ type Config struct {
 	// orchestrator is not a member of it (T-X2).
 	RunnerNetwork string
 
+	// RunnerTokenFile is the host path of the bearer token each runner mounts
+	// read-only, and which it requires in order to start.
+	//
+	// A path, never a value, for the reason every other secret in this stack is a
+	// file: an env var is visible in `docker inspect` and in `/proc/<pid>/environ`.
+	// The runner refuses to boot without it, so this is not optional — see
+	// runner/tests/contract.test.ts.
+	RunnerTokenFile string
+
 	// PoolSize is how many runners exist when idle.
 	PoolSize int
 
@@ -115,13 +124,17 @@ func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (*C
 	}
 
 	cfg := &Config{
-		Listen:          envOr(getenv, "ORCH_LISTEN", ":9100"),
-		DockerSocket:    envOr(getenv, "ORCH_DOCKER_SOCKET", "/var/run/docker.sock"),
-		ReplayWindow:    60 * time.Second,
-		VaultRoot:       envOr(getenv, "ORCH_VAULT_ROOT", "/srv/msout/vault"),
-		ArtifactRoot:    envOr(getenv, "ORCH_ARTIFACT_ROOT", "/srv/msout/artifacts"),
-		RunnerImage:     envOr(getenv, "ORCH_RUNNER_IMAGE", "ghcr.io/ms-one-note-exporter/runner:0.0.0"),
-		RunnerNetwork:   envOr(getenv, "ORCH_RUNNER_NETWORK", "msout-runner"),
+		Listen:        envOr(getenv, "ORCH_LISTEN", ":9100"),
+		DockerSocket:  envOr(getenv, "ORCH_DOCKER_SOCKET", "/var/run/docker.sock"),
+		ReplayWindow:  60 * time.Second,
+		VaultRoot:     envOr(getenv, "ORCH_VAULT_ROOT", "/srv/msout/vault"),
+		ArtifactRoot:  envOr(getenv, "ORCH_ARTIFACT_ROOT", "/srv/msout/artifacts"),
+		RunnerImage:   envOr(getenv, "ORCH_RUNNER_IMAGE", "ghcr.io/ms-one-note-exporter/runner:0.0.0"),
+		RunnerNetwork: envOr(getenv, "ORCH_RUNNER_NETWORK", "msout-runner"),
+		// Next to the orchestrator's own secret, by convention. Not derived from
+		// ORCH_HMAC_SECRET_FILE: it is a different secret with a different
+		// audience, and coupling them would mean rotating one rotates the other.
+		RunnerTokenFile: envOr(getenv, "ORCH_RUNNER_TOKEN_FILE", "/run/secrets/runner_token"),
 		PoolSize:        4,
 		RunnerTTL:       5 * time.Minute,
 		SlotIdleTimeout: 30 * time.Minute,
@@ -178,6 +191,7 @@ func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (*C
 	}{
 		{"ORCH_VAULT_ROOT", cfg.VaultRoot},
 		{"ORCH_ARTIFACT_ROOT", cfg.ArtifactRoot},
+		{"ORCH_RUNNER_TOKEN_FILE", cfg.RunnerTokenFile},
 	} {
 		if root.val == "" {
 			return nil, fmt.Errorf("orchestrator: %s is empty", root.name)

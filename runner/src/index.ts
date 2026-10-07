@@ -6,7 +6,27 @@
  *   GET  /healthz                 liveness, for the orchestrator
  *   GET  /events                  SSE, per session
  *   POST /sessions/:guid/login    the credential, as bytes
- *   GET  /sessions/:guid/artifacts  claim a finished archive
+ *   POST /sessions/:guid/artifacts  stream the vault into a staging dir
+ *
+ * ## The orchestrator's contract, and what it requires of this image
+ *
+ * `internal/pool/runner.go` builds the create request, and it had already decided
+ * three things this package had not provided. None of them fails loudly: the
+ * container starts, and the pool then refuses to bind it forever.
+ *
+ *   1. **A health check at `/app/dist/healthcheck.js`** — named in the create
+ *      request's `HealthConfig.Test`. Absent, every probe fails, the container
+ *      never becomes healthy, and a login waits on a slot that is never handed
+ *      out. Every orchestrator check still passes.
+ *   2. **`MSOUT_RUNNER_TOKEN_FILE` pointing into `/run/secrets`** — the token the
+ *      orchestrator presents. `loadConfig` throws without it, deliberately.
+ *   3. **`/artifacts` writable, alongside the `/data` bind mount** — where the
+ *      staged archive goes. The root filesystem is read-only, so this has to be a
+ *      mount; see the artifact route for why the directory is caller-named.
+ *
+ * All three are asserted in `tests/contract.test.ts` against this file and the
+ * orchestrator's, because two implementations sharing one contract is where every
+ * serious bug in this project has been.
  *
  * **There is no debug surface, and that is a control rather than a default.**
  * `--dodump` writes the authenticated DOM — live cookies, tenant hostnames.
@@ -40,6 +60,7 @@
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import type { Readable } from "node:stream";
 import { createWriteStream, existsSync } from "node:fs";
+import { mkdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import archiver from "archiver";
 import { loadConfig, type RunnerConfig } from "./config.js";
@@ -354,6 +375,13 @@ export function buildApp(
           // it would hand a caller any flag the packages accept, including the
           // dump and screenshot ones.
           nonInteractive: true,
+          // ...and the flag the package actually reads. `nonInteractive` is not
+          // consulted by 0.5.0, so relying on it alone leaves a
+          // password-protected section waiting for a keypress that can never
+          // arrive in a container. Both are set because they answer different
+          // questions: one refuses a missing target, the other skips a locked
+          // section.
+          nopassasked: true,
           // Exactly one of the two targets, chosen rather than spread, so a caller
           // cannot supply both and have the runner pick for them.
           ...(url !== null ? { notebookLink: url } : { notebook: name as string }),
@@ -433,15 +461,59 @@ export function buildApp(
 
   // ---- artifacts -----------------------------------------------------------
 
+  /**
+   * Streams the session's vault into a staging directory the orchestrator then
+   * finalises under an `artifactId`.
+   *
+   * ## Why the caller supplies the id and the runner does not generate one
+   *
+   * PLAN-v3 §2.2: *"the streaming zip is written by the runner into its artifact
+   * dir and finalised under an `artifactId` by the orchestrator."* The split is
+   * deliberate and it is why the directory is named by the caller:
+   *
+   * - §5 makes artifact ids **opaque** — `crypto.randomBytes(32)` → base64url —
+   *   because a download path containing the session GUID or the notebook name
+   *   leaks both into Caddy's access logs and into any `Referer`. A runner that
+   *   generated the id would be deriving it from the GUID it already knows, which
+   *   is the leak the design removes.
+   * - `ArtifactStat` in the orchestrator looks for a **directory** at
+   *   `<ArtifactRoot>/<artifactId>` containing a finalised zip. So a runner that
+   *   writes `<guid>.zip` is not merely unidiomatic: the stat never finds it, and
+   *   every download 404s.
+   *
+   * ## Why it is staged, not written in place
+   *
+   * A zip written directly into its final name is readable while it is being
+   * written. A download that arrives mid-write gets a truncated archive with a
+   * 200 and no error, and the user cannot tell it from a complete one. The
+   * orchestrator's finalise is what moves this into place, and it is the only
+   * component with both the artifact volume and the authority to publish.
+   */
   app.post("/sessions/:guid/artifacts", async (req, reply) => {
     const { guid } = req.params as { guid: string };
+    const body = req.body as { artifactId?: unknown } | undefined;
     const paths = sessionPaths(config.dataRoot, guid);
     if (paths === null) return reply.code(400).send({ error: "bad guid" });
+
+    const artifactId = body?.artifactId;
+    // Validated by shape, not sanitised. The same argument as the guid: "reject
+    // anything that is not exactly 43 base64url characters" is smaller and more
+    // obviously complete than "strip the bad characters", and this string reaches
+    // `path.join` to name a directory the orchestrator will then serve.
+    if (typeof artifactId !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(artifactId)) {
+      return reply.code(400).send({ error: "artifactId must be 43 base64url characters" });
+    }
     if (!existsSync(paths.outDir)) return reply.code(409).send({ error: "no output" });
+
+    // `<artifactRoot>/.staging/<artifactId>` — a dot directory, so a directory
+    // listing of the artifact root never shows an unfinished archive as if it
+    // were a publishable one, and so the orchestrator's own scan skips it.
+    const staging = join(config.artifactRoot, ".staging", artifactId);
+    await mkdir(staging, { recursive: true });
+    const target = join(staging, "vault.zip");
 
     // Streaming, not a system `zip`: a second full copy of the data is the disk
     // spike §8.3 warns about, and a vault can be several gigabytes.
-    const target = join(config.artifactRoot, `${guid}.zip`);
     try {
       await new Promise<void>((resolvePromise, rejectPromise) => {
         const output = createWriteStream(target);
@@ -458,13 +530,25 @@ export function buildApp(
         void zip.finalize();
       });
     } catch (cause) {
+      // The partial directory is left, not cleaned: it is inside `.staging`, so
+      // nothing treats it as an artifact, and removing it would risk deleting a
+      // partially-written archive the orchestrator is in the middle of claiming.
       return reply.code(500).send({
         error: "archive failed",
         detail: cause instanceof Error ? cause.message : "unknown",
       });
     }
 
-    return reply.code(201).send({ path: target });
+    const { size } = await stat(target);
+
+    // 201 with the staging path, not the final one: the orchestrator finalises,
+    // and telling the caller where it ended up would invite api to build a
+    // download URL from a staging path.
+    return reply.code(201).send({
+      artifactId,
+      stagedAt: join(".staging", artifactId),
+      bytes: size,
+    });
   });
 
   app.delete("/sessions/:guid", async (req, reply) => {

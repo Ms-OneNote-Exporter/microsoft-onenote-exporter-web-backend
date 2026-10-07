@@ -290,6 +290,30 @@ const cases = [
     },
     expectMessage: /--no-sandbox/,
   },
+
+  // ---- the orchestrator can hand a runner its token ------------------------
+  //
+  // Dropping either of these is silent: the orchestrator keeps naming
+  // /run/secrets/runner_token as a bind source, Docker creates the destination as
+  // an empty *directory* when the source does not exist, the runner mounts a
+  // directory over its own secret path, reads a path, and exits 1. Every
+  // container starts and every orchestrator check still passes.
+  {
+    name: "takes runner_token away from the orchestrator",
+    mutate: (c) => {
+      c.services.orchestrator.secrets = c.services.orchestrator.secrets.filter(
+        (s) => s.source !== "runner_token",
+      );
+    },
+    expectMessage: /orchestrator's secrets are \[/,
+  },
+  {
+    name: "points the orchestrator's token path at nothing",
+    mutate: (c) => {
+      c.services.orchestrator.environment.ORCH_RUNNER_TOKEN_FILE = "/etc/passwd";
+    },
+    expectMessage: /ORCH_RUNNER_TOKEN_FILE is/,
+  },
 ];
 
 // ---- each violation must be caught ----------------------------------------

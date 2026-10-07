@@ -266,9 +266,9 @@ jobs:
           echo "an empty PUBLIC_HOST is refused"
 
       - name: static capability assertions
-        # \u00a72.1's properties, checked against what Compose *resolved* rather than
+        # §2.1's properties, checked against what Compose *resolved* rather than
         # against the YAML as written. Every one of these mistakes produces a stack
-        # that starts, serves, and looks fine \u2014 which is exactly why they are asserted
+        # that starts, serves, and looks fine — which is exactly why they are asserted
         # rather than reviewed.
         env:
           COMPOSE_PROJECT_NAME: msout
@@ -280,6 +280,19 @@ jobs:
         run: |
           docker compose --profile runner -f docker-compose.yml config --format json \
             | node .github/assert-compose.mjs
+
+      # The duplicate-key check is itself a check, and a check that has never been
+      # asked to fail is a claim rather than a check.
+      #
+      # It lived only in `capability.yml` until it missed a duplicated `run:` in that
+      # very file — a run reporting failure with zero jobs, the exact signature of the
+      # incident it was written for.
+      #
+      # Run here rather than in `capability.yml`, for the same reason the check
+      # itself lives in `capability.yml`: a workflow GitHub cannot parse never runs,
+      # so a check for the validity of one cannot live inside one.
+      - name: the duplicate-key check can actually fail
+        run: node .github/no-duplicate-keys.test.mjs
 
       - name: the assertions can actually fail
         # A check that cannot fail is not a check. This feeds deliberately broken

@@ -19,6 +19,26 @@
  * So: the check that would have caught it is this one, and it runs in CI on the
  * same commit as the workflows.
  *
+ * ## The bug it missed, and why
+ *
+ * On 2026-10-07 this script passed a workflow containing **two `run:` keys on one
+ * step**, and GitHub rejected the file outright — a run that reported failure with
+ * zero jobs, the exact signature of the `IMAGE_TAG` incident above.
+ *
+ * The cause is in the block-scalar handling. `run: |` opens a shell script, and the
+ * scanner cleared its map of seen keys when it saw one, so that lines inside a shell
+ * body would not be mistaken for mapping keys. The intent was right. The mistake
+ * was clearing on the *opening* line: that threw away the key that had just been
+ * recorded, so any pair of block scalars on the same step was invisible.
+ *
+ * `IMAGE_TAG` was caught only because it was a plain scalar. Every `run:` in every
+ * workflow — which is nearly all of them — was unchecked.
+ *
+ * The fix records a block scalar as the key it is and keeps the recorded keys across
+ * its body. `tests/` in this directory exercises four shapes: a duplicated `run:`
+ * (caught), the historical `IMAGE_TAG` (caught), two steps each with one `run:`
+ * (clean), and a shell body containing a line that looks like a key (clean).
+ *
  * ## Why a text scanner and not a parser
  *
  * Because the parse is what loses the information. Reading the file with a YAML
@@ -52,7 +72,7 @@ const WORKFLOWS = join(HERE, "workflows");
 const KEY_LINE = /^(\s*)(-\s+)?([^\s#:][^:]*?)\s*:(?:\s+(.*))?$/;
 
 /** A block scalar: `run: |`, `run: >-`, `run: |2`. */
-const BLOCK_SCALAR = /^(\s*)(?:-\s+)?[^:#]*?:\s*[|>][-+0-9]*\s*(?:#.*)?$/;
+const BLOCK_SCALAR = /^(\s*)(-\s+)?([^:#]*?):\s*[|>][-+0-9]*\s*(?:#.*)?$/;
 
 /**
  * @param {string} source
@@ -87,9 +107,38 @@ function duplicateKeysInText(source) {
 
     const scalar = BLOCK_SCALAR.exec(raw);
     if (scalar !== null) {
-      blockScalarIndent = scalar[1].length;
-      keyIndent = null;
-      seen = new Map();
+      // A block scalar is **still a mapping key**. It has to be recorded, and the
+      // recorded keys have to survive the block — otherwise two `run:` keys on one
+      // step are never compared, which is precisely the bug this script exists to
+      // catch and precisely what it missed in `capability.yml` on 2026-10-07.
+      //
+      // The earlier version cleared `seen` here. The intent was right — a shell
+      // body contains lines that look like mapping keys — but clearing on the
+      // opening line threw away the key that had just been seen, so every pair of
+      // block scalars was invisible to it. `IMAGE_TAG` in `ci.yml` was caught only
+      // because it was a plain scalar.
+      const scalarIndent = scalar[1].length;
+      if (scalar[2] !== undefined) {
+        // `- run: |` — a sequence item, so a fresh scope, as below.
+        keyIndent = null;
+        seen = new Map();
+        blockStart = lineNo;
+      } else if (keyIndent !== scalarIndent) {
+        keyIndent = scalarIndent;
+        blockStart = lineNo;
+        seen = new Map();
+      }
+      const scalarKey = scalar[3].trim();
+      if (scalarKey !== "" && !scalarKey.startsWith("<<") && !scalarKey.startsWith("? ")) {
+        if (seen.has(scalarKey)) {
+          problems.push({ key: scalarKey, first: seen.get(scalarKey), second: lineNo, block: blockStart });
+        } else {
+          seen.set(scalarKey, lineNo);
+        }
+      }
+      // Everything indented further than this line is the scalar's body, and is
+      // skipped rather than parsed.
+      blockScalarIndent = scalarIndent;
       continue;
     }
 

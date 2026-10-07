@@ -109,6 +109,16 @@ jobs:
         # `npm ci` installs exactly the lockfile and fails if it and package.json
         # disagree, so a hand-edited dependency is a red build rather than a
         # silent resolution change.
+        #
+        # PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD is here for @msout/microsoft-webauth,
+        # a devDependency used by tests/login-failures.test.ts to read that
+        # package's exported LOGIN_REASONS. The api itself never launches a
+        # browser — the runner owns Playwright — so downloading ~150 MB of
+        # Chromium to read an array of strings would make this job slower for no
+        # benefit. Set rather than unset: if it is ever absent the install still
+        # works, just wastefully, so the flag cannot be the reason a build fails.
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
         run: npm ci
 
       - name: no audit findings in the shipped dependency tree

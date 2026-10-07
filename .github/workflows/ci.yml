@@ -239,7 +239,7 @@ jobs:
           # The api image is stamped with this, and an unset one is asserted as a
           # failure rather than defaulted.
           IMAGE_TAG: "0000000"
-        run: docker compose -f docker-compose.yml config --quiet
+        run: docker compose --profile runner -f docker-compose.yml config --quiet
 
       - name: the required host name is genuinely required
         # Asserts the guard rather than trusting it. `${PUBLIC_HOST:?}` failing is
@@ -253,7 +253,7 @@ jobs:
           IMAGE_TAG: "0000000"
           PUBLIC_HOST: ""
         run: |
-          if docker compose -f docker-compose.yml config --quiet 2>/dev/null; then
+          if docker compose --profile runner -f docker-compose.yml config --quiet 2>/dev/null; then
             echo "an empty PUBLIC_HOST was accepted, so the guard is not load-bearing"
             exit 1
           fi
@@ -272,7 +272,7 @@ jobs:
           _DOCKER_GID: "998"
           IMAGE_TAG: "0000000"
         run: |
-          docker compose -f docker-compose.yml config --format json \
+          docker compose --profile runner -f docker-compose.yml config --format json \
             | node .github/assert-compose.mjs
 
       - name: the assertions can actually fail

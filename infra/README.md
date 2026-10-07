@@ -22,10 +22,16 @@ the two values an operator has to supply, see [`DEPLOYMENT.md`](./DEPLOYMENT.md)
                   ┌────▼────┐
                   │  orch.  │  the ONLY docker socket
                   └─────────┘
-                       ╳  msout-runner is declared but has no service on it yet
+                        ╳  no path: the orchestrator and the api are on
+                           internal networks only, so a runner cannot reach either
+                   ┌────────────────────────────────────────────┐
+   internet ──────▶│  runner   msout-runner      (egress: open) │
+                   │    │      msout-runner-api  (internal)     │
+                   └────┼───────────────────────────────────────┘
+                        └──▶ api  (the credential path — nothing back the other way)
 ```
 
-Three networks, and each one exists for a stated reason:
+Four networks, and each exists for a stated reason:
 
 - `msout-edge` — **Caddy alone.** The api and the orchestrator are not on it, so
   "not reachable from outside" is a property of the topology rather than of
@@ -34,10 +40,49 @@ Three networks, and each one exists for a stated reason:
   This is the word that matters most in the file: it means these three services
   have **no route to the internet**. A network declared without it still works, so
   nothing else would fail — the orchestrator would simply be able to reach out.
-- `msout-runner` — **declared with no egress enforcement, which compose cannot
-  do.** Honest rather than omitted, so a reviewer reading the file sees the gap.
-  Note it is pruned from the resolved config until a service joins it, so today it
-  is documentation rather than a live network.
+- `msout-runner-api` — `internal: true`, and holds `api` plus the runners. The
+  credential path. Internal, so joining it cannot give `api` egress; and the
+  orchestrator is **not** on it, so the credential is one hop from the Docker
+  socket rather than on it.
+- `msout-runner` — **the runner's internet access, deliberately unrestricted.**
+
+## The runner's egress is unrestricted, and that is a decision
+
+A runner may make any outbound call to the internet. There is no allowlist of
+Microsoft hosts, and adding one is the change to avoid.
+
+**Why:** an allowlist can only be as current as the last login somebody observed.
+Microsoft changes a hostname — a SharePoint tenant, an asset CDN, a regional login
+endpoint — and the product breaks with **no signal at all**: no error, no failing
+test, just sign-in that stopped working. The observation that mattered is the one
+nobody made. Every other property in this stack is asserted rather than
+maintained; an allowlist is the one thing here that would have to be maintained,
+and it would fail quietly.
+
+**What is still denied**, and none of it is a list:
+
+| target | why it is safe to deny |
+|---|---|
+| the cloud metadata service (`169.254.169.254`) | Microsoft will never log in through it. It is a path to the *instance's* credentials, not ours |
+| the host gateway | same; nothing Microsoft does goes there |
+| the Docker socket | only the orchestrator has it, and it is not on the runner's networks |
+| `api` and `orchestrator` by name | they are on internal networks the runner's egress net does not route to |
+
+The first two are *topology* on most hosts, and `capability.yml` asserts all four
+from inside a running container (T-N9). On an instance type that actually has a
+metadata service the topology may not be enough, and that is the one rule worth
+adding at the host level — it constrains nothing Microsoft does:
+
+```sh
+# Deny the metadata service and the Docker socket to the runner's bridge subnet.
+# Find the subnet first:  docker network inspect msout_msout-runner \
+#   --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
+iptables -I DOCKER-USER -s <subnet> -d 169.254.169.254 -j DROP
+iptables -I DOCKER-USER -s <subnet> -d 172.17.0.1 -p tcp --dport 2375 -j DROP
+```
+
+Not applied by this repository, because a host firewall rule is not something a
+compose file should install and a VPS is the operator's.
 
 ## The host name is written down once
 
@@ -174,13 +219,16 @@ not exist, and a global `ARG` used without being re-declared in its stage.
 Every one was found by something executing the deployment. None was found by a test,
 a static assertion, or a read of the file.
 
-## Still not deployed
+## What is deployed, and what is not
 
-The **runner service** does not exist: it depends on `@msout/*` packages that are not
-published (§12 steps 1–2). This is a three-service deployment, not a four-service
-one, and `msout-runner` is declared with no service attached — which also means
-`docker compose config` prunes it, so it is documentation rather than a live
-network.
+The runner **is** built and runs (`runner/`, behind `--profile runner`), and the
+api calls it — the four runner-facing routes are wired. It is started by the
+orchestrator per session in production rather than by compose, so `docker compose
+up` without the profile does not start one; that is deliberate, because a runner
+holds one session's credential and two of them in one compose project would share a
+data root.
 
-The four runner-facing routes answer **501** and name what is missing. That is the
-honest answer and it is what a client sees.
+**Not deployed:** the host-level rules in the egress table above. They are a
+firewall configuration, not a compose file, and a VPS is the operator's — so they
+are documented rather than installed. T-N9 asserts the topology from inside a
+container, which covers the targets that topology already blocks on this host.

@@ -340,6 +340,75 @@ jobs:
           fi
           echo "msout-runner-api holds two containers"
 
+      # ---- the runner's egress: unrestricted, and the denies that hold -------
+      #
+      # A runner may make **any** outbound call to the internet. That is a decision
+      # (see the comment on `msout-runner` in docker-compose.yml): an allowlist of
+      # Microsoft hosts breaks *silently* when MS changes one, and a silent failure
+      # is the failure mode this project has paid for repeatedly.
+      #
+      # What must still be unreachable is the deny direction — the targets Microsoft
+      # will never log in through. None of it is a list; it is topology. These steps
+      # assert it **from inside a running container**, because topology nobody checks
+      # is topology that quietly changes, and a static read of the compose file would
+      # pass on a host where Docker's bridge behaves differently.
+
+      - name: T-N8 — a runner may reach the internet (deliberately unrestricted)
+        # The positive half, and it is a real assertion rather than a formality: this
+        # is the property the whole decision trades against the deny direction, so if
+        # it ever stops holding, the product has silently lost the ability to log in
+        # and every other check in this file would still be green.
+        run: |
+          set -euo pipefail
+          docker compose exec -T runner node -e '
+            require("node:dns").promises.resolve("example.com").then(() => process.exit(0))
+          ' </dev/null
+          echo "T-N8 ok: a runner has unrestricted egress, by decision"
+
+      - name: T-N9 — a runner cannot reach the metadata service or the host gateway
+        # The credential-theft path, and specifically a path to the *instance's*
+        # credentials rather than ours. On a host whose instance type has IMDS this
+        # is the difference between a compromised runner holding a Microsoft password
+        # and a compromised runner holding the instance role.
+        #
+        # It is asserted here rather than left to "the topology handles it" because on
+        # an instance type that has these, the topology may not — and a check that
+        # passes on CI's host type and fails on production's is the same silent
+        # breakage as an allowlist, just pointed the other way.
+        #
+        # `ECONNREFUSED`, `ETIMEDOUT` and `ENETUNREACH` all count as refused. Only an
+        # open connection is a failure: refusing for a different reason than the one
+        # expected is not a security property.
+        run: |
+          set -euo pipefail
+          docker compose exec -T runner node -e '
+            const net = require("node:net");
+            const targets = [
+              ["metadata service", "169.254.169.254", 80],
+              ["host gateway", "172.17.0.1", 2375],
+              ["api", "msout-api-1", 3000],
+              ["orchestrator", "msout-orchestrator-1", 9100],
+            ];
+            let leaked = 0;
+            (async () => {
+              for (const [label, host, port] of targets) {
+                const outcome = await new Promise((resolve) => {
+                  const s = net.connect({ host, port });
+                  const timer = setTimeout(() => { s.destroy(); resolve("TIMEOUT"); }, 4000);
+                  s.on("connect", () => { clearTimeout(timer); s.end(); resolve("OPEN"); });
+                  s.on("error", (e) => { clearTimeout(timer); resolve(e.code); });
+                });
+                if (outcome === "OPEN") { leaked++; console.error(`REACHABLE ${label} ${host}:${port}`); }
+                else console.log(`refused ${label} (${outcome})`);
+              }
+              if (leaked > 0) {
+                console.error(`${leaked} target(s) reachable from a runner`);
+                process.exit(1);
+              }
+            })();
+          ' </dev/null
+          echo "T-N9 ok: the deny direction holds — no metadata, no gateway, no internal service"
+
       - name: the api can resolve and connect to a runner on it
         # The other half. A network existing is not the property; a runner being
         # reachable *by name* on it is. A name that does not resolve, or a runner

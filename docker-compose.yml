@@ -60,24 +60,48 @@ networks:
   msout-runner-api:
     internal: true
 
-  # ---- KNOWN GAP, NOT AN OMISSION -------------------------------------------
+  # ---- the runner's egress: deliberately unrestricted ------------------------
   #
-  # `msout-runner` is declared with NO egress enforcement, because Docker Compose
-  # cannot enforce egress. Declaring it anyway is the honest choice: a reviewer
-  # reading this file sees the gap, where omitting the network would let a runner
-  # reach the internet with nobody having mentioned it. mac's argument, and he is
-  # right — a comment in the file survives; a comment in a PR description does not.
+  # **A runner may make any outbound call to the internet.** That is a decision,
+  # not an omission, and it reverses what this comment used to say.
   #
-  # Accurate caveat, because this is easy to overclaim: while no service joins
-  # the network, `docker compose config` **prunes it**. It does not appear in the
-  # resolved config and enforces nothing. It is documentation today, and becomes a
-  # real network the moment the runner attaches. The comment here is what a
-  # reviewer reads in the meantime.
+  # ## Why there is no allowlist of Microsoft hosts
   #
-  # When the runner lands it needs egress to login.microsoft.com and
-  # graph.microsoft.com and nothing else. That requires either a firewall rule on
-  # the host or `network_mode` with a dedicated netns. **This is an open item, not
-  # a solved one.**
+  # An allowlist derived from hosts observed during a real login is brittle in a way
+  # the rest of this stack is not. Microsoft changes a hostname — a SharePoint
+  # tenant, an asset CDN, a regional login endpoint — and the product breaks with
+  # **no signal**: no error, no failing test, just sign-in that stopped working.
+  #
+  # The failure is silent because there is nothing to assert against. An allowlist
+  # can only be as current as the last login someone observed, and the observation
+  # that mattered is the one nobody made. Compare the rest of this file, where every
+  # property is asserted rather than maintained.
+  #
+  # PLAN-v3 §2.1 already draws this line correctly, and it is worth stating the
+  # distinction it makes, because it is the one this comment previously blurred:
+  # deny the things Microsoft will *never* log in through; do not enumerate the
+  # things it might change.
+  #
+  # ## What is denied, and why it is not an allowlist
+  #
+  # The runner cannot reach:
+  #
+  #   - the Docker socket on the host
+  #   - `msout-api-1`, the orchestrator, or anything else on the internal networks
+  #   - the cloud metadata service (`169.254.169.254`)
+  #   - the host gateway
+  #
+  # **None of that is a list**, which is the point. It is topology: `msout-runner`
+  # is a plain bridge network with one member, and Docker does not give it a route
+  # to the host's interfaces, to the metadata service, or to another network's
+  # containers. Microsoft changing a hostname cannot alter any of it.
+  #
+  # `capability.yml` asserts this **from inside a running container**, because
+  # topology nobody checks is topology that quietly changes. And the one thing worth
+  # adding at the host level is the metadata service and the gateway: those are
+  # reachable on instance types that have them, they are a credential-theft path for
+  # the *instance* rather than for us, and denying them constrains nothing Microsoft
+  # does. See infra/README.md.
   msout-runner: {}
 
 # ---- secrets ----------------------------------------------------------------

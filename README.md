@@ -76,20 +76,26 @@ This repository is mid-build against that order. Where it stands:
 
 | Step | Component | State |
 |---|---|---|
-| 4 | `orchestrator` | **done** — 92 tests, zero third-party deps |
-| 5 | `api` | **partly done** — 422 tests; middleware, primitives, routes and pool binding complete, the runner-facing routes return 501 |
-| 1–2 | `runner` | not started |
-| 6 | Caddy, compose, GHCR, CI | not started |
+| 4 | `orchestrator` | **done** — zero third-party deps, full verb set plus `/finalize` |
+| 5 | `api` | **done** — 589 tests; the four runner-facing routes are wired |
+| 1–2 | `runner` | **done** — 111 tests; a container reaches `healthy` and answers the api |
+| 6 | Caddy, compose, GHCR, CI | **done** — four CI jobs, capability suite against running containers |
 
 Each directory's own README carries the detail for that component. The `api` one
 has a table of what is wired and what is not, because "partly done" is not a
 useful thing to read.
 
-**Nothing here is deployed.** There is no compose file, no Dockerfile for the `api`
-or the runner, and no CI yet, so the test suites are the only evidence any of it
-works — which is a real limitation of the current state and the reason step 6 is
-next. The orchestrator's Dockerfile exists and asserts its zero-dependency
-property at build time, but has not been built.
+**Two things are deliberately not closed**, and both are documented where they
+live rather than here:
+
+- The **host firewall rules** denying the metadata service and the Docker socket
+  to the runner's subnet. A host firewall is the operator's, not a compose file's.
+  See `infra/README.md`; `capability.yml` asserts the topology that already blocks
+  those targets on this host.
+- **A `code`-challenge path.** The runner can be asked for a typed MFA code and
+  there is no route to hand one back, so the service refuses that case by name
+  rather than letting it expire silently. Push approval — the common case — needs
+  nothing from the user and works.
 
 ## Open decisions
 

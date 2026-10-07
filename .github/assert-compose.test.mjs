@@ -321,6 +321,16 @@ const cases = [
     expectMessage: /msout-runner-api/,
   },
   {
+    // The failure an allowlist would cause, arrived at from the other side: the
+    // runner loses the internet and every login fails. Deliberately not
+    // "restricted to Microsoft", which is the tempting wrong fix.
+    name: "makes the runner's egress network internal",
+    mutate: (c) => {
+      c.networks["msout-runner"].internal = true;
+    },
+    expectMessage: /msout-runner is internal/,
+  },
+  {
     name: "removes the api from the credential-path network",
     mutate: (c) => {
       delete c.services.api.networks["msout-runner-api"];

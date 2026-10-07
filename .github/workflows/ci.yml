@@ -236,7 +236,6 @@ jobs:
           ACME_EMAIL: ops@example.com
           ALLOWED_ORIGINS: https://app.example.com
           _DOCKER_GID: "998"
-          IMAGE_TAG: "0000000"
           # The api image is stamped with this, and an unset one is asserted as a
           # failure rather than defaulted.
           IMAGE_TAG: "0000000"

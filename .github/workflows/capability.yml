@@ -484,6 +484,21 @@ jobs:
           fi
           echo "T-C7 (/files/ bypasses node) ok"
 
+      - name: no workflow file contains a duplicate key
+        # A duplicate YAML key is a syntax error for GitHub Actions and invisible
+        # to a YAML parser, which keeps the last value and says nothing.
+        #
+        # This exists because one was shipped: a duplicated `IMAGE_TAG:` in
+        # ci.yml, from PR #21. The effect was that the whole `ci` workflow stopped
+        # being scheduled — every run reported `failure` with **zero jobs** and a
+        # duration of 0s — while `capability` went on passing, because it is a
+        # different file. That reads like an outage rather than a file GitHub
+        # refused to parse, which is presumably why it survived from Oct 6.
+        #
+        # Run here rather than in ci.yml, for the reason above: ci.yml cannot
+        # report on its own validity.
+        run: node .github/no-duplicate-keys.mjs
+
       - name: no session secret is inline anywhere
         # mac's second addition. §2.1's argument is that a frontend compromise
         # yields no credential, and nothing asserted that another container cannot

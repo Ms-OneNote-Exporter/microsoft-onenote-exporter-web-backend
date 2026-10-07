@@ -94,9 +94,17 @@ jobs:
       - name: static assertions first
         # Cheap, and they gate the expensive half. If the compose file does not
         # resolve there is no point starting anything.
+        #
+        # `--profile runner` on both calls. The runner service sits behind that
+        # profile so `docker compose up` does not start it, which means a plain
+        # `config` **prunes the service out of the resolved file entirely** — and
+        # the runner's isolation assertions then run against `undefined`. They
+        # failed here for exactly that reason, which is the correct behaviour of a
+        # check that has nothing to check: the profile has to be enabled for the
+        # resolved config to contain the thing being asserted.
         run: |
-          docker compose config --quiet
-          docker compose config --format json | node .github/assert-compose.mjs
+          docker compose --profile runner config --quiet
+          docker compose --profile runner config --format json | node .github/assert-compose.mjs
 
       - name: throwaway secrets
         # Generated here, never taken from the repository and never a real value.
@@ -111,7 +119,7 @@ jobs:
           mkdir -p secrets
           chmod 700 secrets
           umask 077
-          for f in csrf_key orchestrator_hmac_secret; do
+          for f in csrf_key orchestrator_hmac_secret runner_token; do
             head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n' | cut -c1-43 > "secrets/$f"
             chmod 0444 "secrets/$f"
           done
@@ -272,6 +280,185 @@ jobs:
           fi
           echo "msout-edge holds one container"
 
+      # ---- the runner, which holds credential bytes ---------------------------
+      #
+      # Started with `--profile runner`, because the orchestrator starts runners
+      # per session in production and this needs one standing to inspect. The
+      # container is never given a credential in this suite — the assertions are
+      # about what it *can* reach, not about a login.
+      #
+      # ## Every `docker compose exec` below closes its stdin
+      #
+      # `docker compose exec` attaches stdin by default and **drains it**, so any
+      # line after one is swallowed: the step runs to what looks like its end,
+      # exits 0, and reports success having skipped every assertion after the
+      # exec. It is the worst shape a check can have — silent, and green.
+      #
+      # Found by running the steps locally with a heredoc, where the script
+      # *is* stdin. GitHub Actions writes the run block to a file and its stdin is
+      # not connected, which is why this was invisible in CI and why the existing
+      # steps in this file were never bitten. `</dev/null` on every exec closes
+      # it in both environments, and the final `echo … ok` of each step is kept so
+      # a truncated step is visible in the log rather than inferred from rc=0.
+
+      - name: start one runner and wait for it to be healthy
+        run: |
+          set -euo pipefail
+          docker compose --profile runner up -d --wait runner
+          cid=$(docker compose ps -q runner)
+          test -n "$cid" || { echo "no runner container"; docker compose ps; exit 1; }
+          echo "runner is up: $(docker inspect -f '{{.State.Health.Status}}' "$cid")"
+
+      - name: T-X-R1 — the runner has no session secret in its environment
+        # §2.1, and the sharpest version of it. This is the only component that
+        # sees the credential bytes, so every extra capability it holds is one an
+        # attacker reaches *after* the password.
+        #
+        # It does carry MSOUT_RUNNER_TOKEN_FILE, which is a token for the
+        # orchestrator to authenticate with — it never carries or reveals a
+        # password — so that one is asserted as a path, separately.
+        run: |
+          set -euo pipefail
+          cid=$(docker compose ps -q runner)
+          env_dump=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$cid")
+          echo "$env_dump" | sed 's/=.*/=<redacted>/' | sort
+          for key in CSRF_KEY SESSION_SECRET ORCHESTRATOR_HMAC_SECRET; do
+            if printf '%s' "$env_dump" | grep -qE "^${key}=[A-Za-z0-9_-]{10,}"; then
+              echo "FAIL: the runner carries ${key} inline"
+              exit 1
+            fi
+          done
+          # An `if` rather than `grep … || { …; }`. Under `set -e` the `||` form
+          # reads as a syntax error in this step's context and the whole script
+          # fails at parse time — which is what happened: every assertion above it
+          # had already passed, and the step died before reaching the conclusion.
+          if ! printf '%s' "$env_dump" | grep -qE '^MSOUT_RUNNER_TOKEN_FILE=/run/secrets/'; then
+            echo "FAIL: no MSOUT_RUNNER_TOKEN_FILE path; the runner would refuse to start"
+            exit 1
+          fi
+          echo "T-X-R1 ok"
+
+      - name: T-X-R2 — the runner's only bind mount is its own secret
+        # §2.1 gives this component no host path: its data root is a named volume,
+        # so erase is one directory removal.
+        #
+        # **One bind is correct, not zero.** Docker Compose implements `secrets:`
+        # by bind-mounting the file, so the token arrives that way and a
+        # "no binds at all" check fails on the one mount §2.1 asks for. The first
+        # version of this assertion did exactly that and went red on the correct
+        # configuration. What must hold is that it is *only* the token: a bind to a
+        # vault or a host data directory is the hole, and that still fails.
+        run: |
+          set -euo pipefail
+          cid=$(docker compose ps -q runner)
+          binds=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}} {{end}}{{end}}' "$cid")
+          echo "runner bind mounts: ${binds:-none}"
+          if [ -n "$binds" ]; then
+            for b in $binds; do
+              case "$b" in
+                *runner_token) ;;
+                *) echo "FAIL: the runner bind-mounts $b"; exit 1 ;;
+              esac
+            done
+          fi
+          # The data root must be a volume, not a host path — the difference
+          # between "erase is one removal" and "erase is a traversal".
+          for target in /data /artifacts; do
+            kind=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "'"$target"'"}}{{.Type}}{{end}}{{end}}' "$cid")
+            echo "$target is a $kind mount"
+            test "$kind" = "volume" || { echo "FAIL: $target is not a named volume"; exit 1; }
+          done
+          docker compose exec -T runner sh -c 'test ! -S /var/run/docker.sock' </dev/null \
+            || { echo "FAIL: the runner can see a docker socket"; exit 1; }
+          echo "T-X-R2 ok"
+
+      - name: T-X-R3 — the runner publishes no port and is not on the control network
+        # Unreachable from the host, and not one compromise away from the api.
+        #
+        # The port check reads `HostConfig.PortBindings` rather than
+        # `docker compose port`. The latter resolves `EXPOSE 3100` from the
+        # Dockerfile and prints `:0` — empty host port, but not an empty string —
+        # so a `-z` test on its output reports a published port for a service that
+        # publishes none. That is what the first version of this step did, and it
+        # went red on a correct configuration.
+        run: |
+          set -euo pipefail
+          cid=$(docker compose ps -q runner)
+          bindings=$(docker inspect -f '{{json .HostConfig.PortBindings}}' "$cid")
+          echo "runner port bindings: $bindings"
+          if [ "$bindings" != "null" ] && [ "$bindings" != "{}" ]; then
+            echo "FAIL: the runner publishes a port"
+            exit 1
+          fi
+          for net in $(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$cid"); do
+            echo "runner is on $net"
+            case "$net" in
+              *_msout-control|*_msout-edge)
+                echo "FAIL: the runner is on the control/edge network"; exit 1 ;;
+            esac
+          done
+          # ...and it is on exactly one network. A runner that had joined nothing
+          # would be unreachable, which the orchestrator would discover at claim
+          # time rather than here.
+          count=$(docker inspect -f '{{len .NetworkSettings.Networks}}' "$cid")
+          echo "runner network count: $count"
+          test "$count" -ge 1 || { echo "FAIL: the runner is on no network at all"; exit 1; }
+          echo "T-X-R3 ok"
+
+      - name: the runner answers /healthz and nothing else without a token
+        # The bearer token is defence in depth rather than the boundary — the
+        # orchestrator holds the Docker socket — but a route that answered an
+        # unauthenticated caller would be a hole in it.
+        run: |
+          set -euo pipefail
+          code=$(docker compose exec -T runner node -e '
+            fetch("http://127.0.0.1:3100/healthz").then(async r => { console.log(r.status); });
+          ' </dev/null)
+          echo "healthz without a token: $code"
+          test "$code" = "200" || { echo "FAIL: /healthz needs a token; the orchestrator health check cannot work"; exit 1; }
+          for path in /events "/sessions/3f2504e0-4f89-41d3-9a0c-0305e82c3301/login"; do
+            code=$(docker compose exec -T runner node -e "
+              fetch('http://127.0.0.1:3100${path}', { method: 'POST', body: 'x' })
+                .then(r => { console.log(r.status); }).catch(e => { console.log('err'); });
+            " </dev/null)
+            echo "$path without a token: $code"
+            test "$code" = "401" || { echo "FAIL: $path answered $code without a token"; exit 1; }
+          done
+          echo "runner auth ok"
+
+      - name: the runner offers no debug surface
+        # `--dodump` and `--screenshot` are credential artefacts in a hosted
+        # service, and they are unreachable from the HTTP API by construction. The
+        # route table is asserted against the running container's own output, not
+        # against this file, so a route added in code and forgotten here fails.
+        run: |
+          set -euo pipefail
+          routes=$(docker compose exec -T runner node -e '
+            const app = require("/app/dist/index.js");
+            const cfg = {
+              dataRoot: "/tmp/probe-data", artifactRoot: "/tmp/probe-artifacts",
+              token: "probe-token-long-enough", credentialBodyLimit: 4096,
+              loginTimeoutMs: 1000, exportTimeoutMs: 1000,
+              quotaBytes: 1024, minFreeBytes: 1, ringSize: 10,
+            };
+            const seen = [];
+            const probe = app.buildApp(cfg, (r) => seen.push(
+              `${Array.isArray(r.method) ? r.method.join(",") : r.method} ${r.url}`));
+            probe.ready().then(() => { console.log(seen.join("\n")); return probe.close(); });
+          ' </dev/null)
+          echo "$routes"
+          count=$(printf '%s' "$routes" | grep -c . || true)
+          test "$count" -ge 8 || { echo "FAIL: the runner reported only $count routes"; exit 1; }
+          if printf '%s' "$routes" | grep -qiE 'dodump|screenshot|--dump|debug|headed'; then
+            echo "FAIL: a route offers a debug flag"
+            exit 1
+          fi
+          echo "no debug surface ok"
+
+      - name: stop the runner
+        if: always()
+        run: docker compose --profile runner stop runner
+
       # ---- mac's third addition ---------------------------------------------
 
       - name: /files/ never reaches Node
@@ -296,6 +483,21 @@ jobs:
             exit 1
           fi
           echo "T-C7 (/files/ bypasses node) ok"
+
+      - name: no workflow file contains a duplicate key
+        # A duplicate YAML key is a syntax error for GitHub Actions and invisible
+        # to a YAML parser, which keeps the last value and says nothing.
+        #
+        # This exists because one was shipped: a duplicated `IMAGE_TAG:` in
+        # ci.yml, from PR #21. The effect was that the whole `ci` workflow stopped
+        # being scheduled — every run reported `failure` with **zero jobs** and a
+        # duration of 0s — while `capability` went on passing, because it is a
+        # different file. That reads like an outage rather than a file GitHub
+        # refused to parse, which is presumably why it survived from Oct 6.
+        #
+        # Run here rather than in ci.yml, for the reason above: ci.yml cannot
+        # report on its own validity.
+        run: node .github/no-duplicate-keys.mjs
 
       - name: no session secret is inline anywhere
         # mac's second addition. §2.1's argument is that a frontend compromise
@@ -342,5 +544,5 @@ jobs:
       - name: down
         if: always()
         run: |
-          docker compose down -v
+          docker compose --profile runner down -v
           rm -rf secrets

@@ -38,7 +38,11 @@ function run(cfg) {
 const clone = (cfg) => structuredClone(cfg);
 
 const base = JSON.parse(
-  execFileSync("docker", ["compose", "config", "--format", "json"], {
+  // `--profile runner`, because the runner service sits behind a profile and a
+  // plain `config` prunes it out — which would make every runner case below
+  // mutate nothing and pass vacuously, against a base with no runner in it. The
+  // same trap that made the `infra` job red when ci.yml started running again.
+  execFileSync("docker", ["compose", "--profile", "runner", "config", "--format", "json"], {
     encoding: "utf8",
     env: {
       ...process.env,
@@ -46,6 +50,8 @@ const base = JSON.parse(
       PUBLIC_HOST: "one-backend.phttp.com",
       ACME_EMAIL: "ops@example.com",
       ALLOWED_ORIGINS: "https://app.example.com",
+      IMAGE_TAG: "0000000",
+      _DOCKER_GID: "998",
     },
   }),
 );
@@ -209,6 +215,80 @@ const cases = [
       });
     },
     expectMessage: /caddy bind-mounts something unexpected/,
+  },
+
+  // ---- the runner ---------------------------------------------------------
+  //
+  // The runner holds the credential bytes, so each of these is the assertion
+  // that has to hold before a session password is anywhere near it. Every case
+  // below mutates the *real* resolved config, which only contains a runner
+  // because the base is resolved with `--profile runner` — without that, all six
+  // would mutate `undefined` and pass for the wrong reason.
+
+  {
+    name: "removes the runner entirely",
+    mutate: (c) => {
+      delete c.services.runner;
+    },
+    // The loudest one. Every other runner check reads `services.runner` and sees
+    // an empty object, which is true of no socket, no binds and no ports — so a
+    // missing runner must be reported as a missing runner, not as compliance.
+    expectMessage: /there is no `runner` service/,
+  },
+  {
+    name: "gives the runner the docker socket",
+    mutate: (c) => {
+      c.services.runner.volumes.push({
+        type: "bind",
+        source: "/var/run/docker.sock",
+        target: "/var/run/docker.sock",
+        bind: {},
+      });
+    },
+    expectMessage: /runner mounts a docker socket/,
+  },
+  {
+    name: "gives the runner a host path beyond its secret",
+    mutate: (c) => {
+      c.services.runner.volumes.push({
+        type: "bind",
+        source: "/srv/msout/vault",
+        target: "/srv/msout/vault",
+        bind: {},
+      });
+    },
+    expectMessage: /runner bind-mounts something unexpected/,
+  },
+  {
+    name: "hands the runner the CSRF key",
+    mutate: (c) => {
+      c.services.runner.environment.CSRF_KEY = "0123456789abcdef0123456789abcdef";
+    },
+    expectMessage: /runner environment carries CSRF_KEY/,
+  },
+  {
+    name: "publishes the runner's port",
+    mutate: (c) => {
+      c.services.runner.ports = [{ target: 3100, published: "3100", protocol: "tcp" }];
+    },
+    expectMessage: /runner publishes/,
+  },
+  {
+    name: "puts the runner on the control network",
+    mutate: (c) => {
+      c.services.runner.networks = { "msout-runner": null, "msout-control": null };
+    },
+    // No space after the comma: the list is built by `Array.prototype.join(",")`,
+    // and an expected-message regex that assumed otherwise fails on a *correct*
+    // rejection — which is how a check gets "fixed" by being weakened.
+    expectMessage: /runner is on \[msout-runner,msout-control\]/,
+  },
+  {
+    name: "disables the Chromium sandbox",
+    mutate: (c) => {
+      c.services.runner.command = ["chromium", "--no-sandbox"];
+    },
+    expectMessage: /--no-sandbox/,
   },
 ];
 

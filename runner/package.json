@@ -2,11 +2,12 @@
   "name": "@msout/runner",
   "version": "0.0.0",
   "private": true,
-  "description": "Runner sidecar: the only component that sees the credential bytes. Spawns the unmodified @msout CLIs for one session at a time.",
+  "description": "Runner sidecar: the only component that sees the credential bytes. Spawns the unmodified @msout packages for one session at a time.",
   "license": "MIT",
   "type": "commonjs",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13.0",
+    "comment": "Same floor as the api and for the same reason: node:sqlite is built in from 22.13.0 unflagged. The runner does not use SQLite today, but a floor that is lower than another component's for no stated reason is a floor that will be quoted as precedent."
   },
   "main": "dist/index.js",
   "scripts": {
@@ -18,9 +19,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@msout/microsoft-onenote-export-notebook": "0.4.0",
+    "@msout/microsoft-onenote-export-notebook": "0.5.0",
     "@msout/microsoft-onenote-list-notebooks": "0.0.7",
-    "@msout/microsoft-webauth": "0.1.9",
+    "@msout/microsoft-webauth": "0.1.11",
     "archiver": "7.0.1",
     "fastify": "5.12.5"
   },
@@ -30,5 +31,9 @@
     "tsx": "4.19.3",
     "typescript": "5.7.3",
     "vitest": "5.0.3"
+  },
+  "overridesComment": "esbuild is pinned to 0.25.x, the version the api's lockfile already resolves. Without this, npm hoists esbuild 0.28.2 at the top level and then tries to install its @esbuild/aix-ppc64 optional dependency on linux/arm64, which fails with EBADPLATFORM — so `npm ci` cannot complete in the image and the build dies before it reaches any of this file's own checks. tsx and vitest both accept 0.25; nothing needs 0.28. The api resolved 0.25.x only because it has no top-level esbuild of its own, and a runner that pins archiver pulls a different hoisting outcome out of the same tsx.",
+  "overrides": {
+    "esbuild": "0.25.12"
   }
 }

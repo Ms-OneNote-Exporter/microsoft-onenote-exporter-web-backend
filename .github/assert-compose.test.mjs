@@ -411,6 +411,22 @@ const cases = [
     },
     expectMessage: /ORCH_RUNNER_TOKEN_FILE is/,
   },
+  {
+    // The mistake that shipped. The value looked correct — it named a path the
+    // orchestrator really does mount — but it was a *container* path used as a
+    // bind *source*, so on a host where it does not exist Docker created a
+    // directory and every runner exited 1. The previous assertion checked for
+    // exactly this value and passed.
+    name: "gives the orchestrator the container path as a bind source",
+    mutate: (c) => {
+      c.services.orchestrator.environment.ORCH_RUNNER_TOKEN_FILE = "/run/secrets/runner_token";
+    },
+    // Matches on the *reason* rather than the variable name, because the variable
+    // name is in the message too and a regex written against the old message
+    // would fail on a correct rejection — which is how a check gets "fixed" by
+    // being weakened.
+    expectMessage: /must resolve on the host/,
+  },
 ];
 
 // ---- each violation must be caught ----------------------------------------

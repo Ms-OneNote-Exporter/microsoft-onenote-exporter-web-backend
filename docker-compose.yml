@@ -341,17 +341,36 @@ services:
       # The tag must be a commit SHA. A mutable tag would let a container start
       # with code nobody reviewed.
       ORCH_RUNNER_IMAGE: ${RUNNER_IMAGE:-ghcr.io/ms-one-note-exporter/runner:0.0.0}
-      # The host path of the bearer token every runner mounts read-only.
+      # The **host** path of the bearer token every runner mounts read-only.
       #
       # A *path*, like every other secret here: the orchestrator never reads the
-      # value, it bind-mounts the file into each runner, and the runner reads it
-      # from its own /run/secrets. So the value is never in this container's
+      # value, it bind-mounts the file into each runner, and the runner reads it from
+      # its own /run/secrets. So the value is never in this container's
       # environment, and never in `docker inspect`.
       #
-      # It defaults to /run/secrets/runner_token, which is where the `runner_token`
-      # secret below is mounted in the orchestrator — so the default is correct
-      # and the variable exists only for a deployment that puts secrets elsewhere.
-      ORCH_RUNNER_TOKEN_FILE: /run/secrets/runner_token
+      # **This must be a host path, not the container path the orchestrator itself
+      # mounts the secret at.** It used to be hardcoded to
+      # `/run/secrets/runner_token` — which is the *container's* path — and the
+      # comment above it claimed that made the default correct. It does not:
+      #
+      #   1. the orchestrator bind-mounts this value as the **source** when creating
+      #      each runner, and a bind source is resolved on the host
+      #   2. that path does not exist on the host
+      #   3. so Docker **creates a directory** there
+      #   4. so the runner mounts a directory over its own secret path, tries to
+      #      read a file inside it, and exits 1:
+      #
+      #      MSOUT_RUNNER_TOKEN_FILE could not be read at /run/secrets/runner_token:
+      #      ENOENT: no such file or directory, open '/run/secrets/runner_token'
+      #
+      # Every container still started and `/healthz` still said `ok`. It only
+      # surfaced on the first real login attempt, on a real host.
+      #
+      # So it points at `SECRETS_DIR`, the same directory the `secrets:` block
+      # below reads, and `RUNNER_TOKEN_HOST_FILE` overrides it for a deployment that
+      # keeps them elsewhere. `assert-compose.mjs` requires the two to agree, which
+      # is what makes this stick.
+      ORCH_RUNNER_TOKEN_FILE: ${RUNNER_TOKEN_HOST_FILE:-${SECRETS_DIR:-./secrets}/runner_token}
 
       # No PUBLIC_HOST, no ALLOWED_ORIGINS, no CSRF key. The orchestrator is not a
       # component that should know any of them, and its absence here is a property

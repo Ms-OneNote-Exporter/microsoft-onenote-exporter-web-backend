@@ -113,15 +113,30 @@ type Mount struct {
 // validated identifiers. Nothing in this struct is ever populated from a
 // request body, which is what makes T-X3 checkable by reading this type.
 type CreateRequest struct {
-	Image        string               `json:"Image"`
-	Entrypoint   []string             `json:"Entrypoint"`
-	Cmd          []string             `json:"Cmd"`
-	Env          []string             `json:"Env"`
-	Labels       map[string]string    `json:"Labels"`
-	User         string               `json:"User"`
-	WorkingDir   string               `json:"WorkingDir"`
-	HostConfig   CreateHostConfig     `json:"HostConfig"`
-	Mounts       []CreateMount        `json:"Mounts"`
+	Image      string            `json:"Image"`
+	Entrypoint []string          `json:"Entrypoint"`
+	Cmd        []string          `json:"Cmd"`
+	Env        []string          `json:"Env"`
+	Labels     map[string]string `json:"Labels"`
+	User       string            `json:"User"`
+	WorkingDir string            `json:"WorkingDir"`
+	HostConfig CreateHostConfig  `json:"HostConfig"`
+	// Mounts is the typed mount list. It is NOT serialised as `Mounts`: the Engine
+	// **ignores a top-level `Mounts` field** on `POST /containers/create`, so a
+	// request that set only this produced a container with no mounts whatsoever —
+	// no vault, no artifact tree, no bearer token — and the runner exited 1 with
+	// `MSOUT_RUNNER_TOKEN_FILE could not be read at /run/secrets/runner_token:
+	// ENOENT`.
+	//
+	// Found on the first real deployment that created a runner. Every unit test
+	// passed, because the tests assert against the request *struct*, and the struct
+	// was correct — the wire format was not.
+	//
+	// It is populated rather than removed, because it is the only representation of
+	// a mount where ReadOnly is a bool instead of a mode parsed out of a string.
+	// CreateContainer copies it into HostConfig.Binds, which is the field the
+	// Engine reads.
+	Mounts       []CreateMount        `json:"-"`
 	Networking   *NetworkingConfig    `json:"NetworkingConfig,omitempty"`
 	StopConfig   *StopContainerConfig `json:"StopConfig,omitempty"`
 	HealthConfig *HealthConfig        `json:"Healthcheck,omitempty"`
@@ -159,10 +174,30 @@ type CreateHostConfig struct {
 	AutoRemove     *bool             `json:"AutoRemove"`
 	RestartPolicy  RestartPolicy     `json:"RestartPolicy"`
 	LogConfig      LogConfig         `json:"LogConfig"`
-	// Binds is deliberately absent from use. Mounts go through the Mounts
-	// field, where ReadOnly is an explicit bool rather than a mode string
-	// parsed out of "host:container:ro". There is no code path that
-	// concatenates a caller-influenced string into a bind specification.
+	// Binds carries the mount list. See CreateRequest.Mounts, which explains why
+	// this exists: the Engine ignores a top-level `Mounts` field, so a create
+	// request that set only that produced containers with **no mounts at all**.
+	Binds []string `json:"Binds"`
+}
+
+// bindString renders one mount as a bind specification.
+//
+// Built from typed fields rather than by a caller concatenating a string, so the
+// "no caller-influenced string in a bind specification" property this code
+// originally claimed is still true — it just has to be rendered here, once, from
+// values that are individually checked.
+//
+// `Source` and `Destination` are emitted verbatim. That is safe because every
+// value reaching this point is either a constant from this component or the
+// orchestrator's own configured host paths — and a `:` or `,` inside one would
+// change the parse rather than being escaped, so the values that come from
+// configuration are validated as absolute paths at config load.
+func bindString(m CreateMount) string {
+	spec := m.Source + ":" + m.Destination
+	if m.ReadOnly {
+		spec += ":ro"
+	}
+	return spec
 }
 
 // RestartPolicy is the Engine's restart policy. Always "no": a runner that
@@ -262,6 +297,19 @@ func (c *Client) Ping(ctx context.Context) (PingResult, error) {
 // CreateContainer creates a container and returns its id. name, when non-empty,
 // is a slot-derived container name; it is never caller-influenced.
 func (c *Client) CreateContainer(ctx context.Context, req CreateRequest, name string) (CreateResponse, error) {
+	// Copy the typed mounts into the only field the Engine reads. Done here rather
+	// than by the caller so no caller can produce a container with no mounts by
+	// forgetting — which is exactly what happened, and it is silent.
+	req.HostConfig.Binds = nil
+	for _, m := range req.Mounts {
+		if m.Destination == "" {
+			// A mount with no destination has no meaning, and rendering it would
+			// produce a specification the Engine parses as something else.
+			return CreateResponse{}, fmt.Errorf("mount %q has no destination", m.Source)
+		}
+		req.HostConfig.Binds = append(req.HostConfig.Binds, bindString(m))
+	}
+
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return CreateResponse{}, err

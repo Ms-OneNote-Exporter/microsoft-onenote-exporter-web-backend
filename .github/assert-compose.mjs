@@ -158,12 +158,34 @@ check(
     "into every runner, so without it Docker creates an empty directory at the " +
     "destination and each runner exits 1 at startup",
 );
+// ORCH_RUNNER_TOKEN_FILE must be a **host** path, not the container path the
+// orchestrator mounts the secret at.
+//
+// The previous assertion here checked that it equalled
+// `/run/secrets/runner_token` — the orchestrator's own mount point — and passed.
+// It was checking the wrong thing: this value is used as the **source** of a bind
+// when creating each runner, and a bind source is resolved on the host. On a host
+// where that path does not exist, Docker creates a directory there, the runner
+// mounts a directory over its own secret path, and exits 1:
+//
+//   MSOUT_RUNNER_TOKEN_FILE could not be read at /run/secrets/runner_token: ENOENT
+//
+// Every container started and `/healthz` said `ok`; it surfaced only on the first
+// real login. So the assertion is that the path lives **under SECRETS_DIR**, which
+// is where the `secrets:` block actually reads from.
+const secretsDir = cfg.secrets?.runner_token?.file?.slice(0, -"/runner_token".length);
+const tokenHostFile = services.orchestrator?.environment?.ORCH_RUNNER_TOKEN_FILE;
 check(
-  services.orchestrator?.environment?.ORCH_RUNNER_TOKEN_FILE === "/run/secrets/runner_token",
-  "orchestrator: ORCH_RUNNER_TOKEN_FILE points at the mounted secret",
-  `orchestrator ORCH_RUNNER_TOKEN_FILE is ${JSON.stringify(
-    services.orchestrator?.environment?.ORCH_RUNNER_TOKEN_FILE,
-  )}; it must name the path the token is mounted at, or the mount source is wrong`,
+  secretsDir !== undefined &&
+    tokenHostFile !== undefined &&
+    tokenHostFile.startsWith(secretsDir) &&
+    tokenHostFile.endsWith("/runner_token"),
+  "orchestrator: ORCH_RUNNER_TOKEN_FILE is the HOST path of the token",
+  `orchestrator ORCH_RUNNER_TOKEN_FILE is ${JSON.stringify(tokenHostFile)} but the ` +
+    `runner_token secret is read from ${JSON.stringify(
+      cfg.secrets?.runner_token?.file,
+    )}. This value is the *source* of a bind mount, so it must resolve on the host; ` +
+    `a container path makes Docker create a directory there and every runner exits 1`,
 );
 const runnerBinds = bindsFor("runner").map((v) => String(v.source));
 check(
@@ -436,8 +458,19 @@ for (const svc of Object.keys(services)) {
   }
 
   // Every *_FILE that is present must point at a real secret path.
+  //
+  // **`ORCH_RUNNER_TOKEN_FILE` is the exception, and it is a real one.** It is the
+  // *source* of a bind mount when the orchestrator creates each runner, and a bind
+  // source is resolved on the **host** — so it must be a host path under
+  // SECRETS_DIR, not `/run/secrets/...`. It was `/run/secrets/runner_token` until a
+  // deployment created a runner for the first time and every runner exited 1,
+  // because Docker had created a directory at a host path that did not exist.
+  //
+  // It is asserted separately and correctly above; excluding it here is what keeps
+  // that assertion from being contradicted by this generic rule.
   for (const [key, value] of Object.entries(env)) {
     if (!key.endsWith("_FILE")) continue;
+    if (svc === "orchestrator" && key === "ORCH_RUNNER_TOKEN_FILE") continue;
     check(
       typeof value === "string" && value.startsWith("/run/secrets/"),
       `${svc}: ${key} points into /run/secrets`,

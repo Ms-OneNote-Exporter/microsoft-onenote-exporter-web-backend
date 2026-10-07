@@ -314,8 +314,14 @@ jobs:
               exit 1
             fi
           done
-          printf '%s' "$env_dump" | grep -qE '^MSOUT_RUNNER_TOKEN_FILE=/run/secrets/'
-            || { echo "FAIL: no MSOUT_RUNNER_TOKEN_FILE path"; exit 1; }
+          # An `if` rather than `grep … || { …; }`. Under `set -e` the `||` form
+          # reads as a syntax error in this step's context and the whole script
+          # fails at parse time — which is what happened: every assertion above it
+          # had already passed, and the step died before reaching the conclusion.
+          if ! printf '%s' "$env_dump" | grep -qE '^MSOUT_RUNNER_TOKEN_FILE=/run/secrets/'; then
+            echo "FAIL: no MSOUT_RUNNER_TOKEN_FILE path; the runner would refuse to start"
+            exit 1
+          fi
           echo "T-X-R1 ok"
 
       - name: T-X-R2 — the runner has no bind mount and no docker socket

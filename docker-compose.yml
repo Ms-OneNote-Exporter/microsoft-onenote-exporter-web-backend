@@ -303,6 +303,22 @@ services:
       # Below 10000 the Engine rejects it, and the orchestrator refuses it at config
       # load rather than on every pool top-up.
       ORCH_RUNNER_NANO_CPUS: ${RUNNER_NANO_CPUS:-2000000000}
+      # Which runner image the orchestrator creates containers from.
+      #
+      # This was missing from the compose file entirely, so the orchestrator fell
+      # back to its own built-in default — `ghcr.io/ms-one-note-exporter/runner:0.0.0`
+      # — which is **not the name publish.yml pushes**. Every login failed with
+      # `No such image`, and nothing in this file said a deploy host could change
+      # it, so the only fix was to know the default was wrong.
+      #
+      # The default keeps the orchestrator's own, so a deployment that says nothing
+      # behaves identically. What changes is that the variable is *visible*: a
+      # deploy host sets `RUNNER_IMAGE` to the tag `publish.yml` reported, which is
+      # the whole mechanism.
+      #
+      # The tag must be a commit SHA. A mutable tag would let a container start
+      # with code nobody reviewed.
+      ORCH_RUNNER_IMAGE: ${RUNNER_IMAGE:-ghcr.io/ms-one-note-exporter/runner:0.0.0}
       # The host path of the bearer token every runner mounts read-only.
       #
       # A *path*, like every other secret here: the orchestrator never reads the

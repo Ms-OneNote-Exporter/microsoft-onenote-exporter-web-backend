@@ -113,15 +113,24 @@ for (const svc of ["api", "caddy", "runner"]) {
 //
 // §2.1's rule, and the sharpest form of it here: the runner is the only component
 // that sees the credential bytes, so every additional capability it holds is a
-// capability an attacker reaches *after* the password. No bind mounts — its data
-// root is a named volume, so erase is one directory removal — and no CSRF key, no
-// session secret, neither in its environment.
+// capability an attacker reaches *after* the password. Its **data** root is a
+// named volume, so erase is one directory removal, and it gets no CSRF key and no
+// session secret.
 //
 // The runner *does* carry MSOUT_RUNNER_TOKEN_FILE, which is a token for the
 // orchestrator to authenticate with, not a session credential: it authorises
 // starting work in a container the orchestrator created, and never carries or
-// reveals a password. So it is asserted separately rather than swept into the
-// no-secrets check, where it would be indistinguishable from a mistake.
+// reveals a password.
+//
+// **Exactly one bind mount is therefore correct, and it is the secret.** Docker
+// Compose has no secret mechanism other than bind-mounting the file, so a
+// "no bind mounts at all" check on any service declaring `secrets:` is wrong by
+// construction — and it was: the capability suite failed on the runner's token
+// mount, which is the one thing §2.1 asks it to have. Caddy is already allowed
+// exactly one bind above, for the same reason.
+//
+// So: the allowlist is the secret file and nothing else. A bind to a vault, a
+// data directory or a host path fails here, which is the property that matters.
 check(
   "runner" in services,
   "the runner service is present in the resolved config",
@@ -129,10 +138,12 @@ check(
     "is behind a profile so `docker compose up` does not start it, and without the " +
     "profile every runner assertion below would pass against nothing.",
 );
+const runnerBinds = bindsFor("runner").map((v) => String(v.source));
 check(
-  bindsFor("runner").length === 0,
-  "runner has no bind mounts at all",
-  `runner bind-mounts ${bindsFor("runner").map((v) => v.source).join(", ")}; §2.1 gives it no host path`,
+  runnerBinds.every((src) => src.endsWith("runner_token")),
+  `runner bind-mounts only its token (${runnerBinds.join(", ") || "none"})`,
+  `runner bind-mounts something unexpected: ${runnerBinds.join(", ")}. §2.1 gives it no host ` +
+    "path — its data root is a named volume and the only bind allowed is its own secret file",
 );
 for (const key of ["CSRF_KEY", "CSRF_KEY_FILE", "SESSION_SECRET", "ORCHESTRATOR_HMAC_SECRET"]) {
   check(

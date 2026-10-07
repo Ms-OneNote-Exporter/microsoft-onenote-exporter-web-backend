@@ -324,15 +324,36 @@ jobs:
           fi
           echo "T-X-R1 ok"
 
-      - name: T-X-R2 — the runner has no bind mount and no docker socket
-        # A bind mount is a host path, and §2.1 gives this component none. The
-        # data root is a named volume, so erase is one directory removal.
+      - name: T-X-R2 — the runner's only bind mount is its own secret
+        # §2.1 gives this component no host path: its data root is a named volume,
+        # so erase is one directory removal.
+        #
+        # **One bind is correct, not zero.** Docker Compose implements `secrets:`
+        # by bind-mounting the file, so the token arrives that way and a
+        # "no binds at all" check fails on the one mount §2.1 asks for. The first
+        # version of this assertion did exactly that and went red on the correct
+        # configuration. What must hold is that it is *only* the token: a bind to a
+        # vault or a host data directory is the hole, and that still fails.
         run: |
           set -euo pipefail
           cid=$(docker compose ps -q runner)
           binds=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}} {{end}}{{end}}' "$cid")
           echo "runner bind mounts: ${binds:-none}"
-          test -z "$binds" || { echo "FAIL: the runner has a bind mount"; exit 1; }
+          if [ -n "$binds" ]; then
+            for b in $binds; do
+              case "$b" in
+                *runner_token) ;;
+                *) echo "FAIL: the runner bind-mounts $b"; exit 1 ;;
+              esac
+            done
+          fi
+          # The data root must be a volume, not a host path — the difference
+          # between "erase is one removal" and "erase is a traversal".
+          for target in /data /artifacts; do
+            kind=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "'"$target"'"}}{{.Type}}{{end}}{{end}}' "$cid")
+            echo "$target is a $kind mount"
+            test "$kind" = "volume" || { echo "FAIL: $target is not a named volume"; exit 1; }
+          done
           docker compose exec -T runner sh -c 'test ! -S /var/run/docker.sock' \
             || { echo "FAIL: the runner can see a docker socket"; exit 1; }
           echo "T-X-R2 ok"

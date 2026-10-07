@@ -453,7 +453,22 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4g
+          # Settable, because `4g` on a smaller host is not a limit the kernel can
+          # honour in isolation — it is the *whole machine*. On a 3 GB VPS a
+          # Chromium spike pushes the host into swap or the OOM killer, and what
+          # gets killed is whichever process the kernel picks, which can be the
+          # api or the orchestrator rather than the runner.
+          #
+          # So the limit is operator configuration and the operator sizes it to
+          # what the host actually has, minus room for everything else. `2g` is
+          # chosen here as the default because it is the honest number for a small
+          # VPS; a larger host should raise it.
+          #
+          # `shm_size: 1gb` above is separate and is NOT reduced with it: Chromium
+          # crashes on Docker's 64 MB /dev/shm default, which is the single most
+          # load-bearing flag on this container. It is a shared-memory mount, not
+          # host RAM, so it does not compete with the limit here.
+          memory: ${RUNNER_MEMORY_LIMIT:-2g}
           pids: 512
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3100/healthz').then(r=>r.ok?process.exit(0):process.exit(1)).catch(()=>process.exit(1))"]

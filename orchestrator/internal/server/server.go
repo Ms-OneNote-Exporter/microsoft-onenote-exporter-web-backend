@@ -108,13 +108,14 @@ func (s *Server) Handler() http.Handler {
 // what lets a test also check that no path acquired a second method.
 func (s *Server) routeTable() map[string]map[string]struct{} {
 	table := map[string]map[string]struct{}{
-		"/claim":   {http.MethodPost: {}},
-		"/release": {http.MethodPost: {}},
-		"/recycle": {http.MethodPost: {}},
-		"/remove":  {http.MethodPost: {}},
-		"/stat":    {http.MethodPost: {}},
-		"/stats":   {http.MethodGet: {}},
-		"/healthz": {http.MethodGet: {}},
+		"/claim":    {http.MethodPost: {}},
+		"/release":  {http.MethodPost: {}},
+		"/recycle":  {http.MethodPost: {}},
+		"/remove":   {http.MethodPost: {}},
+		"/stat":     {http.MethodPost: {}},
+		"/stats":    {http.MethodGet: {}},
+		"/healthz":  {http.MethodGet: {}},
+		"/finalize": {http.MethodPost: {}},
 	}
 	return table
 }
@@ -142,6 +143,9 @@ func (s *Server) routes() http.Handler {
 		},
 		"/stat": {
 			http.MethodPost: s.handleStat,
+		},
+		"/finalize": {
+			http.MethodPost: s.handleFinalize,
 		},
 		"/stats": {
 			http.MethodGet: s.handleStats,
@@ -342,6 +346,56 @@ func (s *Server) handleStat(c *call) (any, error) {
 // handleStats reports pool occupancy.
 func (s *Server) handleStats(*call) (any, error) {
 	return s.pool.Stats(), nil
+}
+
+// finalizeRequest is the input schema for the finalize verb.
+type finalizeRequest struct {
+	ArtifactID  string `json:"artifactId"`
+	SessionGUID string `json:"sessionGuid"`
+	Partial     bool   `json:"partial"`
+}
+
+// handleFinalize publishes a staged archive under its artifact id.
+//
+// PLAN-v3 §2.2 splits this deliberately: the runner streams the zip into a
+// staging directory and this process publishes it. It owns the artifact volume
+// and it is the only component that knows the artifact id, which is the caller's
+// and deliberately unrelated to the session GUID (§5).
+//
+// `partial` is a claim the caller makes about an export, and it is trusted for
+// *labelling only* — it selects the `.partial.zip` name and writes the marker.
+// Nothing here verifies it against the export that actually ran, because this
+// process cannot: it never saw the walk. So a caller that passes `false` for a
+// truncated vault gets an unmarked archive, and the honest fix is for the api to
+// pass the truth it already has rather than for this verb to guess.
+func (s *Server) handleFinalize(c *call) (any, error) {
+	var req finalizeRequest
+	if err := c.decode(&req); err != nil {
+		return nil, badRequest("malformed finalize request", err)
+	}
+	if !config.ValidArtifactID(req.ArtifactID) {
+		return nil, badRequest("artifactId must be 43 base64url characters", nil)
+	}
+	if !config.ValidGUID(req.SessionGUID) {
+		return nil, badRequest("sessionGuid must be a lowercase uuid", nil)
+	}
+
+	result, err := s.pool.Finalize(pool.FinalizeInput{
+		ArtifactID:  req.ArtifactID,
+		SessionGUID: req.SessionGUID,
+		Partial:     req.Partial,
+	})
+	if err != nil {
+		// Reported as-is rather than flattened: `nothing staged` is a caller
+		// error (it finalised an export that produced no archive) and deserves a
+		// 409, while a filesystem refusal is a 500. Collapsing both would make an
+		// operator chase a full disk that is not the problem.
+		if errors.Is(err, pool.ErrNothingStaged) || errors.Is(err, pool.ErrArtifactIDInvalid) {
+			return nil, conflict("nothing staged to finalise", err)
+		}
+		return nil, err
+	}
+	return result, nil
 }
 
 // handleHealthz reports liveness and the boot reconciliation outcome.

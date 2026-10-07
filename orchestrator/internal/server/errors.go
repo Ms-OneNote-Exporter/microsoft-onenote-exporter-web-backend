@@ -35,6 +35,13 @@ func badRequest(code string, cause error) error {
 	return &httpError{status: http.StatusBadRequest, code: code, cause: cause}
 }
 
+// conflict is a 409: the request is well-formed and authorised, but the caller's
+// view of the world is stale — it asked for something that is not there, or that
+// is already in a different state.
+func conflict(code string, cause error) error {
+	return &httpError{status: http.StatusConflict, code: code, cause: cause}
+}
+
 // writeHandlerError maps an error to a status and body.
 //
 // The pool's sentinel errors are the interesting cases: ErrNoSlot is 503
@@ -54,6 +61,11 @@ func (s *Server) writeHandlerError(w http.ResponseWriter, r *http.Request, err e
 		writeError(w, http.StatusConflict, "unknown slot")
 	case errors.Is(err, pool.ErrAlreadyBound), errors.Is(err, pool.ErrNotBound):
 		writeError(w, http.StatusConflict, "slot state does not allow this")
+	case errors.Is(err, pool.ErrNothingStaged):
+		// Its own case, because it is the one 409 a caller can act on: it means
+		// it asked to publish an export that produced no archive. Falling into
+		// the generic 500 would send an operator looking at a disk that is fine.
+		writeError(w, http.StatusConflict, "nothing staged to finalise")
 	default:
 		s.log.Error("handler failed",
 			"method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr, "error", err)

@@ -269,6 +269,14 @@ func (s *Server) handleClaim(c *call) (any, error) {
 	return map[string]any{
 		"slotId":      slot.ID,
 		"containerId": slot.ContainerID,
+		// Where `api` posts the credential. Absent here it would have to guess
+		// a container name or resolve an IP, and either guess is a second
+		// implementation of this component's naming — the drift that produced
+		// the three silent failures in runner.go/index.ts.
+		//
+		// Stable for the life of the *slot*, not the container, so this does not
+		// go stale when `recycle` replaces the container. See pool.RunnerURL.
+		"runnerUrl": s.pool.RunnerURL(slot.ID),
 	}, nil
 }
 

@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -839,4 +840,38 @@ func (p *Pool) destroy(ctx context.Context, containerID string) error {
 // ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ requirement without any sanitising of input.
 func containerName(slotID, containerID string) string {
 	return "msout-" + slotID + "-" + containerID
+}
+
+// runnerAlias is the DNS name `api` dials a runner by, on the control network.
+//
+// Derived from the slot id alone, deliberately — that is the whole reason to
+// prefer it over the container IP.
+//
+// `recycle` replaces a slot's container without changing the slot, so a stored
+// IP would silently start pointing at a dead container the moment a runner aged
+// out. Every symptom of that is wrong: the api reports a transport failure,
+// the orchestrator reports a healthy pool, and nothing says the address is
+// stale. A name tied to the slot survives, so the api's stored address stays
+// correct across every recycle, and `claim` can return it once.
+//
+// The "msout-runner-" prefix keeps it distinct from a container name, which
+// carries a container id as well. Both are lowercase alphanumerics with dashes,
+// as Docker's DNS requires.
+func runnerAlias(slotID string) string {
+	return "msout-runner-" + slotID
+}
+
+// RunnerURL is where `api` reaches the container in a slot, on the control
+// network.
+//
+// It is a name rather than a resolved address on purpose, and it is assembled
+// only from values this component generated — the slot id and a deploy-time
+// port. No request field reaches it, so this is not a caller-controlled URL
+// even though the api dereferences it: the api is not a browser, and it is the
+// only thing that can hold a credential stream.
+func (p *Pool) RunnerURL(slotID string) string {
+	if strings.TrimSpace(slotID) == "" {
+		return ""
+	}
+	return fmt.Sprintf("http://%s:%d", runnerAlias(slotID), p.cfg.RunnerPort)
 }

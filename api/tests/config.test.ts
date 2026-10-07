@@ -9,6 +9,11 @@ function baseEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
     CSRF_KEY: "A".repeat(43),
     ORCHESTRATOR_URL: "http://orchestrator:9100",
     ORCHESTRATOR_HMAC_SECRET: "B".repeat(43),
+    // The token the api presents to a runner. It is a bearer value, not a
+    // 256-bit key, so it is a fixed string rather than a repeat of 43 — and
+    // deliberately not the same shape as the CSRF key, which is what
+    // `validateRunnerToken` asserts.
+    RUNNER_TOKEN: "runner-token-for-tests",
     ...overrides,
   };
 }

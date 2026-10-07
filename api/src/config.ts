@@ -38,6 +38,20 @@ export interface ApiConfig {
   readonly orchestratorSecret: string;
   /** Replay window for internal calls, in seconds. */
   readonly orchestratorReplayWindowSeconds: number;
+  /**
+   * The bearer token a runner requires on every route but `/healthz`.
+   *
+   * Held because this is the component that calls a runner, not the
+   * orchestrator — the orchestrator creates containers and drives none of them.
+   * It authorises starting work in a container that already exists; it never
+   * carries or reveals a password, and it cannot create a container.
+   *
+   * Validated to the runner's own rule — at least 16 characters — rather than
+   * the 43-character rule the CSRF key uses. Those are different secrets with
+   * different jobs, and reusing one shape for both would make a 32-byte runner
+   * token an unrepresentable configuration.
+   */
+  readonly runnerToken: string;
   /** Log level. */
   readonly logLevel: "debug" | "info" | "warn" | "error";
   /** Listen address for the HTTP surface. */
@@ -293,6 +307,35 @@ export function validateSecret(raw: string | undefined, variable = "CSRF_KEY"): 
   return value;
 }
 
+/** RUNNER_TOKEN_PATTERN mirrors the runner's own check, minus the base64url rule. */
+const RUNNER_TOKEN_PATTERN = /^[\x21-\x7e]{16,}$/;
+
+/**
+ * validateRunnerToken checks the bearer token presented to a runner.
+ *
+ * The minimum length is the runner's, not this api's: the runner refuses to start
+ * below 16 characters, and a token the api accepted but the runner rejected would
+ * present as every login being refused for no stated reason.
+ *
+ * The character class is printable ASCII with no spaces, because the value travels
+ * in a header — a token with a space in it would be transmitted, be rejected, and
+ * be invisible in the `docker inspect` output an operator would check.
+ */
+export function validateRunnerToken(raw: string | undefined): string {
+  const value = (raw ?? "").trim();
+  if (value === "") {
+    throw new ConfigError("RUNNER_TOKEN", "is required");
+  }
+  if (!RUNNER_TOKEN_PATTERN.test(value)) {
+    throw new ConfigError(
+      "RUNNER_TOKEN",
+      "must be at least 16 printable non-space ASCII characters, which is the " +
+        "runner's own minimum",
+    );
+  }
+  return value;
+}
+
 /**
  * validateInternalOrigin checks the orchestrator URL.
  *
@@ -374,6 +417,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
       "ORCHESTRATOR_REPLAY_WINDOW_SECONDS",
       60,
     ),
+    runnerToken: validateRunnerToken(readSecret(env, "RUNNER_TOKEN")),
     logLevel: level,
     listen: env.LISTEN?.trim() || "0.0.0.0:3000",
     publicOrigin: validatePublicOrigin(env.PUBLIC_ORIGIN ?? ""),

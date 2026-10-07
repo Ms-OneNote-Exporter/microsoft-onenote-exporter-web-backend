@@ -41,6 +41,7 @@ import { Db } from "./db.js";
 import { SseHub } from "./sse.js";
 import { RateLimiter } from "./rate-limit.js";
 import { OrchestratorClient, type OrchestratorApi } from "./orchestrator-client.js";
+import { HttpRunnerAdapter } from "./runner-adapter-http.js";
 import {
   PoolBinder,
   reconcile,
@@ -129,6 +130,27 @@ export async function boot(
 
   const binder = new PoolBinder({ db, orchestrator, sse, log, now: () => Date.now() });
 
+  // The route to a runner container, and the address of each session's runner.
+  //
+  // Two objects rather than one because they answer different questions. The
+  // lookup says *where* a runner is, and it reads what the orchestrator's claim
+  // response recorded — it derives nothing, because the orchestrator owns the
+  // naming and a second implementation of it is the failure mode this project has
+  // hit three times. The adapter says *how to talk to one*, and holds the token.
+  //
+  // Before this, all four runner-facing routes answered 501: a real session was
+  // created, a real cookie set, the live-update stream attached, and the sign-in
+  // could not get past the password field.
+  const runner = new HttpRunnerAdapter({
+    addressFor: (sessionId: string) => db.runnerUrlFor(sessionId),
+    token: config.runnerToken,
+    sse,
+    // Deliberately short. A login and an export both return 202 within
+    // milliseconds; the work happens afterwards and arrives on the event stream.
+    // A long timeout here would mean a wedged runner holds a request open.
+    timeoutMs: 10_000,
+  });
+
   // ---- boot reconciliation -------------------------------------------------
 
   const health = await orchestrator.healthz();
@@ -202,12 +224,32 @@ export async function boot(
       orchestrator,
       sse,
       limiter: new RateLimiter({ logSalt: "api" }),
-      // Absent until the runner sidecar lands (§12 steps 1–2), so the four
-      // runner-facing routes answer 501 rather than pretending. Wiring these two is
-      // the whole of the remaining work on the api side.
-      //
-      // poolBinder IS provided, so a login claims a real slot; what it then hands
-      // the credential to does not exist yet, and the route says so.
+      // The four runner-facing routes. Previously 501.
+      runner,
+      poolBinder: binder,
+      // The erase machine's own view of a runner. It needs the three erase verbs,
+      // which are the same HTTP surface with a different intent, so it is given
+      // the adapter rather than a second client that would drift from it.
+      // The erase machine's view of a runner: the same HTTP surface, three
+      // different intents. Given the adapter rather than a second client, because
+      // two clients over one runner would drift from each other's auth and error
+      // handling.
+      eraseRunner: {
+        abort: (sessionId: string) => runner.abortAny(sessionId),
+        // Freeze is a no-op here and that is a claim worth making precisely.
+        //
+        // The machine calls it so a runner cannot write into the directory it is
+        // about to delete. Here the next step destroys the container outright
+        // through the orchestrator, so a runner that wrote in the meantime would
+        // be writing into a container about to be removed. There is no window
+        // that freeze closes and removal does not.
+        //
+        // Recorded as a method that does nothing rather than left off the
+        // interface: an absent method and a no-op one are different statements
+        // about what the system guarantees.
+        freeze: async () => {},
+        shredDirectory: (sessionId: string) => runner.removeSessionDir(sessionId),
+      },
     },
     { logger: true },
   );

@@ -76,6 +76,21 @@ export interface ClaimBody {
 export interface ClaimResponse {
   slotId: string;
   containerId: string;
+  /**
+   * Where the runner in this slot is reachable — the credential path.
+   *
+   * `api` posts the password here, so this is the one value it must not have to
+   * construct. A runner is addressed by a network alias derived from the *slot*,
+   * not the container, so it stays correct when `recycle` replaces the container
+   * underneath it; that is why it is stored once at claim time and reused for the
+   * life of the session rather than re-fetched.
+   *
+   * Optional for the same reason `stats().slotIds` is: a rolling deploy may reach
+   * an orchestrator that predates the field. Absent means "this orchestrator does
+   * not say", and the caller must refuse rather than guess — see
+   * `runnerAddress`.
+   */
+  readonly runnerUrl?: string;
 }
 
 /** The stat response — the download authoriser's only question. */

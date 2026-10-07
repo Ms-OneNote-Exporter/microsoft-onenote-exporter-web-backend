@@ -22,18 +22,20 @@ func testConfig(t *testing.T, poolSize int) *config.Config {
 	t.Helper()
 	root := t.TempDir()
 	return &config.Config{
-		DockerSocket:    filepath.Join(root, "docker.sock"),
-		HMACSecret:      []byte(strings.Repeat("a", 64)),
-		ReplayWindow:    time.Minute,
-		VaultRoot:       filepath.Join(root, "vault"),
-		ArtifactRoot:    filepath.Join(root, "artifacts"),
-		RunnerImage:     "ghcr.io/ms-one-note-exporter/runner:test",
-		RunnerNetwork:   "msout-runner",
-		RunnerTokenFile: filepath.Join(root, "runner_token"),
-		PoolSize:        poolSize,
-		RunnerTTL:       5 * time.Minute,
-		SlotIdleTimeout: 30 * time.Minute,
-		RequestTimeout:  time.Second,
+		DockerSocket:         filepath.Join(root, "docker.sock"),
+		HMACSecret:           []byte(strings.Repeat("a", 64)),
+		ReplayWindow:         time.Minute,
+		VaultRoot:            filepath.Join(root, "vault"),
+		ArtifactRoot:         filepath.Join(root, "artifacts"),
+		RunnerImage:          "ghcr.io/ms-one-note-exporter/runner:test",
+		RunnerNetwork:        "msout-runner",
+		RunnerControlNetwork: "msout-runner-api",
+		RunnerPort:           3100,
+		RunnerTokenFile:      filepath.Join(root, "runner_token"),
+		PoolSize:             poolSize,
+		RunnerTTL:            5 * time.Minute,
+		SlotIdleTimeout:      30 * time.Minute,
+		RequestTimeout:       time.Second,
 	}
 }
 
@@ -136,10 +138,23 @@ func TestRunnerRequestCarriesTheHardenedFlagSet(t *testing.T) {
 	}
 }
 
-// The runner is pinned to exactly one network. Being on msout-control would
-// make it reachable from `api` and the orchestrator, which is the direction the
-// capability table forbids (PLAN-v3 §2.1).
-func TestRunnerIsOnExactlyOneNetwork(t *testing.T) {
+// The runner is pinned to exactly two networks, and what they are matters more
+// than the count.
+//
+// It is no longer one. The credential has to reach a runner, and there was no
+// path for it: the runner was on the egress network, where `api` cannot be, and
+// nowhere else. So the runner joins one more — an internal one whose only other
+// member is `api`.
+//
+// The property this test actually guards is the negative one, and it is worth
+// stating precisely because both halves have plausible ways to regress:
+//
+//   - NOT on msout-control. That would put the credential path one hop from the
+//     only process holding the Docker socket.
+//   - NOT on the egress network alone. That would mean `api` had joined the
+//     egress network, which is §2.1's prohibition, and nothing else would say
+//     so — the deployment would work.
+func TestRunnerIsOnTheControlAndEgressNetworksAndNothingElse(t *testing.T) {
 	cfg := testConfig(t, 1)
 	p := noDockerPool(t, cfg)
 
@@ -150,12 +165,24 @@ func TestRunnerIsOnExactlyOneNetwork(t *testing.T) {
 	if req.Networking == nil {
 		t.Fatal("networking config must be pinned, not left to the daemon default")
 	}
-	if len(req.Networking.EndpointsConfig) != 1 {
-		t.Fatalf("runner is on %d networks, want 1: %v",
-			len(req.Networking.EndpointsConfig), req.Networking.EndpointsConfig)
+
+	want := map[string]bool{"msout-runner": false, "msout-runner-api": false}
+	if len(req.Networking.EndpointsConfig) != len(want) {
+		t.Fatalf("runner is on %d networks, want %d: %v",
+			len(req.Networking.EndpointsConfig), len(want), req.Networking.EndpointsConfig)
 	}
-	if _, ok := req.Networking.EndpointsConfig["msout-runner"]; !ok {
-		t.Errorf("networks = %v, want msout-runner", req.Networking.EndpointsConfig)
+	for name := range req.Networking.EndpointsConfig {
+		if _, ok := want[name]; !ok {
+			t.Errorf("runner is on unexpected network %q; it must not reach the "+
+				"control network that the orchestrator and api share", name)
+			continue
+		}
+		want[name] = true
+	}
+	for name, seen := range want {
+		if !seen {
+			t.Errorf("runner is not on %q", name)
+		}
 	}
 	// No static address: a predictable address would be a usable mount target
 	// or rate-limit key.
@@ -163,6 +190,82 @@ func TestRunnerIsOnExactlyOneNetwork(t *testing.T) {
 		if ep != nil && ep.IPAMConfig != nil && ep.IPAMConfig.IPv4Address != "" {
 			t.Errorf("network %s has a static address", name)
 		}
+	}
+}
+
+// The control network's alias is what `api` dials, so it is derived from the
+// slot and nothing else — and the reason is that it must survive a recycle.
+//
+// A container IP would look fine here and then fail silently in production: the
+// api stores an address once at claim time, `recycle` replaces the container,
+// and every later call to that runner fails with a transport error while the
+// orchestrator reports a healthy pool. Nothing anywhere says "stale address".
+func TestRunnerAliasIsDerivedFromTheSlotAndSurvivesRecycle(t *testing.T) {
+	cfg := testConfig(t, 1)
+	p := noDockerPool(t, cfg)
+
+	first, err := p.buildCreateRequest("slot-7", "c-old", "", time.Time{})
+	if err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	// A recycled container: same slot, new container id.
+	second, err := p.buildCreateRequest("slot-7", "c-new", "", time.Time{})
+	if err != nil {
+		t.Fatalf("second: %v", err)
+	}
+
+	control, ok := first.Networking.EndpointsConfig[cfg.RunnerControlNetwork]
+	if !ok || control == nil || len(control.Aliases) != 1 {
+		t.Fatalf("control network endpoint = %#v, want exactly one alias", control)
+	}
+	// The alias is the same name the orchestrator tells the api to dial.
+	if got, want := control.Aliases[0], "msout-runner-slot-7"; got != want {
+		t.Errorf("alias = %q, want %q", got, want)
+	}
+	if first.Networking.EndpointsConfig[cfg.RunnerControlNetwork].Aliases[0] !=
+		second.Networking.EndpointsConfig[cfg.RunnerControlNetwork].Aliases[0] {
+		t.Error("alias changed with the container id; an address stored at claim " +
+			"time would go stale on every recycle")
+	}
+
+	// And the URL the api receives names that alias, on the configured port.
+	url := p.RunnerURL("slot-7")
+	if url != "http://msout-runner-slot-7:3100" {
+		t.Errorf("RunnerURL = %q, want http://msout-runner-slot-7:3100", url)
+	}
+	if !strings.HasPrefix(url, "http://"+control.Aliases[0]+":") {
+		t.Errorf("RunnerURL %q does not use the alias the create request registered (%q)",
+			url, control.Aliases[0])
+	}
+
+	// A slot id is not interpolated into the URL unchecked: it is this
+	// component's own, but an empty one must not produce a bare "http://:3100"
+	// that would resolve somewhere surprising.
+	if got := p.RunnerURL("  "); got != "" {
+		t.Errorf("RunnerURL(blank) = %q, want empty", got)
+	}
+}
+
+// An idle runner is reachable by the same alias a bound one is, because a slot's
+// address cannot depend on whether a session is using it: `api` stores the URL
+// it was given at claim time and reuses it for the whole session.
+func TestIdleAndBoundRunnersShareTheSameAlias(t *testing.T) {
+	cfg := testConfig(t, 1)
+	p := noDockerPool(t, cfg)
+
+	idle, err := p.buildCreateRequest("slot-9", "c-1", "", time.Time{})
+	if err != nil {
+		t.Fatalf("idle: %v", err)
+	}
+	bound, err := p.buildCreateRequest("slot-9", "c-2", testGUID, time.Now())
+	if err != nil {
+		t.Fatalf("bound: %v", err)
+	}
+
+	a := idle.Networking.EndpointsConfig[cfg.RunnerControlNetwork].Aliases
+	b := bound.Networking.EndpointsConfig[cfg.RunnerControlNetwork].Aliases
+	if len(a) != 1 || len(b) != 1 || a[0] != b[0] {
+		t.Errorf("alias differs by bind state: idle %v, bound %v", a, b)
 	}
 }
 

@@ -283,6 +283,78 @@ const cases = [
     // rejection — which is how a check gets "fixed" by being weakened.
     expectMessage: /runner is on \[msout-runner,msout-control\]/,
   },
+
+  // ---- the credential path: the three networks ----------------------------
+  //
+  // Each of these is the mistake the arrangement exists to prevent, and each
+  // deploys cleanly. None of them produces an error, an unhealthy container, or a
+  // failing check anywhere else in the stack.
+  {
+    // The one that is genuinely tempting, because it is the obvious way to let
+    // the api reach a runner: one network instead of two. The api then has egress,
+    // which is PLAN-v3 §2.1's prohibition, and nothing in the stack notices.
+    name: "puts the api on the egress network",
+    mutate: (c) => {
+      c.services.api.networks["msout-runner"] = null;
+    },
+    expectMessage: /api is on msout-runner/,
+  },
+  {
+    // The other tempting fix for the same problem: drop the credential-path
+    // network and put the runner where the orchestrator is. Now the credential
+    // and the Docker socket share a network.
+    name: "puts the runner on the control network instead of the api's",
+    mutate: (c) => {
+      delete c.services.runner.networks["msout-runner-api"];
+      c.services.runner.networks["msout-control"] = null;
+      c.services.api.networks["msout-runner-api"] = null;
+    },
+    expectMessage: /runner is on \[/,
+  },
+  {
+    name: "makes the credential-path network routable",
+    mutate: (c) => {
+      c.networks["msout-runner-api"].internal = false;
+    },
+    // This is the whole point of `internal: true` on that network: a default
+    // route on it hands the api the internet.
+    expectMessage: /msout-runner-api/,
+  },
+  {
+    name: "removes the api from the credential-path network",
+    mutate: (c) => {
+      delete c.services.api.networks["msout-runner-api"];
+    },
+    expectMessage: /api is not on msout-runner-api/,
+  },
+  {
+    name: "adds the orchestrator to the credential path",
+    mutate: (c) => {
+      c.services.orchestrator.networks["msout-runner-api"] = null;
+    },
+    expectMessage: /msout-runner-api holds/,
+  },
+  {
+    // The api needs the token to present, and a 401 from the runner reads as "the
+    // password was rejected" — pointing an operator at the wrong component.
+    name: "takes runner_token away from the api",
+    mutate: (c) => {
+      c.services.api.secrets = c.services.api.secrets.filter(
+        (s) => s.source !== "runner_token",
+      );
+    },
+    expectMessage: /api's secrets are/,
+  },
+  {
+    // The value in an env var is visible in `docker inspect`. The other two
+    // secrets this api holds are asserted the same way; the third one is the
+    // easiest to get wrong because it is newest.
+    name: "puts the runner token in the api's environment",
+    mutate: (c) => {
+      c.services.api.environment.RUNNER_TOKEN = "hunter2";
+    },
+    expectMessage: /RUNNER_TOKEN as a value/,
+  },
   {
     name: "disables the Chromium sandbox",
     mutate: (c) => {

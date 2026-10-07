@@ -185,21 +185,112 @@ check(
   "FAIL: the runner has no MSOUT_RUNNER_TOKEN_FILE — it would refuse to start",
 );
 
-// The runner publishes no port. The orchestrator reaches it by container name on
-// the runner network; a published port would make it an API on the internet.
+// The runner publishes no port. The api reaches it by container alias on
+// msout-runner-api; a published port would make it an API on the internet.
 check(
   (services.runner?.ports ?? []).length === 0,
   "runner publishes no port",
   `runner publishes ${JSON.stringify(services.runner?.ports ?? [])}`,
 );
 
-// ...and it is on the runner network only. Being on the control network would
-// put it where the orchestrator and api live, one compromise away from both.
-const runnerNetworks = Object.keys(services.runner?.networks ?? {});
+// The api can authenticate to a runner, which means it holds the same token.
+//
+// Without the mount the api has no token to present, so every credential
+// submission is refused with 401 — and the failure reads as "the runner rejected
+// the password", which sends an operator looking at the wrong component. This
+// binds the assertion to the mount, as the orchestrator's is bound above, so
+// dropping one without the other fails here instead of in production.
+const apiSecrets = (services.api?.secrets ?? []).map((s) => s.source);
 check(
-  runnerNetworks.length === 1 && runnerNetworks[0] === "msout-runner",
-  `runner is on msout-runner only (found: [${runnerNetworks}])`,
-  `runner is on [${runnerNetworks}]; expected [msout-runner] only`,
+  apiSecrets.includes("runner_token"),
+  "the api holds runner_token, to authenticate to a runner",
+  `the api's secrets are [${apiSecrets.join(", ")}]. It calls a runner's HTTP API, so ` +
+    "without this every credential submission is refused 401",
+);
+check(
+  services.api?.environment?.RUNNER_TOKEN_FILE === "/run/secrets/runner_token",
+  "api: RUNNER_TOKEN_FILE points at the mounted secret",
+  `api RUNNER_TOKEN_FILE is ${JSON.stringify(services.api?.environment?.RUNNER_TOKEN_FILE)}; ` +
+    "it must name the path the token is mounted at, or the file is never read",
+);
+// The path, never the value — the same rule the other two secrets follow here.
+for (const key of ["RUNNER_TOKEN", "CSRF_KEY", "SESSION_SECRET"]) {
+  check(
+    !(key in (services.api?.environment ?? {})),
+    `api environment has no ${key}`,
+    `api environment carries ${key} as a value. Secrets travel as file paths: an env ` +
+      "var is visible in docker inspect",
+  );
+}
+
+// ...and it is on exactly two networks: egress for Microsoft, and an internal one
+// whose only other member is `api`.
+//
+// The set is the assertion, not the count. `msout-runner` is where the runner
+// reaches login.microsoft.com; `msout-runner-api` is how the credential gets to
+// it without giving `api` egress. Being on `msout-control` instead would put it
+// where the orchestrator lives, one compromise away from the Docker socket —
+// that is the member this check refuses.
+const runnerNetworks = Object.keys(services.runner?.networks ?? {});
+const wantRunnerNetworks = ["msout-runner", "msout-runner-api"];
+check(
+  runnerNetworks.length === wantRunnerNetworks.length &&
+    wantRunnerNetworks.every((n) => runnerNetworks.includes(n)),
+  `runner is on egress + credential-path networks only (found: [${runnerNetworks}])`,
+  `runner is on [${runnerNetworks}]; expected exactly [${wantRunnerNetworks}] — it must ` +
+    `not join msout-control, which is where the orchestrator's socket lives`,
+);
+
+// The credential-path network must be internal, and that is the whole reason it
+// exists. A non-internal network gives `api` a default route, so the api would
+// reach the internet — §2.1's prohibition, and a deployment that otherwise works.
+check(
+  cfg.networks?.["msout-runner-api"]?.internal === true,
+  "msout-runner-api has internal: true (api gains a route to runners, not egress)",
+  "FAIL: msout-runner-api is missing `internal: true`. The api would join it with " +
+    "egress, which is what PLAN-v3 §2.1 forbids — put the api on msout-runner instead",
+);
+
+// And it must hold the api and the runners, and nothing else. The orchestrator on
+// it would put the credential path and the Docker socket on one network.
+const onRunnerApi = Object.entries(services)
+  .filter(([, def]) => Object.keys(def.networks ?? {}).includes("msout-runner-api"))
+  .map(([name]) => name)
+  .sort();
+check(
+  onRunnerApi.length === 2 && onRunnerApi.includes("api") && onRunnerApi.includes("runner"),
+  `msout-runner-api holds api and runner only (found: [${onRunnerApi}])`,
+  `msout-runner-api holds [${onRunnerApi}]; expected exactly [api, runner]. The ` +
+    `orchestrator must not be on the credential path`,
+);
+
+// The api must be on the credential-path network, or it cannot hand over a
+// credential at all — and the symptom would be a 501 rather than a config error,
+// which is what this check exists to prevent.
+check(
+  Object.keys(services.api?.networks ?? {}).includes("msout-runner-api"),
+  "api is on msout-runner-api",
+  "FAIL: the api is not on msout-runner-api, so it has no route to a runner and " +
+    "every credential submission would fail",
+);
+
+// The api must not be on the egress network. This is the error the whole
+// three-network arrangement is built to make impossible, and it would deploy
+// cleanly.
+check(
+  !Object.keys(services.api?.networks ?? {}).includes("msout-runner"),
+  "api is not on the egress network",
+  "FAIL: the api is on msout-runner, which has egress. PLAN-v3 §2.1 says the api " +
+    "has no route to the internet; remove it and use msout-runner-api instead",
+);
+
+// ...and not on the orchestrator's network either, for the same reason: it would
+// be a step from the api to the only process holding the Docker socket.
+check(
+  !Object.keys(services.runner?.networks ?? {}).includes("msout-control"),
+  "runner is not on msout-control",
+  "FAIL: the runner is on msout-control, which is where the orchestrator lives. The " +
+    "credential path and the socket must not share a network",
 );
 
 // The renderer sandbox stays on. `--no-sandbox` is a documented fallback for a

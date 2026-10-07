@@ -190,6 +190,14 @@ type EndpointConfig struct {
 	// IPAMConfig is deliberately not set. Assigning a static address would let
 	// a caller-predictable address become a mount target or a rate-limit key.
 	IPAMConfig *IPAMConfig `json:"IPAMConfig,omitempty"`
+
+	// Aliases are the DNS names the container answers to on this network.
+	//
+	// Added for the runner's control network, where `api` dials the runner by
+	// name rather than by IP. A name derived from the slot id is stable across
+	// `recycle`, which a container IP is not — so a stored address keeps
+	// working when the container underneath it is replaced.
+	Aliases []string `json:"Aliases,omitempty"`
 }
 
 // IPAMConfig exists only to satisfy the Engine's shape.

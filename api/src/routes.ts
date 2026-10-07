@@ -53,6 +53,14 @@ import type { RunnerAdapter } from "./runner-adapter.js";
 import type { PoolBinder } from "./sweep.js";
 
 /**
+ * Where a session's runner is.
+ *
+ * Null means no runner is bound to that session, which is a normal state: a
+ * session that has not logged in yet, or whose runner has been released.
+ */
+export type RunnerAddressLookup = (sessionId: string) => string | null;
+
+/**
  * Dependencies the routes need beyond config.
  *
  * Mutable only so `buildServer` can assemble it conditionally under
@@ -66,10 +74,19 @@ export interface RouteDeps {
   knownProxies?: ReadonlySet<string>;
   eraseRunner?: EraseDeps["runner"];
   /**
-   * The route to a runner container. Absent until the sidecar lands, or supplied
-   * by a mock — see runner-adapter.ts. Absent means 501, unchanged.
+   * The route to a runner container. Supplied by the entrypoint, or by a mock —
+   * see runner-adapter.ts. Absent means 501.
    */
   runner?: RunnerAdapter;
+  /**
+   * Where a bound session's runner is, if it is known.
+   *
+   * The adapter reads this rather than deriving an address, because the
+   * orchestrator named the runner and only the orchestrator knows how. It is a
+   * separate dependency from `runner` so a test can drive the adapter's HTTP
+   * surface while asserting that the address comes from the claim response.
+   */
+  runnerAddresses?: RunnerAddressLookup;
   /**
    * Binds a session to a container on demand.
    *

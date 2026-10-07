@@ -67,6 +67,16 @@ export interface StartExportInput {
   readonly notebook: string;
   /** Aborts the run if signalled. Required, not optional — §6.3 is explicit. */
   readonly signal: AbortSignal;
+  /**
+   * The notebook's URL, when the listing gave one.
+   *
+   * Preferred over the name where both are available, because a name is not a
+   * stable identifier: two notebooks can share a name, and a rename between
+   * listing and exporting would send the exporter at the wrong one. The runner
+   * accepts exactly one of the two rather than both, because it has to pick and
+   * a caller that supplied both would be relying on which one it picked.
+   */
+  readonly notebookUrl?: string;
 }
 
 /** Input for an abort. */
@@ -102,6 +112,21 @@ export interface RunnerAdapter {
 
   /** Start an export, reporting progress as `export-*` events. */
   startExport(input: StartExportInput): Promise<void>;
+
+  // ---------------------------------------------------------------------
+  // Not in this interface, deliberately, and worth stating because its
+  // absence is a real product gap rather than an oversight:
+  //
+  //   answerChallenge(sessionId, challengeId, code)
+  //
+  // The runner can be asked for a typed MFA code (`kind: "code"`) and then waits
+  // 120 seconds and fails — `login()` has no way to be handed a code mid-flow, and
+  // the runner has no route to receive one. The number-match path needs nothing
+  // from the user, so it works. A code path needs a runner route, this method, an
+  // api route and a frontend screen, and none of those exist.
+  //
+  // Until they do, `HttpRunnerAdapter` refuses that challenge with a named reason
+  // rather than letting it expire silently. See `unsupportedChallenge`.
 
   /**
    * Abort a running export.

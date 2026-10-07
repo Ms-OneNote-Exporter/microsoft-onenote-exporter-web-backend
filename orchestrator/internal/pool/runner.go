@@ -138,12 +138,31 @@ func (p *Pool) buildCreateRequest(slotID, containerID, sessionGUID string, sessi
 			Retries:     3,
 			StartPeriod: (20 * time.Second).Nanoseconds(),
 		},
-		// One network, pinned. The runner is not on msout-control, so it cannot
-		// reach the orchestrator or `api`, and it holds no route to the Docker
-		// socket because the socket is not mounted into it (PLAN-v3 §2.1).
+		// Two networks, both pinned, and what each one is for is the whole
+		// topology:
+		//
+		//   RunnerControlNetwork — internal, and `api` is its only other
+		//     member. This is the credential path: `api` posts the password here.
+		//     Internal means no default route, so joining it cannot give `api`
+		//     egress (PLAN-v3 §2.1). `api` is NOT on msout-control and the
+		//     orchestrator is NOT here, so the component holding the Docker
+		//     socket is one hop away from the credential rather than on it.
+		//
+		//   RunnerNetwork — egress to Microsoft, and `api` is deliberately not
+		//     on it. That is the constraint the first network exists to satisfy.
+		//
+		// The alias is what makes the address stable: it is derived from the
+		// slot id, so it survives `recycle` replacing the container, whereas a
+		// container IP would not. See RunnerURL.
+		//
+		// Neither network name comes from a request. `RunnerURL` is derived
+		// from the slot id the orchestrator generated, and the ip is nil because
+		// a static address would let a caller-predictable value become a mount
+		// target — the same argument EndpointConfig already records.
 		Networking: &dockerapi.NetworkingConfig{
 			EndpointsConfig: map[string]*dockerapi.EndpointConfig{
-				p.cfg.RunnerNetwork: {},
+				p.cfg.RunnerControlNetwork: {Aliases: []string{runnerAlias(slotID)}},
+				p.cfg.RunnerNetwork:        {},
 			},
 		},
 		Env: []string{

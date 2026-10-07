@@ -43,6 +43,23 @@ networks:
   # reachable from outside.
   msout-edge: {}
 
+  # The credential path: `api` and the runners, and nobody else.
+  #
+  # `internal: true` is the load-bearing word. A container on an internal network
+  # has no default route, so joining this one cannot give `api` egress — which is
+  # §2.1's "the api reaches the internet: no", and the reason this network exists
+  # instead of putting the api on msout-runner.
+  #
+  # The runner joins both this and msout-runner, so it gets the Microsoft hosts it
+  # needs and a route to `api`. Two networks rather than one is what keeps those
+  # two properties from cancelling: one network cannot be both reachable and
+# # unrouted.
+  #
+  # The orchestrator is deliberately NOT here. It holds the Docker socket, and the
+  # credential should be one hop away from it rather than on it.
+  msout-runner-api:
+    internal: true
+
   # ---- KNOWN GAP, NOT AN OMISSION -------------------------------------------
   #
   # `msout-runner` is declared with NO egress enforcement, because Docker Compose
@@ -151,6 +168,14 @@ services:
       #
       # What the api must NOT have is a published port, and it has none.
       - msout-control
+      # msout-runner-api, and this is the second of the api's two networks. It is
+      # `internal: true`, so it cannot add egress — the point of the whole
+      # arrangement. The api needs a route to a runner to hand over the
+      # credential, and the only network that has runners on it has egress.
+      #
+      # Note what this does *not* include: `msout-runner`, which would work and
+      # would hand the browser-facing component a route to the internet.
+      - msout-runner-api
     environment:
       # Derived from the single knob. https, because in production the cookie is
       # `__Host-` and therefore Secure-only.
@@ -166,9 +191,31 @@ services:
       # `secrets` block above for why the distinction matters.
       CSRF_KEY_FILE: /run/secrets/csrf_key
       ORCHESTRATOR_HMAC_SECRET_FILE: /run/secrets/orchestrator_hmac_secret
+      # The path, never the value — same rule as every other secret here. An env
+      # var carrying the token would be visible in `docker inspect` to anything
+      # that can read this container's config.
+      RUNNER_TOKEN_FILE: /run/secrets/runner_token
     secrets:
       - csrf_key
       - orchestrator_hmac_secret
+      # The bearer token a runner requires on every route but /healthz.
+      #
+      # The api holds this because it is now the component that calls a runner —
+      # the orchestrator creates them but does not drive them. That is a real
+      # change to §2.1's "the orchestrator is the only thing that talks to a
+      # runner", and it is worth being explicit about why the token is the right
+      # thing to hand over rather than something the orchestrator proxies:
+      #
+      #   - The api is the only process that ever holds credential bytes *and* can
+      #     reach a runner, so it is the only process that could need this.
+      #   - It authorises starting work in a container that already exists. It
+      #     never carries or reveals a password, and it cannot create a container
+      #     — `api` still has no Docker socket.
+      #   - A per-slot token would be tighter (a compromised api could then reach
+      #     only one runner), at the cost of a token lifecycle, a revoke path, and
+      #     the orchestrator having to mint and hand out credentials it must then
+      #     track. Not taken now; noted rather than forgotten.
+      - runner_token
     volumes:
       # The SQLite database. Named volume, so the host path is not an operator
       # chore and the ownership is already right for the non-root user.
@@ -320,6 +367,12 @@ services:
     image: ghcr.io/ms-one-note-exporter/msout-runner:${IMAGE_TAG:-local}
     networks:
       - msout-runner
+      # The credential path. `api` is the only other member; the orchestrator is
+      # not, so this network cannot be a route to the Docker socket.
+      #
+      # Both this and msout-runner are load-bearing together: one gives the runner
+      # Microsoft, the other gives it `api`, and neither alone can be both.
+      - msout-runner-api
     # Published to nothing. The orchestrator reaches it over the runner network by
     # container name; there is no route from the host, so a compromised runner is
     # not a published API.

@@ -141,7 +141,7 @@ export class PoolBinder {
   async claimForLogin(
     session: SessionRow,
   ): Promise<
-    | { ok: true; runnerId: string; containerId: string }
+    | { ok: true; runnerId: string; containerId: string; runnerUrl: string | null }
     | { ok: false; reason: "pool-exhausted" | "orchestrator-unreachable" }
   > {
     const now = this.#now();
@@ -183,11 +183,22 @@ export class PoolBinder {
       return { ok: false, reason: "orchestrator-unreachable" };
     }
 
-    // The orchestrator returns its own container id; record it so boot
-    // reconciliation has something to compare against.
+    // The orchestrator returns its own container id and the address of the runner
+    // it created; both are recorded so boot reconciliation has something to
+    // compare against, and so the adapter can reach the container without
+    // deriving a name the orchestrator owns.
+    //
+    // An absent `runnerUrl` is stored as NULL rather than filled in from
+    // `slotId`. That is the whole reason the field is in the claim response
+    // instead of being built here, and the NULL is what makes the difference
+    // visible: the session gets a runner it cannot call, which reports itself,
+    // rather than a 401 from a guessed hostname.
     this.#db.run(
-      `UPDATE runners SET container_id = ?, status = 'active', health = 'unknown' WHERE id = ?`,
+      `UPDATE runners
+          SET container_id = ?, runner_url = ?, status = 'active', health = 'unknown'
+        WHERE id = ?`,
       result.value.containerId,
+      result.value.runnerUrl ?? null,
       claimed.id,
     );
     this.#db.run(
@@ -204,8 +215,17 @@ export class PoolBinder {
       session: session.guid,
       runner: claimed.id,
       container: result.value.containerId,
+      // Logged rather than assumed: an absent address means every subsequent
+      // runner call fails, and the warning belongs next to the claim that
+      // caused it rather than in the log of a later login attempt.
+      ...(result.value.runnerUrl === undefined ? { runnerUrl: "absent" } : {}),
     });
-    return { ok: true, runnerId: claimed.id, containerId: result.value.containerId };
+    return {
+      ok: true,
+      runnerId: claimed.id,
+      containerId: result.value.containerId,
+      runnerUrl: result.value.runnerUrl ?? null,
+    };
   }
 
   /**

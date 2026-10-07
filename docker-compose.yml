@@ -75,6 +75,14 @@ secrets:
     file: ${SECRETS_DIR:-./secrets}/csrf_key
   orchestrator_hmac_secret:
     file: ${SECRETS_DIR:-./secrets}/orchestrator_hmac_secret
+  # The runner's bearer token, so the orchestrator can authenticate to it.
+  #
+  # Not a session credential: it authorises the orchestrator to *start* work in a
+  # container it created, and never carries or reveals a password. A file rather
+  # than an environment variable for the same reason as the other two — an env var
+  # is visible in `docker inspect` to anything that can read the container config.
+  runner_token:
+    file: ${SECRETS_DIR:-./secrets}/runner_token
 
 # ---- services ---------------------------------------------------------------
 
@@ -258,21 +266,82 @@ services:
       timeout: 5s
       retries: 3
 
-  # ---- THE RUNNER IS NOT HERE -----------------------------------------------
+  # ---- the runner ----------------------------------------------------------
   #
-  # It depends on `@msout/*` packages that are not published, so a runner service
-  # would be a container that starts, fails, and looks like a deployment. When
-  # steps 1–2 land, add a service on `msout-runner` with:
+  # §12 steps 1–2. Started by the orchestrator, one per export session, not by
+  # compose: `deploy.replicas` would be wrong, because the container holds one
+  # session's credential and one browser, and two of them in one compose project
+  # would share a data root.
   #
-  #   - no secrets (only the orchestrator has the HMAC secret)
-  #   - no CSRF key, no session secret, and neither in its environment
-  #   - no bind mounts at all
+  # It is declared here as a profile so `docker compose up` does not start it and
+  # the image can still be built and the compose config still checked. The
+  # orchestrator creates runners by name and network, not through this block.
   #
-  # The capability tests in .github/workflows/capability.yml assert exactly those
-  # three things and will fail loudly if the service grows a capability.
+  # Three absences are load-bearing, and each is asserted by capability.yml rather
+  # than left to a reader of this file:
+  #
+  #   - no CSRF key, no session secret, and neither in its environment. This
+  #     process holds the credential bytes and nothing else.
+  #   - no bind mounts. Its data root is a named volume, so erase is one removal.
+  #   - no docker socket. Only the orchestrator may create containers.
+  #
+  # It *does* hold MSOUT_RUNNER_TOKEN_FILE, which is a token for talking to the
+  # orchestrator and not a session credential — see secrets below.
+  runner:
+    profiles: ["runner"]
+    <<: *restart
+    build:
+      context: ./runner
+      args:
+        BUILD_ID: ${IMAGE_TAG:-local}
+    image: ghcr.io/ms-one-note-exporter/msout-runner:${IMAGE_TAG:-local}
+    networks:
+      - msout-runner
+    # Published to nothing. The orchestrator reaches it over the runner network by
+    # container name; there is no route from the host, so a compromised runner is
+    # not a published API.
+    environment:
+      MSOUT_DATA_ROOT: /data
+      MSOUT_ARTIFACT_ROOT: /artifacts
+      MSOUT_RUNNER_TOKEN_FILE: /run/secrets/runner_token
+    secrets:
+      - runner_token
+    volumes:
+      - runner-data:/data
+      - artifacts:/artifacts
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # The runtime flags from POC §18, as compose properties. `--no-sandbox` is
+    # deliberately absent: the renderer sandbox stays on, and a host that cannot
+    # enable unprivileged user namespaces is a host prerequisite, not a default.
+    # The integration test in .github/workflows/ is the gate on that.
+    shm_size: 1gb
+    # `pids` under `deploy.resources.limits`, not the top-level `pids_limit`.
+    # Compose rejects a file that sets both to different values, and it is a
+    # confusing error rather than an obvious one — so the form the rest of the file
+    # uses is the form used here, and the memory limit lives beside it.
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+          pids: 512
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3100/healthz').then(r=>r.ok?process.exit(0):process.exit(1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
 
 volumes:
   api-data:
   artifacts:
   caddy-data:
   caddy-config:
+  # The runner's session data: one subdirectory per session guid, holding the auth
+  # file, the exported vault, and the packages' own logs and dumps. A named volume
+  # rather than a bind mount, so the runner has no host path and erase is a single
+  # directory removal. The runner writes the artifact to `artifacts`, which it
+  # shares with the orchestrator — that is the handover.
+  runner-data:

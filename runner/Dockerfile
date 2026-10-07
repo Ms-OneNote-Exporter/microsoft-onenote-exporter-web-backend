@@ -1,0 +1,119 @@
+# The runner image.
+#
+# ## What is different from the api image
+#
+# This one **does** carry Playwright, Chromium and a browser's worth of Node
+# modules, because it is the component that runs the `@msout` packages. The api's
+# multi-stage build exists to keep exactly that out of the component that holds the
+# session secret; here it is the point.
+#
+# Everything else is borrowed from the api's Dockerfile, including the reasons
+# given there rather than restated.
+
+# ---- build ---------------------------------------------------------------
+# Which commit this image is. Injected by compose from IMAGE_TAG. No default: an
+# unset BUILD_ID is a packaging mistake and the resulting image reports "local",
+# which is visibly wrong rather than invisibly wrong.
+ARG BUILD_ID
+
+FROM node:22.13.0-bookworm-slim AS build
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY tsconfig.json ./
+COPY src ./src
+
+# No `npm run build` here — the typecheck is the point of this stage. A build that
+# produces dist/ from code that does not typecheck is a way to ship one that
+# works by accident.
+RUN npm run typecheck
+RUN npm run build
+
+# ---- runtime -------------------------------------------------------------
+FROM node:22.13.0-bookworm-slim AS runtime
+
+ARG BUILD_ID
+ENV BUILD_ID=${BUILD_ID}
+
+# Chromium's own dependencies, and nothing else.
+#
+# `chromium` from the Debian archive rather than Playwright's download, because the
+# archive version is patched by the distro's security team and does not carry a
+# separate copy of the same browser. `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` stops
+# `npm ci` fetching a second, unpatched one — which is what happens by default
+# when the `playwright` package is installed, and which is why this stage is not
+# simply "the api's plus a browser".
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      chromium \
+      ca-certificates \
+      fonts-liberation \
+      fonts-noto-color-emoji \
+ && rm -rf /var/lib/apt/lists/*
+
+# Verified here rather than assumed. Chromium resolving to nothing is a container
+# that starts, passes its health check, and then fails every login with a message
+# that reads like a network problem.
+RUN test -n "$(command -v chromium)" || (echo "chromium did not install" && exit 1)
+
+# The session and artifact roots, created while this stage is still root and then
+# handed to the unprivileged user. It has to be *here*, before the first
+# `USER node`: a RUN after that line executes as node, which cannot chown anything.
+#
+# Load-bearing, the same way the api's volume ownership is: Docker creates a fresh
+# named volume from the image's directory *and its ownership*, so a path absent
+# from the image yields a root-owned volume that uid 1000 cannot write to.
+RUN mkdir -p /data /artifacts && chown -R node:node /data /artifacts
+
+USER node
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV MSOUT_DATA_ROOT=/data
+ENV MSOUT_ARTIFACT_ROOT=/artifacts
+
+COPY package.json package-lock.json ./
+# `--omit=dev` gives a tree with no compiler and no test runner. The `@msout`
+# packages *are* kept: they are the reason this container exists.
+RUN npm ci --omit=dev && npm cache clean --force
+
+COPY --from=build /app/dist ./dist
+
+# No test material in the image. `tsconfig.json` includes only `src/**`, so this
+# is structural — but the control is still CI's grep, and the grep uses word
+# boundaries for a reason worth recording: a plain `grep "it("` matches
+# `slot.describe()`, `process.exit(1)` and any `wait(` in the codebase, so it
+# reports failures that have nothing to do with test material and gets ignored.
+# CI's pattern is `(describe|it|test)\(` preceded by a non-identifier character,
+# which matches the call and not the substring.
+
+# ---- the runtime dependency set, checked in the image ---------------------
+#
+# The api asserts exactly {fastify}. The runner cannot: it needs Playwright,
+# archiver and the three packages. What it *can* assert is that the set is
+# exactly what it expects, so a dependency added by accident is caught at build
+# time rather than discovered in a supply-chain review three months later.
+RUN node -e '
+  const want = ["@msout/microsoft-onenote-export-notebook", "@msout/microsoft-onenote-list-notebooks",
+                "@msout/microsoft-webauth", "archiver", "fastify"];
+  const got = Object.keys(require("./package.json").dependencies).sort();
+  if (JSON.stringify(got) !== JSON.stringify(want)) {
+    console.error("runtime dependency set changed:", got, "expected", want);
+    process.exit(1);
+  }
+  console.log("runtime dependency set is as expected");
+'
+
+EXPOSE 3100
+
+# The token arrives as a Docker secret file, never as an env var — see
+# .env.example for MSOUT_RUNNER_TOKEN_FILE. There is no CSRF key and no session
+# secret here: this process holds credential bytes and nothing else, and the
+# capability suite in CI asserts that neither appears in its environment.
+CMD ["node", "dist/index.js"]

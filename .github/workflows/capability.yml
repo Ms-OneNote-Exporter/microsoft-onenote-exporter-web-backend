@@ -111,7 +111,7 @@ jobs:
           mkdir -p secrets
           chmod 700 secrets
           umask 077
-          for f in csrf_key orchestrator_hmac_secret; do
+          for f in csrf_key orchestrator_hmac_secret runner_token; do
             head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n' | cut -c1-43 > "secrets/$f"
             chmod 0444 "secrets/$f"
           done
@@ -272,6 +272,127 @@ jobs:
           fi
           echo "msout-edge holds one container"
 
+      # ---- the runner, which holds credential bytes ---------------------------
+      #
+      # Started with `--profile runner`, because the orchestrator starts runners
+      # per session in production and this needs one standing to inspect. The
+      # container is never given a credential in this suite — the assertions are
+      # about what it *can* reach, not about a login.
+
+      - name: start one runner and wait for it to be healthy
+        run: |
+          set -euo pipefail
+          docker compose --profile runner up -d --wait runner
+          cid=$(docker compose ps -q runner)
+          test -n "$cid" || { echo "no runner container"; docker compose ps; exit 1; }
+          echo "runner is up: $(docker inspect -f '{{.State.Health.Status}}' "$cid")"
+
+      - name: T-X-R1 — the runner has no session secret in its environment
+        # §2.1, and the sharpest version of it. This is the only component that
+        # sees the credential bytes, so every extra capability it holds is one an
+        # attacker reaches *after* the password.
+        #
+        # It does carry MSOUT_RUNNER_TOKEN_FILE, which is a token for the
+        # orchestrator to authenticate with — it never carries or reveals a
+        # password — so that one is asserted as a path, separately.
+        run: |
+          set -euo pipefail
+          cid=$(docker compose ps -q runner)
+          env_dump=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$cid")
+          echo "$env_dump" | sed 's/=.*/=<redacted>/' | sort
+          for key in CSRF_KEY SESSION_SECRET ORCHESTRATOR_HMAC_SECRET; do
+            if printf '%s' "$env_dump" | grep -qE "^${key}=[A-Za-z0-9_-]{10,}"; then
+              echo "FAIL: the runner carries ${key} inline"
+              exit 1
+            fi
+          done
+          printf '%s' "$env_dump" | grep -qE '^MSOUT_RUNNER_TOKEN_FILE=/run/secrets/'
+            || { echo "FAIL: no MSOUT_RUNNER_TOKEN_FILE path"; exit 1; }
+          echo "T-X-R1 ok"
+
+      - name: T-X-R2 — the runner has no bind mount and no docker socket
+        # A bind mount is a host path, and §2.1 gives this component none. The
+        # data root is a named volume, so erase is one directory removal.
+        run: |
+          set -euo pipefail
+          cid=$(docker compose ps -q runner)
+          binds=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}} {{end}}{{end}}' "$cid")
+          echo "runner bind mounts: ${binds:-none}"
+          test -z "$binds" || { echo "FAIL: the runner has a bind mount"; exit 1; }
+          docker compose exec -T runner sh -c 'test ! -S /var/run/docker.sock' \
+            || { echo "FAIL: the runner can see a docker socket"; exit 1; }
+          echo "T-X-R2 ok"
+
+      - name: T-X-R3 — the runner publishes no port and is not on the control network
+        # Unreachable from the host, and not one compromise away from the api.
+        run: |
+          set -euo pipefail
+          ports=$(docker compose port runner 3100 2>/dev/null || true)
+          test -z "$ports" || { echo "FAIL: the runner publishes $ports"; exit 1; }
+          cid=$(docker compose ps -q runner)
+          for net in $(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$cid"); do
+            echo "runner is on $net"
+            case "$net" in
+              *_msout-control|*_msout-edge)
+                echo "FAIL: the runner is on the control/edge network"; exit 1 ;;
+            esac
+          done
+          echo "T-X-R3 ok"
+
+      - name: the runner answers /healthz and nothing else without a token
+        # The bearer token is defence in depth rather than the boundary — the
+        # orchestrator holds the Docker socket — but a route that answered an
+        # unauthenticated caller would be a hole in it.
+        run: |
+          set -euo pipefail
+          code=$(docker compose exec -T runner node -e '
+            fetch("http://127.0.0.1:3100/healthz").then(async r => { console.log(r.status); });
+          ')
+          echo "healthz without a token: $code"
+          test "$code" = "200" || { echo "FAIL: /healthz needs a token; the orchestrator health check cannot work"; exit 1; }
+          for path in /events "/sessions/3f2504e0-4f89-41d3-9a0c-0305e82c3301/login"; do
+            code=$(docker compose exec -T runner node -e "
+              fetch('http://127.0.0.1:3100${path}', { method: 'POST', body: 'x' })
+                .then(r => { console.log(r.status); }).catch(e => { console.log('err'); });
+            ")
+            echo "$path without a token: $code"
+            test "$code" = "401" || { echo "FAIL: $path answered $code without a token"; exit 1; }
+          done
+          echo "runner auth ok"
+
+      - name: the runner offers no debug surface
+        # `--dodump` and `--screenshot` are credential artefacts in a hosted
+        # service, and they are unreachable from the HTTP API by construction. The
+        # route table is asserted against the running container's own output, not
+        # against this file, so a route added in code and forgotten here fails.
+        run: |
+          set -euo pipefail
+          routes=$(docker compose exec -T runner node -e '
+            const app = require("/app/dist/index.js");
+            const cfg = {
+              dataRoot: "/tmp/probe-data", artifactRoot: "/tmp/probe-artifacts",
+              token: "probe-token-long-enough", credentialBodyLimit: 4096,
+              loginTimeoutMs: 1000, exportTimeoutMs: 1000,
+              quotaBytes: 1024, minFreeBytes: 1, ringSize: 10,
+            };
+            const seen = [];
+            const probe = app.buildApp(cfg, (r) => seen.push(
+              `${Array.isArray(r.method) ? r.method.join(",") : r.method} ${r.url}`));
+            probe.ready().then(() => { console.log(seen.join("\n")); return probe.close(); });
+          ')
+          echo "$routes"
+          count=$(printf '%s' "$routes" | grep -c . || true)
+          test "$count" -ge 8 || { echo "FAIL: the runner reported only $count routes"; exit 1; }
+          if printf '%s' "$routes" | grep -qiE 'dodump|screenshot|--dump|debug|headed'; then
+            echo "FAIL: a route offers a debug flag"
+            exit 1
+          fi
+          echo "no debug surface ok"
+
+      - name: stop the runner
+        if: always()
+        run: docker compose --profile runner stop runner
+
       # ---- mac's third addition ---------------------------------------------
 
       - name: /files/ never reaches Node
@@ -342,5 +463,5 @@ jobs:
       - name: down
         if: always()
         run: |
-          docker compose down -v
+          docker compose --profile runner down -v
           rm -rf secrets

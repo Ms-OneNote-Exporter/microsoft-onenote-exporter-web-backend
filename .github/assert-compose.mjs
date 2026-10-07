@@ -91,13 +91,72 @@ check(
   "orchestrator mounts the host docker socket, once",
   `orchestrator has ${socketsFor("orchestrator").length} docker socket mount(s); expected exactly 1`,
 );
-for (const svc of ["api", "caddy"]) {
+for (const svc of ["api", "caddy", "runner"]) {
   check(
     socketsFor(svc).length === 0,
     `${svc} mounts no docker socket`,
     `${svc} mounts a docker socket — it must never hold one (§2.1)`,
   );
 }
+
+// 3a. The runner takes no host path and carries no session secret.
+//
+// §2.1's rule, and the sharpest form of it here: the runner is the only component
+// that sees the credential bytes, so every additional capability it holds is a
+// capability an attacker reaches *after* the password. No bind mounts — its data
+// root is a named volume, so erase is one directory removal — and no CSRF key, no
+// session secret, neither in its environment.
+//
+// The runner *does* carry MSOUT_RUNNER_TOKEN_FILE, which is a token for the
+// orchestrator to authenticate with, not a session credential: it authorises
+// starting work in a container the orchestrator created, and never carries or
+// reveals a password. So it is asserted separately rather than swept into the
+// no-secrets check, where it would be indistinguishable from a mistake.
+check(
+  bindsFor("runner").length === 0,
+  "runner has no bind mounts at all",
+  `runner bind-mounts ${bindsFor("runner").map((v) => v.source).join(", ")}; §2.1 gives it no host path`,
+);
+for (const key of ["CSRF_KEY", "CSRF_KEY_FILE", "SESSION_SECRET", "ORCHESTRATOR_HMAC_SECRET"]) {
+  check(
+    !(key in (services.runner?.environment ?? {})),
+    `runner environment has no ${key}`,
+    `runner environment carries ${key}. It holds credential bytes and must know nothing of sessions`,
+  );
+}
+check(
+  "MSOUT_RUNNER_TOKEN_FILE" in (services.runner?.environment ?? {}),
+  "runner: MSOUT_RUNNER_TOKEN_FILE points into /run/secrets",
+  "FAIL: the runner has no MSOUT_RUNNER_TOKEN_FILE — it would refuse to start",
+);
+
+// The runner publishes no port. The orchestrator reaches it by container name on
+// the runner network; a published port would make it an API on the internet.
+check(
+  (services.runner?.ports ?? []).length === 0,
+  "runner publishes no port",
+  `runner publishes ${JSON.stringify(services.runner?.ports ?? [])}`,
+);
+
+// ...and it is on the runner network only. Being on the control network would
+// put it where the orchestrator and api live, one compromise away from both.
+const runnerNetworks = Object.keys(services.runner?.networks ?? {});
+check(
+  runnerNetworks.length === 1 && runnerNetworks[0] === "msout-runner",
+  `runner is on msout-runner only (found: [${runnerNetworks}])`,
+  `runner is on [${runnerNetworks}]; expected [msout-runner] only`,
+);
+
+// The renderer sandbox stays on. `--no-sandbox` is a documented fallback for a
+// host that cannot enable unprivileged user namespaces, never a default, so its
+// absence here is asserted rather than assumed — a compose file that grew it would
+// otherwise disable the sandbox on every host silently.
+const runnerCommand = JSON.stringify(services.runner?.command ?? services.runner?.entrypoint ?? "");
+check(
+  !runnerCommand.includes("--no-sandbox"),
+  "runner does not pass --no-sandbox",
+  "FAIL: the runner passes --no-sandbox. The renderer sandbox is a control, not a default",
+);
 
 // 3b. The api takes no host path whatsoever.
 //

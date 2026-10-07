@@ -2,11 +2,12 @@
   "name": "@msout/runner",
   "version": "0.0.0",
   "private": true,
-  "description": "Runner sidecar: the only component that sees the credential bytes. Spawns the unmodified @msout CLIs for one session at a time.",
+  "description": "Runner sidecar: the only component that sees the credential bytes. Spawns the unmodified @msout packages for one session at a time.",
   "license": "MIT",
   "type": "commonjs",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13.0",
+    "comment": "Same floor as the api and for the same reason: node:sqlite is built in from 22.13.0 unflagged. The runner does not use SQLite today, but a floor that is lower than another component's for no stated reason is a floor that will be quoted as precedent."
   },
   "main": "dist/index.js",
   "scripts": {
@@ -18,9 +19,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@msout/microsoft-onenote-export-notebook": "0.4.0",
+    "@msout/microsoft-onenote-export-notebook": "0.5.0",
     "@msout/microsoft-onenote-list-notebooks": "0.0.7",
-    "@msout/microsoft-webauth": "0.1.9",
+    "@msout/microsoft-webauth": "0.1.11",
     "archiver": "7.0.1",
     "fastify": "5.12.5"
   },

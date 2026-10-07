@@ -203,3 +203,105 @@ func TestNoMountsMeansNoBinds(t *testing.T) {
 		t.Errorf("Binds = %v, want absent", host["Binds"])
 	}
 }
+
+// An idle runner's mounts, the shape `buildCreateRequest` produces for a pool slot
+// that has not yet been bound to a session.
+func anIdleRunnerCreate() CreateRequest {
+	req := aRunnerCreate()
+	req.Mounts = []CreateMount{
+		{Type: "tmpfs", Source: "", Destination: "/data"},
+		{Type: "bind", Source: "/srv/msout/artifacts", Destination: "/artifacts"},
+		{Type: "bind", Source: "/srv/msout/secrets/runner_token", Destination: "/run/secrets/runner_token", ReadOnly: true},
+	}
+	return req
+}
+
+// A tmpfs must reach the Engine as `HostConfig.Tmpfs`, not as a bind.
+//
+// Found on the same first real container creation, immediately after the Binds fix
+// put mounts on the wire. A tmpfs has no host source, so rendering it produced:
+//
+//	500 {"message":"invalid volume specification: ':/data'"}
+//
+// The security reason it must still work: `/data` is tmpfs precisely so a *waiting*
+// runner holds no credential-bearing host path. Refusing to mount it would mean
+// creating runners with an empty `/data`, which is the opposite of the intent.
+func TestTmpfsGoesToHostConfigTmpfsNotToBinds(t *testing.T) {
+	body := bodyOf(t, anIdleRunnerCreate())
+	host := body["HostConfig"].(map[string]any)
+
+	tmpfs, ok := host["Tmpfs"].(map[string]any)
+	if !ok {
+		t.Fatalf("HostConfig.Tmpfs = %v; /data would be left unmounted, so a waiting "+
+			"runner would hold a host path it must not hold", host["Tmpfs"])
+	}
+	if _, present := tmpfs["/data"]; !present {
+		t.Errorf("Tmpfs = %v, want a /data entry", tmpfs)
+	}
+
+	binds, _ := host["Binds"].([]any)
+	for _, b := range binds {
+		if s, _ := b.(string); strings.HasPrefix(s, ":") {
+			t.Errorf("bind %q has an empty source; the Engine rejects it outright with "+
+				"`invalid volume specification`, so the runner never starts", s)
+		}
+	}
+	if len(binds) != 2 {
+		t.Errorf("got %d binds, want 2 (the tmpfs must not be among them): %v", len(binds), binds)
+	}
+}
+
+// A tmpfs mount's own options string is the tmpfs option, not a source path. An
+// empty one still has to produce a valid tmpfs rather than an empty string the
+// Engine rejects.
+func TestTmpfsOptionsDefaultToWritable(t *testing.T) {
+	body := bodyOf(t, anIdleRunnerCreate())
+	host := body["HostConfig"].(map[string]any)
+	opts, _ := host["Tmpfs"].(map[string]any)["/data"].(string)
+	if opts == "" {
+		t.Errorf("/data tmpfs options are empty; the Engine rejects an empty " +
+			"tmpfs options string")
+	}
+}
+
+// A tmpfs with explicit options must keep them — a size limit is a control, and
+// silently dropping it in favour of Docker's default would be a real weakening.
+func TestTmpfsOptionsSurvive(t *testing.T) {
+	req := anIdleRunnerCreate()
+	req.Mounts[0].Source = "rw,size=64m"
+
+	body := bodyOf(t, req)
+	host := body["HostConfig"].(map[string]any)
+	opts, _ := host["Tmpfs"].(map[string]any)["/data"].(string)
+	if opts != "rw,size=64m" {
+		t.Errorf("/data tmpfs options = %q, want %q — a size limit is a control and "+
+			"must not be replaced by the default", opts, "rw,size=64m")
+	}
+}
+
+// A bind with no source is a misconfiguration, and must be refused by name rather
+// than rendered into `":/data"` for the Engine to reject opaquely.
+func TestABindWithNoSourceIsRefusedByName(t *testing.T) {
+	req := anIdleRunnerCreate()
+	req.Mounts[0] = CreateMount{Type: "bind", Source: "", Destination: "/data"}
+
+	c, _ := start(t)
+	_, err := c.CreateContainer(context.Background(), req, "n")
+	if err == nil {
+		t.Fatal("a bind mount with no source was accepted")
+	}
+	if !strings.Contains(err.Error(), `bind mount "/data" has no source`) {
+		t.Errorf("error %q does not name the mount; a caller cannot fix an opaque "+
+			"Engine rejection", err)
+	}
+}
+
+// A request with only bind mounts carries no `Tmpfs` key, so nothing depends on the
+// Engine treating an empty object and an absent one the same.
+func TestNoTmpfsMeansNoTmpfsKey(t *testing.T) {
+	body := bodyOf(t, aRunnerCreate())
+	host := body["HostConfig"].(map[string]any)
+	if host["Tmpfs"] != nil {
+		t.Errorf("Tmpfs = %v, want absent", host["Tmpfs"])
+	}
+}

@@ -200,6 +200,25 @@ func bindString(m CreateMount) string {
 	return spec
 }
 
+// isTmpfs reports whether a mount is a tmpfs rather than a bind.
+//
+// A tmpfs has **no host source** — the kernel provides the memory — and it cannot
+// be expressed in a bind specification. Rendering one as `":/data"` produced:
+//
+//	500 {"message":"invalid volume specification: ':/data'"}
+//
+// on the first real container creation, because idle runners mount `/data` as
+// tmpfs precisely so a waiting container holds no credential-bearing path. So the
+// distinction is made here, once, rather than by every caller remembering it.
+//
+// The test is the **type**, and deliberately not "has no source". A bind mount
+// with an empty source is a misconfiguration, and inferring tmpfs from the missing
+// source would convert that mistake into a plausible-looking container rather than
+// refusing it. Type is what the caller actually chose.
+func isTmpfs(m CreateMount) bool {
+	return m.Type == "tmpfs"
+}
+
 // RestartPolicy is the Engine's restart policy. Always "no": a runner that
 // exits is the orchestrator's to reconcile, not the daemon's to restart,
 // because a self-restarting runner would silently re-acquire its mounts.
@@ -300,12 +319,44 @@ func (c *Client) CreateContainer(ctx context.Context, req CreateRequest, name st
 	// Copy the typed mounts into the only field the Engine reads. Done here rather
 	// than by the caller so no caller can produce a container with no mounts by
 	// forgetting — which is exactly what happened, and it is silent.
+	//
+	// tmpfs entries go to `HostConfig.Tmpfs`, which is where the Engine expects
+	// them, keyed by destination. A tmpfs has no host source, so it cannot be a
+	// bind at all.
 	req.HostConfig.Binds = nil
+	// Tmpfs is left nil unless a tmpfs mount turns up, so a request with only bind
+	// mounts carries no `Tmpfs` key at all rather than an empty object.
+	usedTmpfs := false
 	for _, m := range req.Mounts {
 		if m.Destination == "" {
 			// A mount with no destination has no meaning, and rendering it would
 			// produce a specification the Engine parses as something else.
 			return CreateResponse{}, fmt.Errorf("mount %q has no destination", m.Source)
+		}
+		if !isTmpfs(m) && m.Source == "" {
+			// A bind has no meaning without a host source, and rendering it would
+			// produce `":/data"` — the specification the Engine rejects with
+			// `500 invalid volume specification`. Refused here so the cause is the
+			// caller's mount, named, rather than an opaque Engine error.
+			return CreateResponse{}, fmt.Errorf(
+				"bind mount %q has no source", m.Destination)
+		}
+		if isTmpfs(m) {
+			if !usedTmpfs {
+				if req.HostConfig.Tmpfs == nil {
+					req.HostConfig.Tmpfs = map[string]string{}
+				}
+				usedTmpfs = true
+			}
+			// The mount's own options string, or just writable. An idle runner's
+			// `/data` is tmpfs so that a waiting container holds no
+			// credential-bearing path at all.
+			opts := m.Source
+			if opts == "" {
+				opts = "rw"
+			}
+			req.HostConfig.Tmpfs[m.Destination] = opts
+			continue
 		}
 		req.HostConfig.Binds = append(req.HostConfig.Binds, bindString(m))
 	}

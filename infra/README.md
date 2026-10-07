@@ -97,23 +97,38 @@ service to refuse. The "topology already handles this" claim was true locally an
 false on the platform that matters, which is precisely what the check existed to
 catch.
 
-`capability.yml` now installs the metadata rule before asserting, so the assertion
-runs against a correctly configured host and a host that lacks the rule fails
-honestly rather than silently passing.
+`capability.yml` splits this into two checks rather than pretending one can cover
+it:
 
-**What could and could not be verified here.** The rule installs cleanly and lands
-in the right chain — confirmed on the VPS:
+- **T-N9** asserts what the *topology* denies — the gateway, the api, the
+  orchestrator. Real on every host, no firewall needed.
+- **T-N10** asserts the metadata service, and reports **which of three states** it is
+  in: rule installed and blocked (a real assertion), rule installed and still
+  reachable (a failure — the rule is not working), or **not asserted** because the
+  host cannot install one.
+
+That third state is the honest one on a CI runner without `NET_ADMIN`. Making it
+pass would be vacuous. Making it fail would produce a check that can never go
+green, which is how a check gets disabled and the property is lost for real. **The
+control that matters is the VPS rule; T-N10 is its regression test, not its
+definition.**
+
+**What was verified here.** The rule installs and lands in the right chain, and
+`iptables -C` detects it, on the VPS:
 
 ```
 -A DOCKER-USER -s 172.26.0.0/16 -d 169.254.169.254/32 -j DROP
 ```
 
-Removing it again leaves `DOCKER-USER` back to just `-j RETURN`. But **the
-fail-open half could not be demonstrated on the VPS**, because that host has no
-metadata service to reach: the probe is blocked with and without the rule. The
-demonstration that the rule is load-bearing is GitHub's runner, where T-N9 went red
-without it. Both hosts are now clean — the probe network and container were removed
-and the VPS chain restored.
+Removing it restores `DOCKER-USER` to only `-j RETURN`. T-N9's three topology
+denies pass from a live container. T-N10's "no rule" path reports NOT ASSERTED and
+exits 0, verified by running the step verbatim.
+
+**Not verified:** that the rule changes the answer *on the VPS*. That host has no
+metadata service, so the probe is blocked with and without it. The demonstration
+that the rule is load-bearing is GitHub's runner, where the metadata service answers
+from a container and T-N9 went red. Both hosts were left clean — probe containers
+and networks removed, the VPS chain restored.
 
 ## The host name is written down once
 

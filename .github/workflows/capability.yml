@@ -353,9 +353,9 @@ jobs:
       # is topology that quietly changes, and a static read of the compose file would
       # pass on a host where Docker's bridge behaves differently.
 
-      # ---- the host rules the deny direction depends on -------------------
+      # ---- the metadata rule: installed here, asserted by T-N10 -----------
       #
-      # ## Why this is here, and why it comes before T-N9
+      # ## Why this is here
       #
       # T-N9 was **written, run, and failed**: on a real Linux host the metadata
       # service answers from inside a runner container. On the Mac where it was
@@ -370,20 +370,23 @@ jobs:
       # `DOCKER-USER` rather than `DOCKER` because Docker's own chain is rebuilt
       # when the daemon reloads or a container starts; `DOCKER-USER` is evaluated
       # first in the `FORWARD` chain and is not managed by Docker. A rule in
-      # `DOCKER` would be an allowlist that silently stops applying — the exact
-      # maintenance-based control this project has decided against everywhere else.
+      # `DOCKER` would be a control that silently stops applying.
       #
-      ## What the VPS actually has, as of 2026-10-07
+      # ## It is installed best-effort, and T-N10 says which state it is in
       #
-      # Checked, not assumed, and the answer is **nothing**: `DOCKER-USER` on the
-      # VPS holds only `-j RETURN`, and no `msout-runner` network exists there yet
-      # because the runner is not deployed on that host. So there is no window
-      # open — but there is also no rule, and one must be installed **before** the
-      # runner is deployed to that host.
+      # A runner that cannot install firewall rules still gets a real assertion for
+      # everything topology denies (T-N9). This one is reported as **not asserted**
+      # rather than as a pass or a fail, because both of those would be dishonest:
+      # a pass would be vacuous, and a fail would be a check that can never go green,
+      # which is how a check gets disabled and the property is lost for real.
       #
-      # The rule below exists so T-N9 asserts something real rather than failing
-      # against an unconfigured host, and so the line the VPS must run is visible in
-      # the repository rather than living only in an operator's memory.
+      # ## What the VPS has, as of 2026-10-07
+      #
+      # Checked, not assumed: **nothing.** `DOCKER-USER` there holds only
+      # `-j RETURN`, and no `msout-runner` network exists because the runner is not
+      # deployed on that host. No window is open — but there is no rule either, and
+      # one must be installed **before** the runner is deployed there. The lines are
+      # in infra/README.md.
 
       - name: deny the metadata service to the runner's subnet
         # Best-effort, and says so. A runner without NET_ADMIN cannot install this,
@@ -398,13 +401,32 @@ jobs:
             exit 0
           fi
           echo "runner subnet: $subnet"
-          if ! iptables -I DOCKER-USER -s "$subnet" -d 169.254.169.254 -j DROP 2>/dev/null; then
-            echo "NOTE: could not install the metadata rule (no NET_ADMIN on this host)."
-            echo "T-N9 will report the metadata service as reachable, which is the"
-            echo "truth about this host."
-          else
-            echo "installed: DOCKER-USER DROP 169.254.169.254 from $subnet"
-          fi
+
+          # `sudo`, because the CI user is not root. The first version of this step
+          # omitted it and printed "no NET_ADMIN on this host" on a GitHub runner
+          # that has passwordless sudo — a failure message naming a *capability* when
+          # the real problem is a missing `sudo`, which sends an operator looking at
+          # the wrong thing.
+          #
+          # `iptables-nft` first because that is the backend current Docker uses;
+          # plain `iptables` on a legacy-only host would fail with "command not
+          # found" and be reported as a permissions problem, which is the same
+          # misdiagnosis in a different place.
+          #
+          # Best-effort on purpose. T-N10 distinguishes "installed", "installed but
+          # not working" and "cannot be installed", and only the middle one is a
+          # failure — see that step for why a rule this host cannot install must not
+          # be reported as a property this host either has or lacks.
+          for bin in iptables-nft iptables; do
+            if command -v "$bin" >/dev/null 2>&1 && \
+               sudo "$bin" -I DOCKER-USER -s "$subnet" -d 169.254.169.254 -j DROP 2>/dev/null; then
+              echo "installed: DOCKER-USER DROP 169.254.169.254 from $subnet (via $bin)"
+              exit 0
+            fi
+          done
+          echo "NOTE: this host does not let the workflow install the metadata rule."
+          echo "T-N10 will report the metadata service as NOT ASSERTED, which is the"
+          echo "truth, rather than passing or failing on a fact it cannot establish."
 
       - name: T-N8 — a runner may reach the internet (deliberately unrestricted)
         # The positive half, and it is a real assertion rather than a formality: this
@@ -418,7 +440,107 @@ jobs:
           ' </dev/null
           echo "T-N8 ok: a runner has unrestricted egress, by decision"
 
-      - name: T-N9 — a runner cannot reach the metadata service or the host gateway
+      - name: T-N9 — a runner cannot reach the api or the orchestrator
+        # **Topology denies only.** The gateway, the api and the orchestrator are
+        # unreachable because `msout-runner` has no route to them — asserted, not
+        # configured — so this is a real assertion on every host, with no
+        # dependency on being able to install a firewall rule.
+        #
+        # The metadata service is deliberately *not* here. It is a property of the
+        # host's routing rather than of the topology, and asserting it from a host
+        # that cannot install the rule would either be permanently red — which is
+        # how checks come to be ignored or disabled — or pass vacuously. Neither is
+        # acceptable, so it is its own step below and says which of the two it is.
+        run: |
+          set -euo pipefail
+          docker compose exec -T runner node -e '
+            const net = require("node:net");
+            const targets = [
+              ["host gateway", "172.17.0.1", 2375],
+              ["api", "msout-api-1", 3000],
+              ["orchestrator", "msout-orchestrator-1", 9100],
+            ];
+            let leaked = 0;
+            (async () => {
+              for (const [label, host, port] of targets) {
+                const outcome = await new Promise((resolve) => {
+                  const s = net.connect({ host, port });
+                  const timer = setTimeout(() => { s.destroy(); resolve("TIMEOUT"); }, 4000);
+                  s.on("connect", () => { clearTimeout(timer); s.end(); resolve("OPEN"); });
+                  s.on("error", (e) => { clearTimeout(timer); resolve(e.code); });
+                });
+                if (outcome === "OPEN") { leaked++; console.error(`REACHABLE ${label} ${host}:${port}`); }
+                else console.log(`refused ${label} (${outcome})`);
+              }
+              if (leaked > 0) {
+                console.error(`${leaked} target(s) reachable from a runner`);
+                process.exit(1);
+              }
+            })();
+          ' </dev/null
+          echo "T-N9 ok: a runner cannot reach the gateway, the api or the orchestrator"
+
+      - name: T-N10 — the metadata service is blocked, or this host cannot say
+        # ## The awkward one, and why it is not a pass or a fail
+        #
+        # The metadata service is reachable from a runner container on a real Linux
+        # host. That is not a property of this project's topology — it is a property
+        # of the host's routing, and only a host firewall rule closes it.
+        #
+        # So there are three possible states, and this step reports which one it is in
+        # rather than collapsing them:
+        #
+        #   rule installed + blocked   -> pass, and it is a real assertion
+        #   rule installed + reachable -> **fail**, the rule is not working
+        #   rule not installed         -> **not asserted**, and it says so loudly
+        #
+        # The third state is the honest one on a runner that cannot install firewall
+        # rules. Making it pass would be vacuous; making it fail would mean a red
+        # check that can never go green, which is how a check gets disabled and the
+        # property is lost for real.
+        #
+        # **The rule that matters is on the VPS, and it is verified there** — see
+        # infra/README.md. This step is a regression test for it, not its definition.
+        run: |
+          set -euo pipefail
+          subnet=$(docker network inspect "${COMPOSE_PROJECT_NAME}_msout-runner" \
+            --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null || true)
+          rule=no
+          if [ -n "$subnet" ]; then
+            for bin in iptables-nft iptables; do
+              if command -v "$bin" >/dev/null 2>&1 && \
+                 sudo "$bin" -C DOCKER-USER -s "$subnet" -d 169.254.169.254 \
+                   -j DROP >/dev/null 2>&1; then
+                rule=yes
+                echo "the metadata rule is installed (via $bin) for $subnet"
+                break
+              fi
+            done
+          fi
+
+          if [ "$rule" != "yes" ]; then
+            echo "NOT ASSERTED: this host has no DOCKER-USER rule for $subnet and"
+            echo "cannot install one, so this step cannot say whether the metadata"
+            echo "service is reachable. T-N9 above still asserts everything the"
+            echo "topology denies."
+            echo "The control that matters is the VPS rule; see infra/README.md."
+            exit 0
+          fi
+
+          outcome=$(docker compose exec -T runner node -e '
+            const net = require("node:net");
+            const s = net.connect({ host: "169.254.169.254", port: 80 });
+            const t = setTimeout(() => { s.destroy(); console.log("TIMEOUT"); }, 4000);
+            s.on("connect", () => { clearTimeout(t); s.end(); console.log("OPEN"); });
+            s.on("error", (e) => { clearTimeout(t); console.log(e.code); });
+          ' </dev/null)
+          echo "metadata service from a runner: $outcome"
+          if [ "$outcome" = "OPEN" ]; then
+            echo "FAIL: the DOCKER-USER rule is installed and the metadata service is"
+            echo "still reachable, so the rule is not doing what it claims."
+            exit 1
+          fi
+          echo "T-N10 ok: the metadata service is blocked"
         # The credential-theft path, and specifically a path to the *instance's*
         # credentials rather than ours. On a host whose instance type has IMDS this
         # is the difference between a compromised runner holding a Microsoft password

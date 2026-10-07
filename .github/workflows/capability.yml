@@ -286,6 +286,20 @@ jobs:
       # per session in production and this needs one standing to inspect. The
       # container is never given a credential in this suite — the assertions are
       # about what it *can* reach, not about a login.
+      #
+      # ## Every `docker compose exec` below closes its stdin
+      #
+      # `docker compose exec` attaches stdin by default and **drains it**, so any
+      # line after one is swallowed: the step runs to what looks like its end,
+      # exits 0, and reports success having skipped every assertion after the
+      # exec. It is the worst shape a check can have — silent, and green.
+      #
+      # Found by running the steps locally with a heredoc, where the script
+      # *is* stdin. GitHub Actions writes the run block to a file and its stdin is
+      # not connected, which is why this was invisible in CI and why the existing
+      # steps in this file were never bitten. `</dev/null` on every exec closes
+      # it in both environments, and the final `echo … ok` of each step is kept so
+      # a truncated step is visible in the log rather than inferred from rc=0.
 
       - name: start one runner and wait for it to be healthy
         run: |
@@ -354,17 +368,28 @@ jobs:
             echo "$target is a $kind mount"
             test "$kind" = "volume" || { echo "FAIL: $target is not a named volume"; exit 1; }
           done
-          docker compose exec -T runner sh -c 'test ! -S /var/run/docker.sock' \
+          docker compose exec -T runner sh -c 'test ! -S /var/run/docker.sock' </dev/null \
             || { echo "FAIL: the runner can see a docker socket"; exit 1; }
           echo "T-X-R2 ok"
 
       - name: T-X-R3 — the runner publishes no port and is not on the control network
         # Unreachable from the host, and not one compromise away from the api.
+        #
+        # The port check reads `HostConfig.PortBindings` rather than
+        # `docker compose port`. The latter resolves `EXPOSE 3100` from the
+        # Dockerfile and prints `:0` — empty host port, but not an empty string —
+        # so a `-z` test on its output reports a published port for a service that
+        # publishes none. That is what the first version of this step did, and it
+        # went red on a correct configuration.
         run: |
           set -euo pipefail
-          ports=$(docker compose port runner 3100 2>/dev/null || true)
-          test -z "$ports" || { echo "FAIL: the runner publishes $ports"; exit 1; }
           cid=$(docker compose ps -q runner)
+          bindings=$(docker inspect -f '{{json .HostConfig.PortBindings}}' "$cid")
+          echo "runner port bindings: $bindings"
+          if [ "$bindings" != "null" ] && [ "$bindings" != "{}" ]; then
+            echo "FAIL: the runner publishes a port"
+            exit 1
+          fi
           for net in $(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$cid"); do
             echo "runner is on $net"
             case "$net" in
@@ -372,6 +397,12 @@ jobs:
                 echo "FAIL: the runner is on the control/edge network"; exit 1 ;;
             esac
           done
+          # ...and it is on exactly one network. A runner that had joined nothing
+          # would be unreachable, which the orchestrator would discover at claim
+          # time rather than here.
+          count=$(docker inspect -f '{{len .NetworkSettings.Networks}}' "$cid")
+          echo "runner network count: $count"
+          test "$count" -ge 1 || { echo "FAIL: the runner is on no network at all"; exit 1; }
           echo "T-X-R3 ok"
 
       - name: the runner answers /healthz and nothing else without a token
@@ -382,14 +413,14 @@ jobs:
           set -euo pipefail
           code=$(docker compose exec -T runner node -e '
             fetch("http://127.0.0.1:3100/healthz").then(async r => { console.log(r.status); });
-          ')
+          ' </dev/null)
           echo "healthz without a token: $code"
           test "$code" = "200" || { echo "FAIL: /healthz needs a token; the orchestrator health check cannot work"; exit 1; }
           for path in /events "/sessions/3f2504e0-4f89-41d3-9a0c-0305e82c3301/login"; do
             code=$(docker compose exec -T runner node -e "
               fetch('http://127.0.0.1:3100${path}', { method: 'POST', body: 'x' })
                 .then(r => { console.log(r.status); }).catch(e => { console.log('err'); });
-            ")
+            " </dev/null)
             echo "$path without a token: $code"
             test "$code" = "401" || { echo "FAIL: $path answered $code without a token"; exit 1; }
           done
@@ -414,7 +445,7 @@ jobs:
             const probe = app.buildApp(cfg, (r) => seen.push(
               `${Array.isArray(r.method) ? r.method.join(",") : r.method} ${r.url}`));
             probe.ready().then(() => { console.log(seen.join("\n")); return probe.close(); });
-          ')
+          ' </dev/null)
           echo "$routes"
           count=$(printf '%s' "$routes" | grep -c . || true)
           test "$count" -ge 8 || { echo "FAIL: the runner reported only $count routes"; exit 1; }

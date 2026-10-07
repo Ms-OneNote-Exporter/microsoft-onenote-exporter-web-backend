@@ -20,7 +20,9 @@
   "dependencies": {
     "fastify": "5.12.5"
   },
+  "devDependenciesComment": "@msout/microsoft-webauth is a devDependency, and only for one thing: tests/login-failures.test.ts imports its exported LOGIN_REASONS, so this api's transcription of that union is checked against the real one instead of drifting from it. It is deliberately not a runtime dependency. This api never loads Playwright, and pulling the package in to obtain an array of thirteen strings would put a browser-sized dependency tree in the component that must not have one - the runner owns Playwright, not the api. A test may depend on it; the service may not. See src/login-failures.ts.",
   "devDependencies": {
+    "@msout/microsoft-webauth": "0.1.11",
     "@types/node": "22.13.5",
     "tsx": "4.19.3",
     "typescript": "5.7.3",

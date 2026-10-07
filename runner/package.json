@@ -31,5 +31,9 @@
     "tsx": "4.19.3",
     "typescript": "5.7.3",
     "vitest": "5.0.3"
+  },
+  "overridesComment": "esbuild is pinned to 0.25.x, the version the api's lockfile already resolves. Without this, npm hoists esbuild 0.28.2 at the top level and then tries to install its @esbuild/aix-ppc64 optional dependency on linux/arm64, which fails with EBADPLATFORM — so `npm ci` cannot complete in the image and the build dies before it reaches any of this file's own checks. tsx and vitest both accept 0.25; nothing needs 0.28. The api resolved 0.25.x only because it has no top-level esbuild of its own, and a runner that pins archiver pulls a different hoisting outcome out of the same tsx.",
+  "overrides": {
+    "esbuild": "0.25.12"
   }
 }

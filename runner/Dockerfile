@@ -99,16 +99,14 @@ COPY --from=build /app/dist ./dist
 # archiver and the three packages. What it *can* assert is that the set is
 # exactly what it expects, so a dependency added by accident is caught at build
 # time rather than discovered in a supply-chain review three months later.
-RUN node -e '
-  const want = ["@msout/microsoft-onenote-export-notebook", "@msout/microsoft-onenote-list-notebooks",
-                "@msout/microsoft-webauth", "archiver", "fastify"];
-  const got = Object.keys(require("./package.json").dependencies).sort();
-  if (JSON.stringify(got) !== JSON.stringify(want)) {
-    console.error("runtime dependency set changed:", got, "expected", want);
-    process.exit(1);
-  }
-  console.log("runtime dependency set is as expected");
-'
+# Written as a `node -p` one-liner rather than a multi-line `node -e "…"`.
+# A quoted string does not continue across lines in a Dockerfile RUN — the parser
+# treats each line as a new instruction — so the multi-line form fails with
+# `unknown instruction: const`. Exactly the mistake the api's Dockerfile already
+# documents and works around; recorded here because it is the same trap and this
+# file is new.
+RUN test "$(node -p "Object.keys(require('./package.json').dependencies).sort().join(',')")" = "@msout/microsoft-onenote-export-notebook,@msout/microsoft-onenote-list-notebooks,@msout/microsoft-webauth,archiver,fastify" \
+ && echo "runtime dependency set is as expected"
 
 EXPOSE 3100
 

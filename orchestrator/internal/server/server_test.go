@@ -531,13 +531,14 @@ func TestRouteTableIsExactlyTheVerbSet(t *testing.T) {
 	table := srv.routeTable()
 
 	want := map[string][]string{
-		"/claim":   {http.MethodPost},
-		"/release": {http.MethodPost},
-		"/recycle": {http.MethodPost},
-		"/remove":  {http.MethodPost},
-		"/stat":    {http.MethodPost},
-		"/stats":   {http.MethodGet},
-		"/healthz": {http.MethodGet},
+		"/claim":    {http.MethodPost},
+		"/release":  {http.MethodPost},
+		"/recycle":  {http.MethodPost},
+		"/remove":   {http.MethodPost},
+		"/stat":     {http.MethodPost},
+		"/stats":    {http.MethodGet},
+		"/healthz":  {http.MethodGet},
+		"/finalize": {http.MethodPost},
 	}
 
 	if len(table) != len(want) {
@@ -573,6 +574,12 @@ func TestRequestSchemasHoldOnlyIdentifiers(t *testing.T) {
 		{"slotRequest", slotRequest{}, []string{"slotId"}},
 		{"recycleRequest", recycleRequest{}, []string{"slotId", "reason"}},
 		{"statRequest", statRequest{}, []string{"artifactId"}},
+		// `partial` is a boolean, not an identifier. It is the one field on any
+		// verb that is not an id, and it is asserted here explicitly so adding it
+		// was a visible act: it selects the `.partial.zip` name and writes the
+		// marker, so it is a claim about an export rather than a pointer to one.
+		// Nothing about the filesystem comes from it — no path, no size.
+		{"finalizeRequest", finalizeRequest{}, []string{"artifactId", "sessionGuid", "partial"}},
 	}
 	for _, tc := range cases {
 		got := jsonFieldNames(tc.value)

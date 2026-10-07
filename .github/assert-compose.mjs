@@ -284,6 +284,30 @@ check(
     "has no route to the internet; remove it and use msout-runner-api instead",
 );
 
+// The runner's egress network must be UNRESTRICTED.
+//
+// The opposite assertion to the ones above, and deliberately so. A runner has to
+// be able to log in wherever Microsoft decides to host the login, because an
+// allowlist fails *silently* the day Microsoft changes a hostname — no error, no
+// failing test, just sign-in that stopped working. That is a worse failure than
+// one extra host being reachable.
+//
+// So this asserts the network is a plain bridge with no policy attached, rather
+// than asserting a list of permitted hosts. It also would not be possible to
+// assert such a list here: compose cannot enforce one, which is the whole reason
+// the choice is unrestricted egress plus topology-based denies.
+//
+// The denies are asserted in capability.yml against running containers (T-N9),
+// because the ones that matter — the metadata service, the host gateway — are
+// properties of the host's routing rather than of this file.
+check(
+  !("internal" in (cfg.networks?.["msout-runner"] ?? {})),
+  "msout-runner has egress (not internal)",
+  "FAIL: msout-runner is internal, so a runner cannot reach the internet and every " +
+    "login will fail. Do not fix this with an allowlist — see the comment on this " +
+    "network in docker-compose.yml",
+);
+
 // ...and not on the orchestrator's network either, for the same reason: it would
 // be a step from the api to the only process holding the Docker socket.
 check(

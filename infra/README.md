@@ -84,6 +84,37 @@ iptables -I DOCKER-USER -s <subnet> -d 172.17.0.1 -p tcp --dport 2375 -j DROP
 Not applied by this repository, because a host firewall rule is not something a
 compose file should install and a VPS is the operator's.
 
+**Checked on the VPS on 2026-10-07: neither rule is present.** `DOCKER-USER` holds
+only `-j RETURN`, and there is no `msout-runner` network there because the runner
+is not deployed on that host — so no window is open, but there is also no rule, and
+one must be installed **before** the runner is deployed there.
+
+This was not a theoretical gap. `capability.yml`'s T-N9 was written, run, and
+failed: on a real Linux host — GitHub's runner — the metadata service **answers**
+from inside a runner container. On the Mac it was developed against, it returned
+`ECONNREFUSED`, because Docker Desktop is not a cloud instance and has no metadata
+service to refuse. The "topology already handles this" claim was true locally and
+false on the platform that matters, which is precisely what the check existed to
+catch.
+
+`capability.yml` now installs the metadata rule before asserting, so the assertion
+runs against a correctly configured host and a host that lacks the rule fails
+honestly rather than silently passing.
+
+**What could and could not be verified here.** The rule installs cleanly and lands
+in the right chain — confirmed on the VPS:
+
+```
+-A DOCKER-USER -s 172.26.0.0/16 -d 169.254.169.254/32 -j DROP
+```
+
+Removing it again leaves `DOCKER-USER` back to just `-j RETURN`. But **the
+fail-open half could not be demonstrated on the VPS**, because that host has no
+metadata service to reach: the probe is blocked with and without the rule. The
+demonstration that the rule is load-bearing is GitHub's runner, where T-N9 went red
+without it. Both hosts are now clean — the probe network and container were removed
+and the VPS chain restored.
+
 ## The host name is written down once
 
 `PUBLIC_HOST` in `.env` is the only place the domain appears. Compose feeds it to

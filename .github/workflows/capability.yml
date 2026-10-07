@@ -353,6 +353,59 @@ jobs:
       # is topology that quietly changes, and a static read of the compose file would
       # pass on a host where Docker's bridge behaves differently.
 
+      # ---- the host rules the deny direction depends on -------------------
+      #
+      # ## Why this is here, and why it comes before T-N9
+      #
+      # T-N9 was **written, run, and failed**: on a real Linux host the metadata
+      # service answers from inside a runner container. On the Mac where it was
+      # developed it returned `ECONNREFUSED` — Docker Desktop is not a cloud
+      # instance and has no metadata service to refuse.
+      #
+      # So the "topology already handles this" claim was true locally and false on
+      # the only platform that matters. That is the failure mode this file exists to
+      # catch, and it is worth recording that a check written from a workstation
+      # proved nothing about a VPS.
+      #
+      # `DOCKER-USER` rather than `DOCKER` because Docker's own chain is rebuilt
+      # when the daemon reloads or a container starts; `DOCKER-USER` is evaluated
+      # first in the `FORWARD` chain and is not managed by Docker. A rule in
+      # `DOCKER` would be an allowlist that silently stops applying — the exact
+      # maintenance-based control this project has decided against everywhere else.
+      #
+      ## What the VPS actually has, as of 2026-10-07
+      #
+      # Checked, not assumed, and the answer is **nothing**: `DOCKER-USER` on the
+      # VPS holds only `-j RETURN`, and no `msout-runner` network exists there yet
+      # because the runner is not deployed on that host. So there is no window
+      # open — but there is also no rule, and one must be installed **before** the
+      # runner is deployed to that host.
+      #
+      # The rule below exists so T-N9 asserts something real rather than failing
+      # against an unconfigured host, and so the line the VPS must run is visible in
+      # the repository rather than living only in an operator's memory.
+
+      - name: deny the metadata service to the runner's subnet
+        # Best-effort, and says so. A runner without NET_ADMIN cannot install this,
+        # and T-N9 will then fail on the metadata service — which is the correct
+        # outcome, because it means the host genuinely lacks the rule.
+        run: |
+          set -euo pipefail
+          subnet=$(docker network inspect "${COMPOSE_PROJECT_NAME}_msout-runner" \
+            --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null || true)
+          if [ -z "$subnet" ]; then
+            echo "the runner network does not exist yet; nothing to harden"
+            exit 0
+          fi
+          echo "runner subnet: $subnet"
+          if ! iptables -I DOCKER-USER -s "$subnet" -d 169.254.169.254 -j DROP 2>/dev/null; then
+            echo "NOTE: could not install the metadata rule (no NET_ADMIN on this host)."
+            echo "T-N9 will report the metadata service as reachable, which is the"
+            echo "truth about this host."
+          else
+            echo "installed: DOCKER-USER DROP 169.254.169.254 from $subnet"
+          fi
+
       - name: T-N8 — a runner may reach the internet (deliberately unrestricted)
         # The positive half, and it is a real assertion rather than a formality: this
         # is the property the whole decision trades against the deny direction, so if

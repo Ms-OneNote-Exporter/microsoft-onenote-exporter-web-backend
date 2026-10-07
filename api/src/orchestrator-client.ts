@@ -113,6 +113,20 @@ export interface OrchestratorStats {
    * that as an unseedable pool rather than as an empty one — see `syncPool`.
    */
   readonly slotIds?: readonly string[];
+
+  /**
+   * Why the last pool top-up failed, when it did.
+   *
+   * Optional because an orchestrator predating the field simply does not report it.
+   * Absent is **not** read as "healthy": a pool with no idle slot and no reported
+   * fault is still a pool that cannot currently serve anyone, and the distinction
+   * this enables is between "wait" and "escalate", not between "working" and
+   * "broken".
+   */
+  readonly fillError?: string;
+
+  /** Consecutive failed top-up attempts, when there has been one. */
+  readonly fillFailures?: number;
 }
 
 /** Errors the orchestrator's HTTP surface can produce, as typed results. */
@@ -123,7 +137,7 @@ export type OrchestratorResult<T> =
 /** An orchestrator failure, classified so callers can react correctly. */
 export type OrchestratorError =
   | { readonly kind: "unauthorized"; readonly status: number }
-  | { readonly kind: "pool-exhausted" }
+  | { readonly kind: "pool-exhausted"; readonly fillError?: string }
   | { readonly kind: "conflict"; readonly status: number }
   | { readonly kind: "unreachable"; readonly cause: string }
   | { readonly kind: "unexpected"; readonly status: number; readonly body: string };
@@ -237,7 +251,26 @@ export class OrchestratorClient implements OrchestratorApi {
         return { ok: false, error: { kind: "unauthorized", status: response.status } };
       }
       if (response.status === 503) {
-        return { ok: false, error: { kind: "pool-exhausted" } };
+        // Carry the orchestrator's reason through, when it reported one. A 503
+        // without it is a pool that is merely full; a 503 with it is a pool that
+        // cannot fill at all, and the two call for different user-facing advice.
+        let fillError: string | undefined;
+        try {
+          const parsed = JSON.parse(text) as { fillError?: unknown };
+          if (typeof parsed.fillError === "string" && parsed.fillError !== "") {
+            fillError = parsed.fillError;
+          }
+        } catch {
+          // A 503 with an unparseable body is still a 503. No fillError, so it
+          // reads as the plain case.
+        }
+        // Built conditionally rather than with an explicit `undefined`, because
+        // `exactOptionalPropertyTypes` treats `fillError: undefined` as a
+        // different value from an absent key — and "the orchestrator did not
+        // report a reason" must stay distinguishable from "the reason is empty".
+        return fillError === undefined
+          ? { ok: false, error: { kind: "pool-exhausted" } }
+          : { ok: false, error: { kind: "pool-exhausted", fillError } };
       }
       if (response.status === 409) {
         return { ok: false, error: { kind: "conflict", status: 409 } };

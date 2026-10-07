@@ -142,7 +142,19 @@ export class PoolBinder {
     session: SessionRow,
   ): Promise<
     | { ok: true; runnerId: string; containerId: string; runnerUrl: string | null }
-    | { ok: false; reason: "pool-exhausted" | "orchestrator-unreachable" }
+    | {
+        ok: false;
+        reason: "pool-exhausted" | "orchestrator-unreachable";
+        /**
+         * Why the pool could not fill, when the orchestrator said.
+         *
+         * The distinction is between "busy, try shortly" and "cannot start runners
+         * at all", and it is the difference between a user waiting and an operator
+         * being paged. Found by deploying to a host where every create failed: the
+         * api said *every session is busy* for hours while `healthz` said `ok`.
+         */
+        fillError?: string;
+      }
   > {
     const now = this.#now();
 
@@ -150,6 +162,26 @@ export class PoolBinder {
       // Pool exhaustion. §2.6: the caller shows the earliest of
       // (idle_expires_at, expires_at) minus now, or says plainly that every
       // session is busy rather than showing a countdown that will not move.
+      //
+      // The orchestrator is asked *why* before answering, because "busy" and
+      // "cannot fill at all" are different advice and only one of them clears by
+      // waiting. Found by deploying to a host where every container create failed:
+      // the api said *every session is busy* for as long as the pool stayed empty,
+      // while `/healthz` said `ok` and every CI job passed.
+      const stats = await this.#orchestrator.stats();
+      const fillError =
+        stats.ok && typeof stats.value.fillError === "string" ? stats.value.fillError : undefined;
+      if (fillError !== undefined) {
+        // `warn`, not `error`, and `SweeperLog` has no `error` — which is the right
+        // shape here. The binder retries every sweep, so this is not a dead end;
+        // it is a condition an operator must fix. Widening the interface to add
+        // `error` would blur "the sweeper gave up" with "look at this".
+        this.#log.warn("pool cannot fill", {
+          session: session.guid,
+          cause: fillError,
+        });
+        return { ok: false, reason: "pool-exhausted", fillError };
+      }
       this.#log.info("pool exhausted", { session: session.guid });
       return { ok: false, reason: "pool-exhausted" };
     }

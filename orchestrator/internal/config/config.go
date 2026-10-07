@@ -84,6 +84,21 @@ type Config struct {
 	// property: no request field can change it.
 	RunnerPort int
 
+	// RunnerNanoCpus is the CPU allowance in a runner's create request, in
+	// billionths of a CPU — 2e9 is two cores, matching POC §18.
+	//
+	// Configurable because a hardcoded 2 made this component **undeployable** on a
+	// host with fewer than two cores: the Engine rejects the whole create request
+	// with `Range of CPUs is from 0.01 to 1.00, as there are only N CPUs
+	// available`, so every slot fails to fill and the pool stays empty. That was
+	// found by deploying to a 1-CPU VPS, not by reading the code.
+	//
+	// It stays deploy-time config rather than being clamped to the host's CPU
+	// count, for the reason everything else here is: a value this component
+	// silently rewrites is a misconfiguration nobody is told about. If it is wrong
+	// the create fails loudly, which is the right failure for a capacity setting.
+	RunnerNanoCpus int64
+
 	// RunnerTokenFile is the host path of the bearer token each runner mounts
 	// read-only, and which it requires in order to start.
 	//
@@ -156,6 +171,8 @@ func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (*C
 		// reaches them.
 		RunnerControlNetwork: envOr(getenv, "ORCH_RUNNER_CONTROL_NETWORK", "msout-runner-api"),
 		RunnerPort:           3100,
+		// POC §18's two cores. Deploy-time only, for the reason on the field.
+		RunnerNanoCpus: 2_000_000_000,
 		// Next to the orchestrator's own secret, by convention. Not derived from
 		// ORCH_HMAC_SECRET_FILE: it is a different secret with a different
 		// audience, and coupling them would mean rotating one rotates the other.
@@ -197,6 +214,22 @@ func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (*C
 			return nil, fmt.Errorf("orchestrator: ORCH_REPLAY_WINDOW_SECONDS must be positive, got %d", n)
 		}
 		cfg.ReplayWindow = time.Duration(n) * time.Second
+	}
+
+	if v := strings.TrimSpace(getenv("ORCH_RUNNER_NANO_CPUS")); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("orchestrator: ORCH_RUNNER_NANO_CPUS %q is not an integer", v)
+		}
+		// 10 000 is one hundredth of a core, which is the Engine's own floor — a
+		// request below it is rejected with `Range of CPUs is from 0.01`, so the
+		// bound is checked here rather than discovered on every pool top-up.
+		if n < 10_000 {
+			return nil, fmt.Errorf(
+				"orchestrator: ORCH_RUNNER_NANO_CPUS %d is below the Docker minimum of 10000 (0.01 of a core)",
+				n)
+		}
+		cfg.RunnerNanoCpus = n
 	}
 
 	if v := strings.TrimSpace(getenv("ORCH_POOL_SIZE")); v != "" {

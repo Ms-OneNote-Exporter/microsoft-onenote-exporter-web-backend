@@ -105,8 +105,12 @@ func (p *Pool) buildCreateRequest(slotID, containerID, sessionGUID string, sessi
 			// MemorySwap pinned equal to Memory so a runaway cannot silently
 			// swap. It gets OOM-killed instead, which is a visible failure
 			// rather than a slow one.
-			MemorySwap:  2560 << 20,
-			NanoCpus:    2e9,
+			MemorySwap: 2560 << 20,
+			// Deploy-time, not a constant. See config.RunnerNanoCpus: a hardcoded
+			// 2e9 made this component refuse to create any container at all on a
+			// host with fewer than two cores, so the pool stayed permanently empty
+			// and the api reported the result as "every session is busy".
+			NanoCpus:    p.cfg.RunnerNanoCpus,
 			PidsLimit:   &pidsLimit,
 			CapDrop:     []string{"ALL"},
 			SecurityOpt: []string{"no-new-privileges"},

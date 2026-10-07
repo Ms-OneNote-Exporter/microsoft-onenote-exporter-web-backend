@@ -435,7 +435,12 @@ func TestInternalErrorDoesNotLeakInternals(t *testing.T) {
 // The pool's sentinel errors map to statuses `api` acts on differently.
 func TestPoolErrorsMapToActionableStatuses(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := &Server{log: log}
+	// A real pool, because the ErrNoSlot branch now asks it whether a top-up
+	// failed. The previous `&Server{log: log}` left `pool` nil and would have
+	// panicked the moment that branch was taken — which is the test failing for
+	// the right reason, but only once the code it guards exists.
+	_, _, cfg := newTestServer(t)
+	srv := New(cfg, pool.New(cfg, nil, log), log, nil)
 
 	cases := []struct {
 		err    error

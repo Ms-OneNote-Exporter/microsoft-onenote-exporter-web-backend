@@ -126,6 +126,16 @@ type Pool struct {
 	// would keep one container warm and leave the rest cold.
 	randMu sync.Mutex
 	rnd    *rand.Rand
+
+	// lastFillErr is why the most recent EnsurePool could not create a container,
+	// and fillFailureCount how many attempts in a row have failed. Both cleared by
+	// a successful top-up.
+	//
+	// They exist because a pool that cannot fill is indistinguishable from a busy
+	// one through the slot list, and the difference matters: one clears by waiting
+	// and the other never clears at all. See Stats.FillError.
+	lastFillErr      error
+	fillFailureCount int
 }
 
 // New returns a pool. It does not touch Docker; call Reconcile or EnsurePool.
@@ -177,6 +187,24 @@ type Stats struct {
 	//
 	// mac's review, and he put the alternative's failure mode better than I did.
 	SlotIDs []string `json:"slotIds"`
+
+	// FillError is why the last pool top-up failed, when it did. Absent when the
+	// pool is healthy, so a consumer can tell "no fault" from "no information".
+	//
+	// The api turns this into the difference between "every session is busy" — wait
+	// and it may clear — and "the control plane cannot start runners" — waiting is
+	// pointless and an operator is needed. Both are 503; only one of them is true.
+	//
+	// A string rather than a code because there is no enumeration to agree on: the
+	// cause is whatever the Engine said, and inventing a code for each would be a
+	// vocabulary maintained on both sides of a boundary, which is how the three
+	// silent failures in runner.go and index.ts happened.
+	FillError string `json:"fillError,omitempty"`
+
+	// FillFailures counts consecutive failed top-up attempts. Present so a consumer
+	// can distinguish one blip from a pool that has been unable to fill for minutes,
+	// which is the difference between retrying and escalating.
+	FillFailures int `json:"fillFailures,omitempty"`
 }
 
 // Stats summarises the pool.
@@ -192,13 +220,52 @@ func (p *Pool) Stats() Stats {
 	// An unstable order would make a diff of two /stats responses meaningless, and
 	// would let the api's view churn for no reason.
 	sort.Strings(ids)
-	return Stats{
+	stats := Stats{
 		Size:             len(slots),
 		ByState:          byState,
 		RunnerTTLSeconds: int(p.cfg.RunnerTTL.Seconds()),
 		SlotIDs:          ids,
 	}
+	if fault := p.LastFillFault(); fault != nil {
+		stats.FillError = fault.Error()
+		stats.FillFailures = p.fillFailures()
+	}
+	return stats
 }
+
+// LastFillFault returns why the most recent pool top-up could not create a
+// container, or nil if the last top-up succeeded or none has failed.
+//
+// ## Why this exists
+//
+// Found by deploying to a 1-CPU VPS, where every create failed with `Range of CPUs
+// is from 0.01 to 1.00`. The pool stayed empty, and the api reported a login as
+// **503 "every session is busy"** — which is the one thing it is definitely not.
+// No slot would ever exist, so no amount of waiting would help, and PLAN-v3 §2.6
+// is explicit that a caller must be told which of those two things it is.
+//
+// Nothing reported it. `/healthz` said `ok`, `/stats` said `size: 0`, every CI job
+// passed, and the only evidence was an ERROR line in a container log nobody reads.
+//
+// So the pool carries the reason with it, and the api can name it. This does not
+// make the pool healthy; it makes the fault visible to something that checks.
+func (p *Pool) LastFillFault() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastFillErr
+}
+
+// fillFailures is how many consecutive top-up attempts have failed.
+func (p *Pool) fillFailures() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.fillFailureCount
+}
+
+// FillFailures is how many consecutive top-up attempts have failed. Exported for
+// the server's error body, which reports it so a caller can tell one blip from a
+// pool that has been unable to fill for minutes.
+func (p *Pool) FillFailures() int { return p.fillFailures() }
 
 // Claim takes an idle slot and binds it to a session.
 //
@@ -457,6 +524,24 @@ func (p *Pool) EnsurePool(ctx context.Context) error {
 			continue
 		}
 	}
+
+	// Record the outcome for Stats, and clear it on any success.
+	//
+	// A pool that cannot fill must be distinguishable from a pool that is merely
+	// full, or the api tells a user to wait for a slot that will never exist. That
+	// is not hypothetical: it is what a 1-CPU host did, silently, with healthz
+	// reporting ok the whole time.
+	p.mu.Lock()
+	if firstErr != nil {
+		p.lastFillErr = firstErr
+		p.fillFailureCount++
+	} else if p.fillFailureCount > 0 {
+		p.log.Info("pool top-up recovered", "afterFailures", p.fillFailureCount)
+		p.lastFillErr = nil
+		p.fillFailureCount = 0
+	}
+	p.mu.Unlock()
+
 	return firstErr
 }
 

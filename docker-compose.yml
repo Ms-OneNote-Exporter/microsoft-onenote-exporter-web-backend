@@ -291,6 +291,18 @@ services:
       # assert-compose.mjs checks the whole set, so a name that drifts out of the
       # namespace fails a test rather than a deployment.
       ORCH_POOL_SIZE: ${POOL_SIZE:-2}
+      # A runner's CPU allowance, in billionths of a core. 2e9 is POC §18's two
+      # cores and the default, and it is configurable because a hardcoded 2 made
+      # this orchestrator unable to create a container at all on a host with fewer
+      # than two: the Engine rejects the whole create request, the pool stays empty,
+      # and every login then reports "every session is busy" while `/healthz` says
+      # `ok`. Found by deploying to a 1-CPU VPS.
+      #
+      # Set it to the host's core count or lower — with POOL_SIZE slots all wanting
+      # this many, `POOL_SIZE × RUNNER_NANO_CPUS` is what the host has to cover.
+      # Below 10000 the Engine rejects it, and the orchestrator refuses it at config
+      # load rather than on every pool top-up.
+      ORCH_RUNNER_NANO_CPUS: ${RUNNER_NANO_CPUS:-2000000000}
       # The host path of the bearer token every runner mounts read-only.
       #
       # A *path*, like every other secret here: the orchestrator never reads the

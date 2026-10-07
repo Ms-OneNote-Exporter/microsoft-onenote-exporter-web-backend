@@ -274,6 +274,31 @@ check(
     "every credential submission would fail",
 );
 
+// The two runner networks must exist under the names the orchestrator asks for.
+//
+// Compose prefixes a network with the project name — `msout_msout-runner` — while
+// `ORCH_RUNNER_NETWORK` names it `msout-runner`. The orchestrator builds its create
+// request by name, so a mismatch means it asks the Engine for a network that does
+// not exist and every slot fails with `404 network not found`.
+//
+// CI could not see it: in the capability suite compose creates the runner, so the
+// orchestrator's create path never runs. The first real deployment failed on it.
+// `name:` on the network is what makes the two agree by construction; this asserts
+// they do.
+for (const [network, envVar] of [
+  ["msout-runner", "ORCH_RUNNER_NETWORK"],
+  ["msout-runner-api", "ORCH_RUNNER_CONTROL_NETWORK"],
+]) {
+  check(
+    cfg.networks?.[network]?.name === network,
+    `${network} exists under its own name`,
+    `FAIL: ${network} would be created as "<project>_${network}" by Compose, but the ` +
+      `orchestrator asks for "${network}" by name (${envVar}). Add \`name: ${network}\` ` +
+      `under it, or every runner create fails with "network not found" — and CI cannot ` +
+      `see it, because the capability suite creates the runner through Compose`,
+  );
+}
+
 // The api must not be on the egress network. This is the error the whole
 // three-network arrangement is built to make impossible, and it would deploy
 // cleanly.

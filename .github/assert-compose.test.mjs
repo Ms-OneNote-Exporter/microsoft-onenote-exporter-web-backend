@@ -331,6 +331,21 @@ const cases = [
     expectMessage: /msout-runner is internal/,
   },
   {
+    // The one CI structurally cannot see. In the capability suite the *compose
+    // file* creates the runner, so the orchestrator's own create path never runs —
+    // which is exactly how a name mismatch between the two survived every job.
+    //
+    // The fix is `name:` on the network, and this is the assertion for it: without
+    // it Compose creates `<project>_msout-runner` while the orchestrator asks for
+    // `msout-runner`, and every slot fails on a real host.
+    name: "lets Compose prefix the runner networks the orchestrator names",
+    mutate: (c) => {
+      delete c.networks["msout-runner"].name;
+      delete c.networks["msout-runner-api"].name;
+    },
+    expectMessage: /network not found/,
+  },
+  {
     name: "removes the api from the credential-path network",
     mutate: (c) => {
       delete c.services.api.networks["msout-runner-api"];

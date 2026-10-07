@@ -59,6 +59,24 @@ networks:
   # credential should be one hop away from it rather than on it.
   msout-runner-api:
     internal: true
+    # An explicit `name`, and it is load-bearing rather than cosmetic.
+    #
+    # Compose prefixes a network with the **project name** — `msout_msout-runner` —
+    # while `ORCH_RUNNER_NETWORK` names it `msout-runner`. The orchestrator builds
+    # its create request by name, so it asked the Engine for a network that does not
+    # exist and every slot failed with:
+    #
+    #     404 {"message":"network msout-runner not found"}
+    #
+    # CI never caught it because in the capability suite the **compose** file
+    # creates the runner, so the orchestrator's create path is never exercised. The
+    # first real deployment failed on it.
+    #
+    # Declaring `name:` here makes the network the orchestrator expects, by
+    # construction rather than by the two defaults happening to agree. Both runner
+    # networks need it: `msout-control` and `msout-edge` are only ever used through
+    # compose's service DNS, so nothing outside compose names them.
+    name: msout-runner-api
 
   # ---- the runner's egress: deliberately unrestricted ------------------------
   #
@@ -102,7 +120,11 @@ networks:
   # reachable on instance types that have them, they are a credential-theft path for
   # the *instance* rather than for us, and denying them constrains nothing Microsoft
   # does. See infra/README.md.
-  msout-runner: {}
+  msout-runner:
+    # `name:` for the same reason as `msout-runner-api` above — the orchestrator
+    # names this network when it creates a container, so it must exist under that
+    # name and not under `<project>_msout-runner`.
+    name: msout-runner
 
 # ---- secrets ----------------------------------------------------------------
 

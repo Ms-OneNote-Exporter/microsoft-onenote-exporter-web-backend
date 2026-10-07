@@ -163,6 +163,10 @@ const config: ApiConfig = {
   orchestratorUrl: "http://mock:9100",
   orchestratorSecret: "mock".padEnd(43, "0").slice(0, 43),
   orchestratorReplayWindowSeconds: 60,
+  // Present so the config shape matches production and a field added later does
+  // not break the mock's build. Never read: the mock has no runner, and a
+  // plausible-looking value here would suggest otherwise.
+  runnerToken: "mock".padEnd(43, "0").slice(0, 43),
   logLevel: process.env.LOG_LEVEL === "debug" ? "debug" : "info",
   listen: `${HOST}:${PORT}`,
   // The mock serves both ports, and a download pointed at the control port would

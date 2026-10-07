@@ -164,10 +164,16 @@ jobs:
           printf '%s\n' "$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n' | cut -c1-43)" > /tmp/boot/csrf_key
           chmod 400 /tmp/boot/csrf_key
           cp /tmp/boot/csrf_key /tmp/boot/hmac
+          # The third secret, with the *runner's* shape rather than the CSRF key's:
+          # a bearer token, minimum 16 characters. Reusing the 43-character key
+          # above would have been a copy-paste that happened to pass.
+          printf '%s\n' "runner-token-for-the-boot-check" > /tmp/boot/runner_token
+          chmod 400 /tmp/boot/runner_token
           ALLOWED_ORIGINS=https://app.example.com \
           PUBLIC_ORIGIN=https://one-backend.example.com \
           CSRF_KEY_FILE=/tmp/boot/csrf_key \
           ORCHESTRATOR_HMAC_SECRET_FILE=/tmp/boot/hmac \
+          RUNNER_TOKEN_FILE=/tmp/boot/runner_token \
           ORCHESTRATOR_URL=http://127.0.0.1:9100 \
           DATABASE_PATH=/tmp/boot/api.db \
           LISTEN=127.0.0.1:0 \

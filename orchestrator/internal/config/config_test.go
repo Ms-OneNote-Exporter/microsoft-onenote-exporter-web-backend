@@ -119,6 +119,53 @@ func TestLoadRejectsOverlappingRoots(t *testing.T) {
 	}
 }
 
+// The runner's two networks must be distinct, and this is the check that stops
+// the whole stack from quietly acquiring egress it must not have.
+//
+// The failure mode this refuses is not a crash. If both variables named the same
+// network, `api` would join the egress network in order to reach a runner, the
+// deployment would come up, every test would pass — and PLAN-v3 §2.1's "the api
+// has no route to the internet" would be false in production only. That is a
+// worse outcome than a refusal at load.
+func TestLoadRejectsIdenticalRunnerNetworks(t *testing.T) {
+	for _, name := range []string{"msout-runner", "msout-runner-api", "anything"} {
+		e := baseEnv()
+		e["ORCH_RUNNER_NETWORK"] = name
+		e["ORCH_RUNNER_CONTROL_NETWORK"] = name
+		_, err := Load(env(e), readFileFrom(validSecret))
+		if err == nil {
+			t.Errorf("both networks %q: want an error — api would join the egress network", name)
+		}
+	}
+}
+
+// Whitespace must not smuggle two different-looking names past it into the same
+// network.
+func TestLoadRejectsRunnerNetworksThatDifferOnlyByWhitespace(t *testing.T) {
+	e := baseEnv()
+	e["ORCH_RUNNER_NETWORK"] = "msout-runner"
+	e["ORCH_RUNNER_CONTROL_NETWORK"] = " msout-runner "
+	_, err := Load(env(e), readFileFrom(validSecret))
+	if err == nil {
+		t.Error("a control network differing only by whitespace was accepted")
+	}
+}
+
+// The defaults must be two distinct names and a usable port, or the runner would
+// join nothing the api can reach.
+func TestLoadDefaultsGiveTwoRunnerNetworksAndAPort(t *testing.T) {
+	cfg, err := Load(env(baseEnv()), readFileFrom(validSecret))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RunnerNetwork == cfg.RunnerControlNetwork {
+		t.Errorf("both runner networks default to %q", cfg.RunnerNetwork)
+	}
+	if cfg.RunnerPort <= 0 || cfg.RunnerPort > 65535 {
+		t.Errorf("runner port = %d, out of range", cfg.RunnerPort)
+	}
+}
+
 // A sibling directory sharing a name prefix is not an overlap. /srv/vault must
 // not reject /srv/vault2, or the check would be unusable.
 func TestLoadAllowsSiblingRoots(t *testing.T) {

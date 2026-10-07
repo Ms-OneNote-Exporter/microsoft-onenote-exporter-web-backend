@@ -280,6 +280,90 @@ jobs:
           fi
           echo "msout-edge holds one container"
 
+      # ---- the credential path ----------------------------------------------
+      #
+      # `msout-runner-api` exists so the api can reach a runner without gaining
+      # egress. Both halves of that are asserted here, live, because the static
+      # checks in assert-compose.mjs read the file rather than the topology: a
+      # network marked `internal: true` in a yaml file and one that behaves that way
+      # are the same claim until a container proves it.
+
+      # ---- the credential path: egress --------------------------------------
+      #
+      # The *membership* assertion lives further down, after the runner has been
+      # started. It cannot live here: the runner is behind a profile, so at this
+      # point the network correctly holds only the api, and an assertion expecting
+      # two containers fails against a correct configuration. That is the same
+      # mistake as running `config` without `--profile runner` — a check that
+      # cannot fail is worse than none, and one that fails wrongly is worse still.
+
+      - name: T-N7 — joining the credential-path network gave the api no egress
+        # The whole reason a third network exists. `assert-compose.mjs` checks that
+        # it is declared `internal: true`; this checks the consequence, from inside
+        # a container that is actually on it.
+        #
+        # A failure here means the api can reach the internet, which §2.1 forbids
+        # and which no other check in this file would notice — the api still
+        # reaches the orchestrator and still refuses external hosts on
+        # msout-control, so every existing assertion would stay green.
+        run: |
+          set -euo pipefail
+          docker compose exec -T api node -e 'require("node:dns").promises.resolve("example.com")
+            .then(() => { console.error("DNS resolved from the credential path"); process.exit(1); })
+            .catch(() => process.exit(0))' </dev/null
+          echo "T-N7 ok: the api is on the credential path and still has no egress"
+
+      - name: start one runner and wait for it to be healthy
+        run: |
+          set -euo pipefail
+          docker compose --profile runner up -d --wait runner
+          cid=$(docker compose ps -q runner)
+          test -n "$cid" || { echo "no runner container"; docker compose ps; exit 1; }
+          echo "runner is up: $(docker inspect -f '{{.State.Health.Status}}' "$cid")"
+
+      - name: the credential-path network holds the api and a runner, and nothing else
+        # Asserted *here*, after the runner exists — the runner is behind a profile,
+        # so before this step the network correctly holds only the api and an
+        # expectation of two containers fails against a correct configuration.
+        run: |
+          set -euo pipefail
+          members=$(docker network inspect "${COMPOSE_PROJECT_NAME}_msout-runner-api" \
+            --format '{{range .Containers}}{{.Name}} {{end}}' | tr ' ' '\n' | grep -c . || true)
+          # api + runner = 2. The orchestrator on here would put the credential and
+          # the Docker socket on one network; Caddy would make a runner reachable
+          # from the proxy that terminates TLS.
+          if [ "$members" != "2" ]; then
+            echo "msout-runner-api has $members containers; expected 2 (api and runner)"
+            docker network inspect "${COMPOSE_PROJECT_NAME}_msout-runner-api" \
+              --format '{{range .Containers}}{{.Name}} {{end}}'
+            exit 1
+          fi
+          echo "msout-runner-api holds two containers"
+
+      - name: the api can resolve and connect to a runner on it
+        # The other half. A network existing is not the property; a runner being
+        # reachable *by name* on it is. A name that does not resolve, or a runner
+        # that refuses the api's token, presents as a login that hangs with every
+        # component healthy and every other assertion in this file green.
+        #
+        # `runner` is the compose service name, so this resolves through Docker's
+        # embedded DNS on that network — which is the same mechanism the
+        # orchestrator's per-slot alias relies on. It does not exercise the alias
+        # itself (that needs a claimed slot, which needs a session, which needs a
+        # credential this suite deliberately never creates) and does not claim to;
+        # what it proves is that a name on this network is resolvable and its port
+        # is open from the api.
+        run: |
+          set -euo pipefail
+          docker compose exec -T api node -e '
+            const net = require("node:net");
+            const socket = net.connect(3100, "runner");
+            socket.on("connect", () => { socket.end(); process.exit(0); });
+            socket.on("error", (e) => { console.error("api cannot reach runner: " + e.message); process.exit(1); });
+            setTimeout(() => { console.error("timed out reaching runner"); process.exit(1); }, 10000);
+          ' </dev/null
+          echo "the api resolves and connects to a runner on the credential path"
+
       # ---- the runner, which holds credential bytes ---------------------------
       #
       # Started with `--profile runner`, because the orchestrator starts runners
@@ -300,14 +384,6 @@ jobs:
       # steps in this file were never bitten. `</dev/null` on every exec closes
       # it in both environments, and the final `echo … ok` of each step is kept so
       # a truncated step is visible in the log rather than inferred from rc=0.
-
-      - name: start one runner and wait for it to be healthy
-        run: |
-          set -euo pipefail
-          docker compose --profile runner up -d --wait runner
-          cid=$(docker compose ps -q runner)
-          test -n "$cid" || { echo "no runner container"; docker compose ps; exit 1; }
-          echo "runner is up: $(docker inspect -f '{{.State.Health.Status}}' "$cid")"
 
       - name: T-X-R1 — the runner has no session secret in its environment
         # §2.1, and the sharpest version of it. This is the only component that

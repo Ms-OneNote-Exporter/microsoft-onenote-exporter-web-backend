@@ -35,6 +35,16 @@ export interface RunnerRow {
   health: string;
   last_health_at: number | null;
   session_guid: string | null;
+  /**
+   * Where this runner is reachable, as the orchestrator's claim reported it.
+   *
+   * Stored rather than recomputed because the orchestrator owns the name and
+   * this api must not derive one. Null on a row written before this column
+   * existed, and on a slot claimed by an orchestrator too old to report one —
+   * both of which mean "this api cannot call that runner", and neither of which
+   * is a reason to guess.
+   */
+  runner_url: string | null;
 }
 
 /** Session states. A session's state machine is small and closed. */
@@ -79,7 +89,10 @@ CREATE TABLE IF NOT EXISTS runners (
                     ('idle','claimed','active','draining','dead')),
   health          TEXT NOT NULL DEFAULT 'unknown',
   last_health_at  INTEGER,
-  session_guid    TEXT
+  session_guid    TEXT,
+  -- The address the orchestrator reported for this slot. NULL is meaningful: it
+  -- means this api cannot call the runner, and see #migrate.
+  runner_url      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -136,6 +149,30 @@ export class Db {
     // alternative is the caller seeing a spurious failure for a millisecond.
     this.#db.exec("PRAGMA busy_timeout = 5000");
     this.#db.exec(SCHEMA);
+    this.#migrate();
+  }
+
+  /**
+   * #migrate brings an existing database up to the current schema.
+   *
+   * `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, so
+   * a column added to SCHEMA is absent from every database created before it —
+   * and the failure that produces is a bare `no such column: runner_url` on the
+   * first login after a deploy. Each step is therefore a separate `ALTER` guarded
+   * by a check, so opening an old database is a no-op and opening a new one gets
+   * the column from SCHEMA.
+   *
+   * Ad hoc rather than a version table because there is one column and no
+   * destructive change to make: a schema-version counter would be more machinery
+   * than the migrations need, and would be its own thing to get wrong.
+   */
+  #migrate(): void {
+    const columns = this.all<{ name: string }>(`PRAGMA table_info(runners)`).map(
+      (row) => row.name,
+    );
+    if (columns.length > 0 && !columns.includes("runner_url")) {
+      this.#db.exec(`ALTER TABLE runners ADD COLUMN runner_url TEXT`);
+    }
   }
 
   close(): void {
@@ -293,6 +330,29 @@ export class Db {
   /** listRunners returns every runner row. */
   listRunners(): RunnerRow[] {
     return this.all<RunnerRow>(`SELECT * FROM runners`);
+  }
+
+  /**
+   * runnerUrlFor reports where a session's runner is, or null.
+   *
+   * The single reader of `runners.runner_url`, so there is one place that decides
+   * what "no address" means and one SQL join from session to runner rather than
+   * a query per call site.
+   *
+   * Joining through `sessions.runner_id` rather than reading the runner row
+   * directly matters for correctness, not tidiness: `sessions.runner_id` is the
+   * binding that claim/release maintain atomically, so a lookup that did not use
+   * it could report a runner belonging to a different session.
+   */
+  runnerUrlFor(sessionGuid: string): string | null {
+    const row = this.get<{ runner_url: string | null }>(
+      `SELECT r.runner_url
+         FROM sessions s
+         JOIN runners r ON r.id = s.runner_id
+        WHERE s.guid = ?`,
+      sessionGuid,
+    );
+    return row?.runner_url ?? null;
   }
 
   /**

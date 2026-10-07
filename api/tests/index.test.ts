@@ -45,14 +45,20 @@ let booted: Booted | undefined;
 function envFor(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
   const csrfKey = join(dir, "csrf_key");
   const hmac = join(dir, "hmac");
+  const runnerToken = join(dir, "runner_token");
   writeFileSync(csrfKey, `${"A".repeat(43)}\n`, { mode: 0o400 });
   writeFileSync(hmac, `${"B".repeat(43)}\n`, { mode: 0o400 });
+  // A file rather than an env var, so this test exercises the `_FILE` path the
+  // deployment uses. The value is a bearer token with the runner's 16-character
+  // minimum, not 43 like the other two secrets.
+  writeFileSync(runnerToken, "runner-token-for-tests\n", { mode: 0o400 });
 
   return {
     ALLOWED_ORIGINS: "https://app.example.com",
     PUBLIC_ORIGIN: "https://one-backend.example.com",
     CSRF_KEY_FILE: csrfKey,
     ORCHESTRATOR_HMAC_SECRET_FILE: hmac,
+    RUNNER_TOKEN_FILE: runnerToken,
     ORCHESTRATOR_URL: "http://orchestrator:9100",
     DATABASE_PATH: join(dir, "api.db"),
     LOG_LEVEL: "error",

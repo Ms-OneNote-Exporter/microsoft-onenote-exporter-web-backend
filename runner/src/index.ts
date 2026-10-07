@@ -229,11 +229,23 @@ export function buildApp(
     // The packages are loaded inside the request rather than at boot, so a missing
     // Chromium produces a login-failed event naming the reason instead of a
     // container that never became healthy.
-    const { login } = await packages();
+    const { login, LOGIN_REASONS } = await packages();
 
     // `onEvent` is the whole reason this is a library call and not a child
     // process: the challenge and the terminal reason arrive as typed values rather
     // than as log lines matched by their wording.
+    //
+    // `terminalReason` is the package's own `login-result` reason, kept here so the
+    // false branch below can report it instead of inventing one.
+    //
+    // This is not a nicety. `login()` returns a boolean, so a caller cannot tell a
+    // wrong password from Microsoft being unreachable from a host with no egress —
+    // and this runner's first live run produced exactly `login-failed
+    // {reason: "unknown"}`, which the api maps to its generic message. The package
+    // had said `network`. Without this the reason is lost between two components
+    // that both had it.
+    let terminalReason: string | null = null;
+
     const forward = (type: string, payload: Record<string, unknown>): void => {
       switch (type) {
         case "challenge":
@@ -258,6 +270,10 @@ export function buildApp(
         case "challenge-seen":
           // No session claim. See events.ts.
           break;
+        case "login-result":
+          // The terminal event, and the only place the package states *why*.
+          terminalReason = reasonFromLoginResult(payload, LOGIN_REASONS);
+          break;
         default:
           break;
       }
@@ -276,17 +292,30 @@ export function buildApp(
         if (ok) {
           hub.publish(guid, { type: "login-success" });
         } else {
-          // `login()` still resolves a boolean, so a caller cannot tell a wrong
-          // password from a Microsoft outage. The reason is in the log, and the
-          // log is on disk inside the session — this response says only that it
-          // failed, because the api maps the reason it learns from the package's
-          // own `login-result`, and a reason invented here would be a guess.
-          hub.publish(guid, { type: "login-failed", reason: "unknown" });
+          // `login()` resolves a boolean, so the return value cannot say why. The
+          // reason comes from the package's own terminal `login-result`, captured
+          // in `forward` above — which is the only component that had it.
+          //
+          // Still `unknown` if that event never arrived: a package that failed
+          // before emitting one, or an exception thrown before the emit. That is
+          // the honest answer rather than a guess, and the api maps `unknown` to
+          // its generic message.
+          hub.publish(guid, { type: "login-failed", reason: terminalReason ?? "unknown" });
         }
       } catch (cause) {
+        // An error thrown *around* `login()` rather than by it — Chromium missing,
+        // the module failing to import. `cause.name` is a JS error name, which is
+        // not a member of LOGIN_REASONS, so it is reported as `unknown` rather
+        // than inventing a reason the api has no message for.
+        //
+        // The alternative — passing the name through — would put a value like
+        // "TypeError" into the api's reason field, where it maps to the generic
+        // message anyway, and would look like a mapped reason to anyone reading
+        // the log. The specific error goes in the container's own logs.
+        void cause;
         hub.publish(guid, {
           type: "login-failed",
-          reason: cause instanceof Error ? cause.name : "unknown",
+          reason: terminalReason ?? "unknown",
         });
       } finally {
         claimed.release();
@@ -568,6 +597,35 @@ export function buildApp(
   });
 
   return app;
+}
+
+/**
+ * reasonFromLoginResult reads the package's terminal `login-result` into a reason
+ * this process is willing to forward.
+ *
+ * ## Why this is checked against the union rather than trusted
+ *
+ * The reason goes to the api, which maps it to a message. A value outside
+ * `LOGIN_REASONS` has no mapping and arrives as the generic message — so forwarding
+ * an unchecked string would replace "the wrong reason" with "a reason that looks
+ * plausible and is not in the table", which is harder to notice and just as wrong.
+ *
+ * The union is passed in rather than imported: `packages()` loads it lazily so that
+ * `/healthz` answers on a container whose Chromium is missing, and this function is
+ * called from a request handler that has already loaded them. Importing at module
+ * scope would undo that.
+ *
+ * Returns null for success, where `reason` is deliberately null in the package —
+ * every value in the union names something that went wrong.
+ */
+export function reasonFromLoginResult(
+  payload: Record<string, unknown>,
+  reasons: readonly string[],
+): string | null {
+  if (payload.ok === true) return null;
+  const reason = payload.reason;
+  if (typeof reason === "string" && reasons.includes(reason)) return reason;
+  return "unknown";
 }
 
 /** A 409 body naming the job holding the slot, or null when the slot is free. */

@@ -64,6 +64,26 @@ type Config struct {
 	// orchestrator is not a member of it (T-X2).
 	RunnerNetwork string
 
+	// RunnerControlNetwork is the second network a runner joins: an
+	// `internal: true` one whose only other member is `api`.
+	//
+	// It exists because the credential has to reach a runner and neither
+	// existing network could carry it. `msout-runner` has egress, so putting
+	// `api` on it would give the browser-facing component a route to the
+	// internet — the thing PLAN-v3 §2.1 forbids. `msout-control` is the
+	// orchestrator's, and the runner joining it would put the credential path
+	// one hop from the only process holding the Docker socket.
+	//
+	// So a third network, internal, with exactly two members. `api` gains a
+	// route to a runner's HTTP port and nothing else; the runner gains a route
+	// to `api` and no egress it did not have.
+	RunnerControlNetwork string
+
+	// RunnerPort is the port the runner's HTTP API listens on, and the port
+	// RunnerURL embeds. Fixed at deploy time like every other runner
+	// property: no request field can change it.
+	RunnerPort int
+
 	// RunnerTokenFile is the host path of the bearer token each runner mounts
 	// read-only, and which it requires in order to start.
 	//
@@ -131,6 +151,11 @@ func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (*C
 		ArtifactRoot:  envOr(getenv, "ORCH_ARTIFACT_ROOT", "/srv/msout/artifacts"),
 		RunnerImage:   envOr(getenv, "ORCH_RUNNER_IMAGE", "ghcr.io/ms-one-note-exporter/runner:0.0.0"),
 		RunnerNetwork: envOr(getenv, "ORCH_RUNNER_NETWORK", "msout-runner"),
+		// The third network, and the port `api` dials on it. Both fixed at deploy
+		// time for the same reason as everything else here: no request field
+		// reaches them.
+		RunnerControlNetwork: envOr(getenv, "ORCH_RUNNER_CONTROL_NETWORK", "msout-runner-api"),
+		RunnerPort:           3100,
 		// Next to the orchestrator's own secret, by convention. Not derived from
 		// ORCH_HMAC_SECRET_FILE: it is a different secret with a different
 		// audience, and coupling them would mean rotating one rotates the other.
@@ -204,6 +229,24 @@ func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (*C
 		if strings.HasSuffix(root.val, "/") {
 			return nil, fmt.Errorf("orchestrator: %s must not end with a slash, got %q", root.name, root.val)
 		}
+	}
+
+	// The two runner networks must be different names.
+	//
+	// If they were the same, `api` would end up on the egress network — which
+	// is the one thing this third network exists to avoid — and nothing would
+	// say so. A single network name would produce a working deployment with the
+	// wrong topology, so it is refused at load rather than at first login.
+	if strings.TrimSpace(cfg.RunnerNetwork) == strings.TrimSpace(cfg.RunnerControlNetwork) {
+		return nil, fmt.Errorf(
+			"orchestrator: ORCH_RUNNER_NETWORK and ORCH_RUNNER_CONTROL_NETWORK are both %q; "+
+				"the runner's egress network and the api's control path must be separate, or api "+
+				"gains the internet egress PLAN-v3 §2.1 forbids",
+			cfg.RunnerNetwork,
+		)
+	}
+	if cfg.RunnerPort <= 0 || cfg.RunnerPort > 65535 {
+		return nil, fmt.Errorf("orchestrator: runner port %d is out of range", cfg.RunnerPort)
 	}
 
 	// The two trees must not overlap. If ArtifactRoot were inside VaultRoot,

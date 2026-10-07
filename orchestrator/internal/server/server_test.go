@@ -27,23 +27,54 @@ const testSecret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab
 func newTestServer(t *testing.T) (*Server, http.Handler, *config.Config) {
 	t.Helper()
 	cfg := &config.Config{
-		Listen:          ":0",
-		DockerSocket:    filepath.Join(t.TempDir(), "absent.sock"),
-		HMACSecret:      []byte(testSecret),
-		ReplayWindow:    60 * time.Second,
-		VaultRoot:       t.TempDir(),
-		ArtifactRoot:    t.TempDir(),
-		RunnerImage:     "runner:test",
-		RunnerNetwork:   "msout-runner",
-		PoolSize:        1,
-		RunnerTTL:       5 * time.Minute,
-		SlotIdleTimeout: 30 * time.Minute,
-		RequestTimeout:  time.Second,
+		Listen:               ":0",
+		DockerSocket:         filepath.Join(t.TempDir(), "absent.sock"),
+		HMACSecret:           []byte(testSecret),
+		ReplayWindow:         60 * time.Second,
+		VaultRoot:            t.TempDir(),
+		ArtifactRoot:         t.TempDir(),
+		RunnerImage:          "runner:test",
+		RunnerNetwork:        "msout-runner",
+		RunnerControlNetwork: "msout-runner-api",
+		RunnerPort:           3100,
+		PoolSize:             1,
+		RunnerTTL:            5 * time.Minute,
+		SlotIdleTimeout:      30 * time.Minute,
+		RequestTimeout:       time.Second,
 	}
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	p := pool.New(cfg, nil, log)
 	srv := New(cfg, p, log, nil)
+	return srv, srv.Handler(), cfg
+}
+
+// A server whose pool has a slot to give, so a verb that reaches Docker can be
+// driven to success.
+//
+// Needed only where the assertion is about what a caller *receives* on the
+// success path — `claim`'s `runnerUrl`, for instance. A test that asserts only
+// on a rejection never needs Docker, and the nil client stays the default so
+// that a test reaching for it by accident fails rather than quietly passing.
+func newTestServerWithDaemon(t *testing.T) (*Server, http.Handler, *config.Config) {
+	t.Helper()
+	return newTestServerWithDaemonSized(t, 1)
+}
+
+// As above, with a pool of the given size. `poolSize` is not cosmetic: a claim
+// consumes a slot and does not return it, so a test that claims three times
+// against a one-slot pool is testing 503, not URLs.
+func newTestServerWithDaemonSized(t *testing.T, poolSize int) (*Server, http.Handler, *config.Config) {
+	t.Helper()
+	_, _, cfg := newTestServer(t)
+	cfg.PoolSize = poolSize
+	// Rebuild the pool over the daemon, keeping the same config and the same
+	// server instance so route table and signature handling are the real ones.
+	p := pool.New(cfg, &claimDaemon{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := New(cfg, p, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	if err := p.EnsurePool(t.Context()); err != nil {
+		t.Fatalf("EnsurePool: %v", err)
+	}
 	return srv, srv.Handler(), cfg
 }
 

@@ -203,3 +203,51 @@ describe("nothing in the runner's own surface contradicts the orchestrator", () 
     expect(config).not.toContain("msout-edge");
   });
 });
+
+describe("the alias the orchestrator registers is the one the api dials", () => {
+  // The credential path rests on a name that appears in **three** places: the
+  // alias the orchestrator registers on the container, the `runnerUrl` it builds
+  // for the api, and the pattern the api accepts.
+  //
+  // Two of those are in Go and one in TypeScript, and the failure mode is the
+  // worst in this file: the api would refuse to dial a correctly-named runner,
+  // so every credential submission failed with "address" in the log while the
+  // orchestrator reported a healthy pool and the runner was up and healthy. All
+  // three components green, no login.
+  //
+  // So this reads both repositories and compares the shapes rather than trusting
+  // either. The literals here are the same ones `runnerAlias` and
+  // `RUNNER_ALIAS_PATTERN` use.
+  const aliasPrefix = "msout-runner-";
+
+  it("the orchestrator derives the alias from the slot id", () => {
+    expect(pool).toContain(`return "${aliasPrefix}" + slotID`);
+    // And from the slot *only*. A container id in the alias would change on every
+    // recycle, and an address stored at claim time would go stale silently.
+    expect(pool).not.toContain(`return "${aliasPrefix}" + containerID`);
+  });
+
+  it("the orchestrator reports a URL built from that alias and its configured port", () => {
+    expect(pool).toContain(`"http://%s:%d", runnerAlias(slotID), p.cfg.RunnerPort`);
+  });
+
+  it("the create request registers the alias on the control network", () => {
+    expect(orchestratorRunner).toContain("Aliases: []string{runnerAlias(slotID)}");
+  });
+
+  it("the api accepts exactly the shape the orchestrator produces", () => {
+    const api = read(join(REPO, "api", "src", "runner-adapter-http.ts"));
+    expect(api).toContain(`^http:\\/\\/${aliasPrefix}`);
+    // Only http. The runner serves plain HTTP on an internal network, and
+    // accepting https would mean a silent downgrade decision.
+    expect(api).not.toContain(`^https:\\/\\/${aliasPrefix}`);
+  });
+
+  it("the api reads the address rather than building one", () => {
+    // The property that keeps the three places from becoming four: the api must
+    // have no string-concatenation that could produce an alias.
+    const api = read(join(REPO, "api", "src", "runner-adapter-http.ts"));
+    expect(api).not.toContain(`"${aliasPrefix}" +`);
+    expect(api).not.toContain("`${aliasPrefix}");
+  });
+});

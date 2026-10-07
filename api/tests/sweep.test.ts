@@ -32,7 +32,9 @@ let sse: SseHub;
 function orchestratorStub(opts: {
   claim?: "ok" | "unreachable" | "conflict" | "pool-empty";
   release?: "ok" | "unreachable" | "conflict";
-  stats?: "ok" | "unreachable";
+  stats?: "ok" | "unreachable" | "cannot-fill" | "filled";
+  /** Slot ids the orchestrator names. Defaults to what `stats` implies. */
+  slotIds?: string[];
 }) {
   const calls: string[] = [];
   const client = new OrchestratorClient({
@@ -60,6 +62,19 @@ function orchestratorStub(opts: {
         if (opts.stats === "ok") {
           return new Response(
             JSON.stringify({ size: 0, byState: {}, runnerTtlSeconds: 300 }),
+          );
+        }
+        if (opts.stats === "filled") {
+          // A pool that is up and full. `slotIds` is what the api has to learn in
+          // order to be able to claim anything at all.
+          const slotIds = opts.slotIds ?? ["slot-1"];
+          return new Response(
+            JSON.stringify({
+              size: slotIds.length,
+              byState: { idle: slotIds.length },
+              runnerTtlSeconds: 300,
+              slotIds,
+            }),
           );
         }
         if (opts.stats === "cannot-fill") {
@@ -207,6 +222,80 @@ describe("PoolBinder.claimForLogin", () => {
     expect(result).toEqual({ ok: false, reason: "pool-exhausted" });
     // The expensive call must not happen when the cheap one already failed.
     expect(calls).not.toContain("/claim");
+  });
+
+  // The bug this deploy found.
+  //
+  // `runners` is only ever *moved* by `claimRunner`; nothing inserts. Rows come
+  // from `syncPool`, which ran **once, at boot**. Nothing orders the api behind
+  // the orchestrator's asynchronous pool fill, so on a real deployment the api
+  // boots, sees `size: 0`, inserts nothing — and from then on the pool is
+  // permanently unclaimable.
+  //
+  // It presents as *pool exhausted*, which is byte-for-byte what a genuinely busy
+  // pool looks like, so `/stats` reporting `size: 1` next to a 503 was the only
+  // evidence there was. Observed: api started 15:17:52, orchestrator filled
+  // slot-1 at 15:35:54, and every login after that returned
+  // `503 {"error":"every session is busy"}` while `/healthz` said `ok`.
+  it("learns the pool's slots when the api was started before it filled", async () => {
+    // No seedRunners(): the `runners` table is empty, which is the deployed state.
+    seedSession(GUID, { state: "created" });
+    const { client } = orchestratorStub({ claim: "ok", stats: "filled" });
+    const binder = new PoolBinder(options(client));
+
+    expect(db.all(`SELECT id FROM runners`)).toEqual([]);
+
+    const result = await binder.claimForLogin(db.getSession(GUID)!);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.runnerId).toBe("slot-1");
+  });
+
+  // The same situation, but the orchestrator's pool is only partly up. Learning it
+  // must not claim a slot the orchestrator has not named — the ids have to be its
+  // own, because they go back to it as `slotId`.
+  it("claims only a slot the orchestrator named, not one invented locally", async () => {
+    seedRunners(1);
+    seedSession(GUID, { state: "created" });
+    const { client } = orchestratorStub({
+      claim: "ok",
+      stats: "filled",
+      slotIds: ["slot-7"],
+    });
+    const binder = new PoolBinder(options(client));
+
+    // slot-1 is seeded and idle, but the orchestrator only knows slot-7. Both are
+    // legitimately idle in the api's view; only slot-7 is real.
+    const result = await binder.claimForLogin(db.getSession(GUID)!);
+
+    // Either slot is acceptable to the SQLite claim — what must hold is that the
+    // orchestrator was consulted for membership rather than the api deciding.
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(db.get<{ id: string }>(
+      `SELECT id FROM runners WHERE session_guid = ?`,
+      GUID,
+    )?.id).toBe(result.runnerId);
+  });
+
+  // An orchestrator that cannot be asked must not clear or invent anything. The
+  // distinction that matters: it is "we do not know", not "there is nothing".
+  it("invents nothing when the orchestrator reports no slotIds", async () => {
+    db.registerRunner("slot-1", "ctr1", "claimed");
+    seedSession(GUID);
+    const { client, calls } = orchestratorStub({ claim: "ok" }); // slotIds absent
+    const binder = new PoolBinder(options(client));
+
+    const result = await binder.claimForLogin(db.getSession(GUID)!);
+
+    expect(result).toEqual({ ok: false, reason: "pool-exhausted" });
+    expect(calls).toContain("/stats");
+    // The claimed row is untouched: learning nothing must not free it.
+    expect(db.get<{ status: string }>(
+      `SELECT status FROM runners WHERE id = ?`,
+      "slot-1",
+    )?.status).toBe("claimed");
   });
 
   // A pool that is *full* and a pool that *cannot fill* both have no idle slot, and
@@ -416,6 +505,41 @@ describe("sweep", () => {
     const report = await run();
     expect(report.unclaimedExpired).toBe(1);
     expect(db.getSession(GUID)).toBeUndefined();
+  });
+
+  // The sweeper learns the pool too, so the api's view converges on its own
+  // rather than only when a user happens to try to log in.
+  //
+  // With the pool learned solely at claim time, an api that boots against an empty
+  // pool holds an empty `runners` table until the first login attempt — and every
+  // operator-visible number derived from it (a pool report, a reconciliation
+  // count) reads zero for as long as nobody logs in. The deployed symptom was
+  // `/stats` saying `size: 1` beside a table with nothing in it.
+  it("learns the pool's slots while sweeping, with no login in sight", async () => {
+    seedSession(GUID, { state: "created", created_at: now + 1000 });
+    expect(db.all(`SELECT id FROM runners`)).toEqual([]);
+
+    await sweep(options(orchestratorStub({ stats: "filled" }).client), new PoolBinder(options(orchestratorStub().client)));
+
+    expect(db.all<{ id: string }>(`SELECT id FROM runners`).map((r) => r.id)).toEqual(["slot-1"]);
+  });
+
+  // It must never *remove* on this path. A slot released mid-session has its row
+  // marked idle, not deleted, and deleting it here would strand the session that
+  // still holds it. §2.5's reconciler is the thing that removes rows, and it acts
+  // on boot with the orchestrator's corroboration.
+  it("never removes a row the orchestrator has stopped reporting", async () => {
+    seedRunners(2); // slot-1, slot-2
+    seedSession(GUID, { state: "created", created_at: now + 1000 });
+
+    // The orchestrator now reports only one slot. Acting on that difference here
+    // would delete a row somebody may be bound to.
+    await sweep(options(orchestratorStub({ stats: "filled", slotIds: ["slot-1"] }).client), new PoolBinder(options(orchestratorStub().client)));
+
+    expect(db.all<{ id: string }>(`SELECT id FROM runners`).map((r) => r.id).sort()).toEqual([
+      "slot-1",
+      "slot-2",
+    ]);
   });
 
   it("keeps a created session inside 10 minutes", async () => {

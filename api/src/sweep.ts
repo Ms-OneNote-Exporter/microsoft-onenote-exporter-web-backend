@@ -169,6 +169,40 @@ export class PoolBinder {
       // the api said *every session is busy* for as long as the pool stayed empty,
       // while `/healthz` said `ok` and every CI job passed.
       const stats = await this.#orchestrator.stats();
+
+      // A failed SQLite claim has two very different causes, and they need
+      // different answers:
+      //
+      //   - the pool is genuinely full → `pool-exhausted`, retry shortly
+      //   - **the api does not know the pool exists** → also `pool-exhausted`,
+      //     which is why this was so hard to see
+      //
+      // `syncPool` at boot is not enough, because the orchestrator fills its pool
+      // *after* it starts and nothing orders the api behind it. Found by
+      // deploying: the api booted at 15:17:52, saw `size: 0`, inserted no rows,
+      // and from the moment the orchestrator filled `slot-1` at 15:35:54 onward
+      // every login answered *every session is busy* while `/stats` said
+      // `size: 1`.
+      //
+      // So when the claim fails, learn the membership the orchestrator actually
+      // reports and try once more. This costs nothing on the happy path — the
+      // `stats` call was already being made — and it closes the window a
+      // 30-second sweep interval would otherwise leave open.
+      if (stats.ok && stats.value.slotIds !== undefined) {
+        const learned = syncPool(this.#db, stats.value.slotIds);
+        if (learned.added > 0) {
+          this.#log.info("pool slots learned at claim time", {
+            session: session.guid,
+            added: learned.added,
+            total: learned.total,
+          });
+          if (this.#db.claimRunner(session.guid)) {
+            // Fall through to the rest of the claim on the success path below.
+            return this.#finishClaim(session, now);
+          }
+        }
+      }
+
       const fillError =
         stats.ok && typeof stats.value.fillError === "string" ? stats.value.fillError : undefined;
       if (fillError !== undefined) {
@@ -186,6 +220,24 @@ export class PoolBinder {
       return { ok: false, reason: "pool-exhausted" };
     }
 
+    return this.#finishClaim(session, now);
+  }
+
+  /**
+   * #finishClaim turns an already-claimed SQLite row into a running container.
+   *
+   * Split out of `claimForLogin` because the claim can now be reached twice: once
+   * on the first attempt and once after learning the pool's membership. Both
+   * paths must be identical from here — the row is claimed, so everything that
+   * follows assumes exactly that.
+   */
+  async #finishClaim(
+    session: SessionRow,
+    now: number,
+  ): Promise<
+    | { ok: true; runnerId: string; containerId: string; runnerUrl: string | null }
+    | { ok: false; reason: "pool-exhausted" | "orchestrator-unreachable"; fillError?: string }
+  > {
     const claimed = this.#db.get<{ id: string }>(
       `SELECT id FROM runners WHERE session_guid = ?`,
       session.guid,
@@ -344,6 +396,32 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
     loginExpired: 0,
     skippedErasing: 0,
   };
+
+  // Learn the pool's current membership, not just its size.
+  //
+  // `syncPool` used to run once, at boot. That is a latent outage whenever the
+  // orchestrator's pool is not yet full when the api starts — which is the
+  // normal case, because the orchestrator fills asynchronously after its own
+  // start and the api is not ordered behind it. Found by deploying: the api
+  // started at 15:17:52, saw `size: 0`, and inserted no rows; the orchestrator
+  // filled `slot-1` at 15:35:54. From then on `claimRunner` found nothing idle and
+  // every login 503'd with *every session is busy* while `/stats` said `size: 1`
+  // and `/healthz` said `ok`.
+  //
+  // The symptom is uniquely bad: a pool-exhausted 503 is exactly what a *full*
+  // pool looks like, so the evidence points at demand rather than at the api
+  // never having been told the pool existed.
+  //
+  // `syncPool` upserts and never removes, so running it against a pool that has
+  // shrunk leaves rows behind — which is what §2.5's reconciler is for, and it
+  // means a slot released mid-session is not deleted out from under it.
+  const stats = await options.orchestrator.stats();
+  if (stats.ok && stats.value.slotIds !== undefined) {
+    const pool = syncPool(db, stats.value.slotIds);
+    if (pool.added > 0) {
+      log.info("pool slots learned", { added: pool.added, total: pool.total });
+    }
+  }
 
   // Every session, because each TTL depends on a different field.
   const sessions = db.all<SessionRow>(`SELECT * FROM sessions`);

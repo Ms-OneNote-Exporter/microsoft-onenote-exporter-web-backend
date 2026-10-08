@@ -257,6 +257,12 @@ jobs:
           # `ORCH_RUNNER_TOKEN_FILE` became a relative bind source. `config` does not
           # read the files, so the directory need not exist here.
           SECRETS_DIR: /srv/msout/secrets
+          # Must be the same string as the `runner` service's `image:`, which
+          # `assert-compose.mjs` now requires — it caught this job falling through to
+          # the orchestrator's built-in default, `…/runner:0.0.0`, which is a name
+          # nothing publishes. Written out rather than derived because a workflow
+          # `env:` value is not shell-expanded, and `IMAGE_TAG` is stamped later.
+          RUNNER_IMAGE: ghcr.io/ms-one-note-exporter/msout-runner:0000000
         run: docker compose --profile runner -f docker-compose.yml config --quiet
 
       - name: the required host name is genuinely required
@@ -279,6 +285,12 @@ jobs:
           # `ORCH_RUNNER_TOKEN_FILE` became a relative bind source. `config` does not
           # read the files, so the directory need not exist here.
           SECRETS_DIR: /srv/msout/secrets
+          # Must be the same string as the `runner` service's `image:`, which
+          # `assert-compose.mjs` now requires — it caught this job falling through to
+          # the orchestrator's built-in default, `…/runner:0.0.0`, which is a name
+          # nothing publishes. Written out rather than derived because a workflow
+          # `env:` value is not shell-expanded, and `IMAGE_TAG` is stamped later.
+          RUNNER_IMAGE: ghcr.io/ms-one-note-exporter/msout-runner:0000000
           PUBLIC_HOST: ""
         run: |
           if docker compose --profile runner -f docker-compose.yml config --quiet 2>/dev/null; then
@@ -309,6 +321,12 @@ jobs:
           # `ORCH_RUNNER_TOKEN_FILE` became a relative bind source. `config` does not
           # read the files, so the directory need not exist here.
           SECRETS_DIR: /srv/msout/secrets
+          # Must be the same string as the `runner` service's `image:`, which
+          # `assert-compose.mjs` now requires — it caught this job falling through to
+          # the orchestrator's built-in default, `…/runner:0.0.0`, which is a name
+          # nothing publishes. Written out rather than derived because a workflow
+          # `env:` value is not shell-expanded, and `IMAGE_TAG` is stamped later.
+          RUNNER_IMAGE: ghcr.io/ms-one-note-exporter/msout-runner:0000000
         run: |
           docker compose --profile runner -f docker-compose.yml config --format json \
             | node .github/assert-compose.mjs
@@ -359,6 +377,12 @@ jobs:
           # `ORCH_RUNNER_TOKEN_FILE` became a relative bind source. `config` does not
           # read the files, so the directory need not exist here.
           SECRETS_DIR: /srv/msout/secrets
+          # Must be the same string as the `runner` service's `image:`, which
+          # `assert-compose.mjs` now requires — it caught this job falling through to
+          # the orchestrator's built-in default, `…/runner:0.0.0`, which is a name
+          # nothing publishes. Written out rather than derived because a workflow
+          # `env:` value is not shell-expanded, and `IMAGE_TAG` is stamped later.
+          RUNNER_IMAGE: ghcr.io/ms-one-note-exporter/msout-runner:0000000
         run: node .github/assert-compose.test.mjs
 
       - name: nothing logs a request header

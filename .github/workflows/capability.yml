@@ -72,6 +72,7 @@ jobs:
       # but leaves an environment value verbatim — so a relative value gives the
       # orchestrator a relative bind source, which it refuses to start with.
       SECRETS_DIR: ${{ github.workspace }}/secrets
+
     steps:
       - uses: actions/checkout@v4
 
@@ -79,7 +80,22 @@ jobs:
         # `build` on /api/public/version is this value, and compose requires it.
         # Taken from the checkout rather than pinned to a literal, so the stamp is
         # the commit that is actually being tested.
-        run: echo "IMAGE_TAG=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+        run: |
+          echo "IMAGE_TAG=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          # Point the orchestrator at the image *this job builds*, so its own
+          # container-create path runs. It is the path that failed on the first real
+          # deployment and that CI could not see, because the capability suite creates
+          # the runner through Compose and the orchestrator had never made one.
+          #
+          # Written to $GITHUB_ENV rather than the job `env:` block because it needs
+          # the stamp above, and a job-level `env:` value is not shell-expanded —
+          # `${IMAGE_TAG}` there is a literal.
+          #
+          # Without it the orchestrator spams `No such image:
+          # ghcr.io/ms-one-note-exporter/runner:0.0.0` every ten seconds — the
+          # built-in default, a name nobody publishes — and every log-based assertion
+          # below reads through that noise.
+          echo "RUNNER_IMAGE=ghcr.io/ms-one-note-exporter/msout-runner:$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
 
       - name: discover the host docker group
         # Not hardcoded. The first version pinned _DOCKER_GID to a literal, which is
@@ -143,6 +159,81 @@ jobs:
 
       - name: build
         run: docker compose build
+
+      - name: provision the runner's egress network
+        # Compose **prunes** `msout-runner`: the only service that would join it is
+        # the `runner` service, which sits behind a profile, so a plain
+        # `docker compose up` leaves it non-existent. The orchestrator asks the
+        # Engine for it *by name* when it creates a container and gets:
+        #
+        #     404 {"message":"network msout-runner not found"}
+        #
+        # which is how the first real deployment failed. Pre-creating it here means
+        # the orchestrator's create path can actually run in CI.
+        run: |
+          set -euo pipefail
+          docker network create --driver bridge msout-runner
+          docker network inspect msout-runner --format '{{.Name}} {{.Driver}}'
+
+      - name: the orchestrator fills its own pool
+        # **This is the path CI could not see.** Every other assertion in this file
+        # exercises a container Compose created. This one asserts that the
+        # orchestrator — the only process with the Docker socket — can create a
+        # runner, give it the mounts and networks it should have, and get a
+        # container that reports healthy.
+        #
+        # Found on the first real deployment, where the create failed on a network
+        # name mismatch and every job in this file passed, because nothing here
+        # asked the orchestrator to make a container.
+        run: |
+          set -euo pipefail
+          must() { docker compose exec -T orchestrator true </dev/null || {
+            echo "FAIL: orchestrator is not running; this assertion would pass vacuously"; exit 1;
+          }; }
+          must
+
+          echo "waiting for the orchestrator to fill a slot..."
+          filled=""
+          for _ in $(seq 1 24); do
+            sleep 5
+            cid=$(docker ps -q --filter "label=msout.role=runner" || true)
+            if [ -n "$cid" ]; then filled="$cid"; break; fi
+          done
+          if [ -z "$filled" ]; then
+            echo "FAIL: the orchestrator created no runner in 120s"
+            docker compose logs --tail 40 orchestrator
+            exit 1
+          fi
+
+          echo "orchestrator-created runner: $filled"
+          # The mounts it granted itself: the artifact root and its own token, and
+          # nothing else. This is the assertion about the create *request* reaching
+          # the Engine, which is what a top-level `Mounts` field silently failed.
+          binds=$(docker inspect -f '{{range .Mounts}}{{.Source}} {{end}}' "$filled")
+          echo "binds: $binds"
+          case "$binds" in
+            *runner_token*) ;;
+            *) echo "FAIL: the orchestrator's runner has no token bind"; exit 1 ;;
+          esac
+          case "$binds" in
+            *"$ARTIFACT_HOST_DIR"*) ;;
+            *) echo "FAIL: the orchestrator's runner does not bind the artifact root"; exit 1 ;;
+          esac
+          # And the two networks, named the way the orchestrator asked for them.
+          nets=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$filled")
+          echo "networks: $nets"
+          case "$nets" in *"msout-runner "*) ;; *) echo "FAIL: no egress network"; exit 1 ;; esac
+          case "$nets" in *"msout-runner-api "*) ;; *) echo "FAIL: no credential network"; exit 1 ;; esac
+
+          # `/data` is tmpfs on an idle runner: a waiting container must hold no
+          # credential-bearing path at all.
+          data=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Type}}{{end}}{{end}}' "$filled")
+          if [ -n "$data" ]; then
+            echo "FAIL: an idle orchestrator-created runner has /data as a $data mount; it must be tmpfs"
+            exit 1
+          fi
+          docker inspect -f '{{json .HostConfig.Tmpfs}}' "$filled"
+          echo "the orchestrator can create a runner"
 
       - name: provision the orchestrator's storage roots
         # A deployment step, and the reason this file needs one.

@@ -522,11 +522,24 @@ services:
       - runner_token
     volumes:
       - runner-data:/data
-      # The same host directory the orchestrator binds from, so a dev runner and an
-      # orchestrator-created runner hand artifacts to the same place. It used to be
-      # the `artifacts` named volume, which is not the same directory — see the
-      # orchestrator's mount above.
-      - ${ARTIFACT_HOST_DIR:?set ARTIFACT_HOST_DIR; see infra/README.md}:/artifacts
+      # A named volume, deliberately, and not the host directory the orchestrator uses.
+      # This service is the **development** runner: nothing creates it through the
+      # orchestrator, so nothing is granting it anything, and the strongest property
+      # available is available — the runner holds the Microsoft credential and is the
+      # only component pointed at the open internet, so it gets **no host path at
+      # all**. T-X-R2 asserts that, against the running container.
+      #
+      # An orchestrator-created runner cannot have this: the orchestrator binds it the
+      # per-session vault and the artifact root, because artifacts must leave the
+      # container and the vault must persist. So the two runners differ here, and the
+      # difference is the *grants*, not a difference in posture.
+      #
+      # I briefly pointed this at `ARTIFACT_HOST_DIR` so a dev runner and an
+      # orchestrator-created runner would share an artifacts directory. That is a
+      # convenience, and it costs T-X-R2 — the one assertion about the runner's
+      # mounts on a real container. Not a trade worth making for symmetry nobody
+      # depends on; the cost is that this runner's artifacts are throwaway.
+      - artifacts:/artifacts
     cap_drop:
       - ALL
     security_opt:
@@ -569,6 +582,11 @@ services:
 
 volumes:
   api-data:
+  # The **development** runner's artifacts only. Production artifacts go to
+  # `ARTIFACT_HOST_DIR`, because the orchestrator needs that path to bind it into a
+  # runner it creates — and a named volume has no host path to bind from. See the
+  # `runner` service's `volumes`.
+  artifacts:
   caddy-data:
   caddy-config:
   # The runner's session data: one subdirectory per session guid, holding the auth

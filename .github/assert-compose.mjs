@@ -254,24 +254,31 @@ check(
     )}. This value is the *source* of a bind mount, so it must resolve on the host; ` +
     `a container path makes Docker create a directory there and every runner exits 1`,
 );
-// The runner takes no host path of its own choosing. Everything it gets, it is
-// *granted*: the orchestrator builds its create request, and the two mounts there are
-// the per-session vault and the artifact root.
+// The runner takes no host path at all.
 //
-// The one exception is the artifact root, which the compose `runner` service — the
-// development one behind a profile — also mounts, and that is deliberate: it must be
-// the **same directory** the orchestrator binds from, or a dev runner and an
-// orchestrator-created runner would hand artifacts to two different places. It used
-// to mount the `artifacts` named volume, which is not that directory.
+// Not "no host path of its own choosing" — **none**. The runner holds the Microsoft
+// credential and is the only component pointed at the open internet, so it gets its
+// data and its artifacts as named volumes and its token as a Docker secret, and
+// nothing else.
+//
+// This is asserted against the compose `runner` service, which is the *development*
+// runner: nothing creates it through the orchestrator, so no grants are in play and
+// the full property is available. An orchestrator-created runner cannot have it — the
+// orchestrator binds that one the per-session vault and the artifact root, because
+// artifacts must leave the container and the vault must persist. T-X-R2 in
+// `capability.yml` asserts the same property against a running container.
+//
+// The temptation this guards against: pointing the dev runner at
+// `ARTIFACT_HOST_DIR` "so both runners share an artifacts directory". That is a
+// convenience, and it costs the only assertion about the runner's mounts on a real
+// container. It was tried, and reverted.
 const runnerBinds = bindsFor("runner").map((v) => String(v.source));
-const grantedRunnerBinds = (src) =>
-  src.endsWith("runner_token") || src === services.orchestrator?.environment?.ORCH_ARTIFACT_ROOT;
 check(
-  runnerBinds.every(grantedRunnerBinds),
-  `runner bind-mounts only what it is granted (${runnerBinds.join(", ") || "none"})`,
+  runnerBinds.every((src) => src.endsWith("runner_token")),
+  `runner bind-mounts only its token (${runnerBinds.join(", ") || "none"})`,
   `runner bind-mounts something unexpected: ${runnerBinds.join(", ")}. §2.1 gives it no host ` +
-    `path of its own — only its secret file and, for the compose dev runner, the ` +
-    `artifact root it shares with the orchestrator`,
+    `path — its data root and its artifact root are named volumes, and the only bind ` +
+    `allowed is its own secret file`,
 );
 for (const key of ["CSRF_KEY", "CSRF_KEY_FILE", "SESSION_SECRET", "ORCHESTRATOR_HMAC_SECRET"]) {
   check(

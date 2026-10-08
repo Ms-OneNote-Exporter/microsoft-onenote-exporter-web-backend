@@ -124,6 +124,24 @@ export interface HttpRunnerAdapterOptions {
   readonly token: string;
   /** The hub runner events are republished into. */
   readonly sse: SseHub;
+  /**
+   * Called when the runner reports the *outcome* of a login: `authenticated`, or
+   * `failed`.
+   *
+   * Injected as a narrow callback rather than a `Db` handle, because this module is
+   * transport: it knows the runner's wire format and nothing about storage. It was
+   * missing precisely because the adapter had no way to say anything except "forward
+   * this to the browser" — so `login-success` reached the frontend while the database
+   * went on saying `authenticating`, and the two routes that need `valid` refused a
+   * session that had really authenticated.
+   *
+   * Optional so that a caller which does not care about persisted state (the mock,
+   * some tests) does not have to supply one.
+   */
+  readonly onAuthOutcome?: (
+    sessionId: string,
+    outcome: "authenticated" | "failed",
+  ) => void;
   /** Per-request timeout. Logins and exports return immediately, so this is short. */
   readonly timeoutMs?: number;
   /** Injected for tests. */
@@ -169,6 +187,9 @@ export class HttpRunnerAdapter implements RunnerAdapter {
   readonly #addressFor: (sessionId: string) => string | null;
   readonly #token: string;
   readonly #sse: SseHub;
+  readonly #onAuthOutcome:
+    | ((sessionId: string, outcome: "authenticated" | "failed") => void)
+    | undefined;
   readonly #timeoutMs: number;
   readonly #fetch: typeof fetch;
   /** One event stream per session, so a reconnect does not double-deliver. */
@@ -180,6 +201,7 @@ export class HttpRunnerAdapter implements RunnerAdapter {
     this.#addressFor = options.addressFor;
     this.#token = options.token;
     this.#sse = options.sse;
+    this.#onAuthOutcome = options.onAuthOutcome;
     this.#timeoutMs = options.timeoutMs ?? 15_000;
     this.#fetch = options.fetchImpl ?? fetch;
   }
@@ -595,7 +617,7 @@ export class HttpRunnerAdapter implements RunnerAdapter {
       return;
     }
 
-    const published = publish(this.#sse, sessionId, raw);
+    const published = publish(this.#sse, sessionId, raw, this.#onAuthOutcome);
     if (published === "challenge-code") {
       // Reported, not silently dropped and not silently accepted. See the header:
       // there is no route to answer a typed code and pretending otherwise would
@@ -635,6 +657,7 @@ function publish(
   sse: SseHub,
   sessionId: string,
   raw: Record<string, unknown>,
+  onAuthOutcome?: (sessionId: string, outcome: "authenticated" | "failed") => void,
 ): "published" | "dropped" | "challenge-code" {
   const str = (key: string): string => (typeof raw[key] === "string" ? (raw[key] as string) : "");
   const num = (key: string): number =>
@@ -672,10 +695,16 @@ function publish(
 
     case "login-success":
       sse.emit(sessionId, "login-success", {});
+      // Recorded **before** the return, and not after it: the caller needs to know the
+      // session is authenticated whether or not anyone was listening on the SSE hub.
+      // A missed write here is a 409 on every subsequent route for this session, and
+      // the frontend would have seen `login-success` and believed otherwise.
+      onAuthOutcome?.(sessionId, "authenticated");
       return "published";
 
     case "login-failed":
       sse.emit(sessionId, "login-failed", { reason: str("reason") || "unknown" });
+      onAuthOutcome?.(sessionId, "failed");
       return "published";
 
     case "notebooks-listed": {

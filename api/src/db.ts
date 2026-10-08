@@ -285,6 +285,58 @@ export class Db {
   }
 
   /**
+   * markAuthenticated records that the runner saved a usable auth.json.
+   *
+   * Called when the runner publishes `login-success`, which it does only after it
+   * has written the cookie jar. Before this existed, nothing in the api ever wrote
+   * `'valid'`, and the only place that promoted a session to it was
+   * `releaseForIdle` — which nulls `runner_id` in the same statement. So
+   * `/api/session/notebooks` and `/api/export`, which require `auth_state === 'valid'`
+   * **and** a bound runner, could never both be true, and answered 409 forever from a
+   * session that had genuinely authenticated.
+   *
+   * The condition is `authenticating`, not an unconditional write, for two reasons:
+   * a session already released and idle must not be dragged back to `authenticating`
+   * by a late event, and a session whose auth has already been invalidated as
+   * `expired` must not be revived by a straggler. A straggler is a real event — the
+   * runner's stream outlives the api's knowledge of it — so the guard is what keeps
+   * this from being the bug it replaces.
+   *
+   * Returns whether a row changed, so a caller can tell "recorded" from "ignored".
+   */
+  markAuthenticated(guid: string, now: number): boolean {
+    return (
+      this.run(
+        `UPDATE sessions
+            SET auth_state = 'valid', state = 'authenticated', last_activity_at = ?
+          WHERE guid = ? AND auth_state = 'authenticating'`,
+        now,
+        guid,
+      ) > 0
+    );
+  }
+
+  /**
+   * markAuthFailed records that the runner reported a failed login.
+   *
+   * Without it a failed login left `auth_state` at `authenticating` until the login
+   * TTL swept it, and `releaseForIdle`'s `CASE WHEN auth_state = 'authenticating' THEN
+   * 'valid'` then promoted a **failed** login to `valid` on release. That promotion is
+   * now unreachable for a failed login precisely because this sets `failed` first.
+   */
+  markAuthFailed(guid: string, now: number): boolean {
+    return (
+      this.run(
+        `UPDATE sessions
+            SET auth_state = 'failed', last_activity_at = ?
+          WHERE guid = ? AND auth_state = 'authenticating'`,
+        now,
+        guid,
+      ) > 0
+    );
+  }
+
+  /**
    * deleteSession removes a session row.
    *
    * Used by the erase state machine and by the boot sweeper for expired rows.

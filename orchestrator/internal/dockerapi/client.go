@@ -450,8 +450,37 @@ func (c *Client) InspectContainer(ctx context.Context, id string) (*Container, e
 // ListContainersByLabel returns the ids of every container carrying label,
 // including stopped ones. Boot reconciliation needs the stopped ones: a
 // container that died must be cleaned up, not just the running ones.
+//
+// **The `filters` parameter takes JSON, not a bare value.** The Engine's schema for
+// it is an object of arrays:
+//
+//	?filters={"label":["msout.component=runner"]}
+//
+// It was sent as a bare, URL-escaped `label`, which the Engine rejected on every
+// single boot:
+//
+//	reconcile: list containers: docker engine: 400 {"message":"invalid filter"}
+//
+// which the caller logs as "boot reconciliation failed, serving anyway" and moves on
+// from. So reconciliation has never run: an orchestrator restart did not adopt its
+// existing runners, and `EnsurePool` would create a *second* runner for a slot whose
+// container was still alive and holding a session's vault.
+//
+// Encoded from the typed value rather than by hand so the shape cannot drift again —
+// the same reason the mount list is rendered by one function.
 func (c *Client) ListContainersByLabel(ctx context.Context, label string) ([]string, error) {
-	raw, err := c.request(ctx, http.MethodGet, "/containers/json?all=1&filters="+url.QueryEscape(label), nil)
+	filter, err := json.Marshal(map[string][]string{"label": {label}})
+	if err != nil {
+		// A []string cannot fail to marshal, so this is unreachable. Returning an
+		// error rather than ignoring it keeps the signature honest if that changes.
+		return nil, fmt.Errorf("encode label filter: %w", err)
+	}
+
+	query := url.Values{}
+	query.Set("all", "1")
+	query.Set("filters", string(filter))
+
+	raw, err := c.request(ctx, http.MethodGet, "/containers/json?"+query.Encode(), nil)
 	if err != nil {
 		return nil, err
 	}

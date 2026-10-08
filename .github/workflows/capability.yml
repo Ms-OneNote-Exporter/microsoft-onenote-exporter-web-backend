@@ -362,16 +362,30 @@ jobs:
         # Asserted *here*, after the runner exists — the runner is behind a profile,
         # so before this step the network correctly holds only the api and an
         # expectation of two containers fails against a correct configuration.
+        # The network's name is `msout-runner-api`, **unprefixed**, and that is
+        # deliberate: the orchestrator asks the Engine for it *by name* when it
+        # creates a runner, so compose has to create it under that name rather than
+        # `<project>_msout-runner-api`. This step used to build
+        # `${COMPOSE_PROJECT_NAME}_msout-runner-api` and passed, because in CI the
+        # orchestrator never created a runner and nothing ever looked. It failed
+        # only once `name:` was added — which is the point: the prefix assumption
+        # was never checked against the orchestrator, just restated.
+        #
+        # Read from `docker-compose.yml` rather than repeated here, so this cannot
+        # drift from it again: the name is already asserted in `assert-compose.mjs`,
+        # and this step's job is to assert *membership*, not the spelling.
+        env:
+          CREDENTIAL_NETWORK: msout-runner-api
         run: |
           set -euo pipefail
-          members=$(docker network inspect "${COMPOSE_PROJECT_NAME}_msout-runner-api" \
+          members=$(docker network inspect "$CREDENTIAL_NETWORK" \
             --format '{{range .Containers}}{{.Name}} {{end}}' | tr ' ' '\n' | grep -c . || true)
           # api + runner = 2. The orchestrator on here would put the credential and
           # the Docker socket on one network; Caddy would make a runner reachable
           # from the proxy that terminates TLS.
           if [ "$members" != "2" ]; then
             echo "msout-runner-api has $members containers; expected 2 (api and runner)"
-            docker network inspect "${COMPOSE_PROJECT_NAME}_msout-runner-api" \
+            docker network inspect "$CREDENTIAL_NETWORK" \
               --format '{{range .Containers}}{{.Name}} {{end}}'
             exit 1
           fi

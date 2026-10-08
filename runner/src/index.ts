@@ -79,9 +79,23 @@ const KEEPALIVE_MS = 15_000;
  * running tests. A static import would make the debug-surface route enumeration
  * test load a browser to do it.
  */
+/**
+ * One notebook, as `@msout/microsoft-onenote-list-notebooks` returns it.
+ *
+ * Transcribed from the package's own return rather than invented: `listNotebooks()`
+ * resolves to a **bare array** of these, and that fact is the whole reason this type
+ * exists. Declaring the seam as `Promise<unknown>` and casting at the call site is what
+ * allowed an array to be read as `{notebooks}` — an empty list, published on every run,
+ * with the package's own log cheerfully reporting three notebooks found.
+ */
+export interface Notebook {
+  readonly name?: string;
+  readonly url?: string;
+}
+
 async function packages(): Promise<{
   login: (options: Record<string, unknown>) => Promise<boolean>;
-  listNotebooks: (options: Record<string, unknown>) => Promise<unknown>;
+  listNotebooks: (options: Record<string, unknown>) => Promise<Notebook[]>;
   runExport: (options: Record<string, unknown>) => Promise<unknown>;
   LOGIN_REASONS: readonly string[];
 }> {
@@ -89,8 +103,11 @@ async function packages(): Promise<{
     login: (o: Record<string, unknown>) => Promise<boolean>;
     LOGIN_REASONS: readonly string[];
   };
+  // Typed by what the package actually returns — see `Notebook` and the comment on it.
+  // The old `Promise<unknown>` plus an `as {notebooks?}` cast at the call site is what
+  // let a bare array be read as an object for the whole life of this route.
   const list = (await import("@msout/microsoft-onenote-list-notebooks")) as unknown as {
-    listNotebooks: (o: Record<string, unknown>) => Promise<unknown>;
+    listNotebooks: (o: Record<string, unknown>) => Promise<Notebook[]>;
   };
   const exporter = (await import("@msout/microsoft-onenote-export-notebook")) as unknown as {
     runExport: (o: Record<string, unknown>) => Promise<unknown>;
@@ -343,14 +360,35 @@ export function buildApp(
 
     void (async () => {
       try {
-        const result = (await listNotebooks({
+        // **`listNotebooks()` returns a bare array.** It did not return an object with a
+        // `notebooks` property, ever.
+        //
+        // The old code was:
+        //
+        //     const result = (await listNotebooks(...)) as { notebooks?: ... };
+        //     notebooks: (result.notebooks ?? []).map(...)
+        //
+        // `result.notebooks` on an array is `undefined`, so `?? []` made it an empty
+        // list — **and the runner published an empty notebook list every single time.**
+        // The package's own log said `Found 3 notebooks!` and `3 of 3 notebooks
+        // resolved to a link`, because those come from the package. The names died at
+        // this line.
+        //
+        // The `as` cast is what made it compile. An array is not `{notebooks?}`, and
+        // saying so with a cast is a way of telling the compiler to stop checking. The
+        // seam is typed `Promise<Notebook[]>` above, so the next mistake here is an
+        // error rather than an empty array.
+        //
+        // Observed end to end on the deployed host: the api persisted `[]` after a
+        // listing that the runner had logged as finding three.
+        const notebooks = await listNotebooks({
           authFile: paths.authFile,
           keepOpen: false,
-        })) as { notebooks?: ReadonlyArray<{ name?: string; url?: string }> };
+        });
 
         hub.publish(guid, {
           type: "notebooks-listed",
-          notebooks: (result.notebooks ?? []).map((n) => ({
+          notebooks: notebooks.map((n) => ({
             name: String(n.name ?? ""),
             url: String(n.url ?? ""),
           })),

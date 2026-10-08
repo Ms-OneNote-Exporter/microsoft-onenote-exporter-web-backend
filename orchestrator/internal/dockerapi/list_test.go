@@ -63,7 +63,7 @@ func startListEngine(t *testing.T, body string) (*Client, *string) {
 
 // The whole bug: the filter must be a JSON object of arrays.
 func TestTheLabelFilterIsSentAsJSON(t *testing.T) {
-	c, seen := startListEngine(t, `{"Containers":[]}`)
+	c, seen := startListEngine(t, `[]`)
 
 	if _, err := c.ListContainersByLabel(t.Context(), "msout.component=runner"); err != nil {
 		t.Fatalf("ListContainersByLabel: %v", err)
@@ -93,7 +93,7 @@ func TestTheLabelFilterIsSentAsJSON(t *testing.T) {
 // `all=1` is what makes a stopped container visible, and boot reconciliation needs
 // those: a runner that died must be cleaned up, not just the running ones.
 func TestStoppedContainersAreIncluded(t *testing.T) {
-	c, seen := startListEngine(t, `{"Containers":[]}`)
+	c, seen := startListEngine(t, `[]`)
 
 	if _, err := c.ListContainersByLabel(t.Context(), "x=y"); err != nil {
 		t.Fatalf("ListContainersByLabel: %v", err)
@@ -110,10 +110,20 @@ func TestStoppedContainersAreIncluded(t *testing.T) {
 }
 
 func TestAListOfIdsIsReturned(t *testing.T) {
-	// The Engine's shape, not a bare array — a test body that does not match the
-	// response struct fails for a reason unrelated to the bug under test, which is
-	// how a real failure gets written off as a broken test.
-	c, _ := startListEngine(t, `{"Containers":[{"Id":"a"},{"Id":"b"}]}`)
+	// The Engine's actual shape: a **bare array**. Checked against a live
+	// `GET /containers/json?filters={"label":["msout.component=runner"]}` on the
+	// deployed host, not read from a reference.
+	//
+	// This body was `{"Containers":[...]}` in the first version, because that is what
+	// the code declared — so the test agreed with the code and the real mismatch only
+	// appeared in production:
+	//
+	//     json: cannot unmarshal array into Go value of type dockerapi.listResponse
+	//
+	// The comment on the wrong declaration now says the same thing, because the
+	// lesson is not "check the shape" but that a fixture invented from the code under
+	// test cannot check the code under test.
+	c, _ := startListEngine(t, `[{"Id":"a"},{"Id":"b"}]`)
 
 	ids, err := c.ListContainersByLabel(t.Context(), "x=y")
 	if err != nil {

@@ -308,9 +308,18 @@ type listContainer struct {
 }
 
 // listResponse is the Engine's answer to a container list.
-type listResponse struct {
-	Containers []listContainer `json:"Containers"`
-}
+//
+// A **bare array**, not an object with a `Containers` key. It was declared as the
+// object, and the filter bug hid it: with `filters` rejected outright the decode was
+// never reached, so the wrong shape sat there through the fix and surfaced the moment
+// the filter was right —
+//
+//	json: cannot unmarshal array into Go value of type dockerapi.listResponse
+//
+// Verified against the live Engine on the deployed host rather than from the API
+// reference, and `list_test.go` asserts this shape specifically. A test written
+// against the same wrong struct would have agreed with the code forever.
+type listResponse = []listContainer
 
 // PingResult is the Engine's /_ping answer.
 type PingResult struct {
@@ -488,8 +497,8 @@ func (c *Client) ListContainersByLabel(ctx context.Context, label string) ([]str
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, err
 	}
-	ids := make([]string, 0, len(out.Containers))
-	for _, ctr := range out.Containers {
+	ids := make([]string, 0, len(out))
+	for _, ctr := range out {
 		ids = append(ids, ctr.ID)
 	}
 	return ids, nil

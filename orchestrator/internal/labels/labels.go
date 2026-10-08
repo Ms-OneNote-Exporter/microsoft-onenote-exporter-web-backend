@@ -124,5 +124,26 @@ func ReadSessionGUID(labels map[string]string) (string, bool) {
 	return v, true
 }
 
-// RunnerFilter is the Engine label filter that selects our runner containers.
-const RunnerFilter = "label=" + Role + "=" + RoleRunner
+// RunnerFilter selects our runner containers, as the Engine's own filter syntax —
+// `label=<key>=<value>`. It is what `Daemon.ListContainersByLabel` is given.
+//
+// It is **not** a bare `key=value`, and the difference is load-bearing. The two
+// conventions collided the first time this path worked: the filter was declared
+// `"label=msout.role=runner"` and the client encoded it a second time, producing
+//
+//	{"label":["label=msout.role=runner"]}
+//
+// which selects a label *named* `label` whose value is `msout.role=runner`. No
+// container has that, so reconciliation silently adopted nothing and removed nothing
+// while reporting `boot reconciliation complete`.
+//
+// Two ways this could be resolved, and which was chosen:
+//   - strip `label=` here and let the client do the encoding, so the constant is a
+//     bare `key=value` and the parameter means what its name says
+//   - keep the Engine syntax and have the client detect a leading `label=`
+//
+// The second was rejected: a value that means one thing to its caller and another to
+// the thing it is passed to is the same class of bug as a container path used as a
+// bind source. `ListContainersByLabel` takes a **label** and encodes it, and the
+// encoding is asserted in `list_test.go`.
+const RunnerFilter = Role + "=" + RoleRunner

@@ -34,6 +34,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Ms-OneNote-Exporter/microsoft-onenote-exporter-web-backend/orchestrator/internal/labels"
 )
 
 // startListEngine returns a client whose Engine records the request line.
@@ -140,4 +142,56 @@ func TestAListOfIdsIsReturned(t *testing.T) {
 func stripPath(uri string) string {
 	_, query, _ := strings.Cut(uri, "?")
 	return query
+}
+
+// TestTheFilterIsNotDoubleEncoded is the collision this file's sibling commit fixed.
+//
+// `labels.RunnerFilter` was declared `"label=msout.role=runner"` — the Engine's own
+// filter syntax — and this function encoded it again, producing
+//
+//	{"label":["label=msout.role=runner"]}
+//
+// which selects a label *named* `label`. Reconciliation then adopted nothing and
+// removed nothing while reporting `boot reconciliation complete`, and the live count
+// of orphaned runner containers **went up** after a restart.
+//
+// So the assertion is on the exact string the Engine receives for the value the pool
+// actually passes, and a `label=` prefix in the input is the specific thing it refuses.
+func TestTheFilterIsNotDoubleEncoded(t *testing.T) {
+	// **`labels.RunnerFilter` itself, not a literal copy of it.**
+	//
+	// The first version of this test hardcoded `"msout.role=runner"` with a comment
+	// saying it was the exact value `Pool.Reconcile` passes. It was not: it was a
+	// copy, and it kept passing when the constant was reverted to the double-encoded
+	// form. A test that pins one end of a two-ended agreement does not pin the
+	// agreement — which is the bug it was written for.
+	filter := labels.RunnerFilter
+
+	c, seen := startListEngine(t, `[]`)
+	if _, err := c.ListContainersByLabel(t.Context(), filter); err != nil {
+		t.Fatalf("ListContainersByLabel: %v", err)
+	}
+
+	q, err := url.ParseQuery(stripPath(*seen))
+	if err != nil {
+		t.Fatalf("query did not parse: %v", err)
+	}
+	var decoded map[string][]string
+	if err := json.Unmarshal([]byte(q.Get("filters")), &decoded); err != nil {
+		t.Fatalf("filters is not JSON: %q", q.Get("filters"))
+	}
+
+	got, ok := decoded["label"]
+	if !ok || len(got) != 1 {
+		t.Fatalf(`decoded filters = %v, want one "label" entry`, decoded)
+	}
+	if got[0] != filter {
+		t.Errorf("filters[\"label\"] = %q, want %q", got[0], filter)
+	}
+	// Named explicitly, because this is the whole bug and it is invisible: a leading
+	// `label=` is *valid JSON in the right place*, just a filter for a different label.
+	if strings.HasPrefix(got[0], "label=") {
+		t.Errorf("the filter is double-encoded: %q selects a label named `label`. "+
+			"Reconciliation would find nothing and report success", got[0])
+	}
 }

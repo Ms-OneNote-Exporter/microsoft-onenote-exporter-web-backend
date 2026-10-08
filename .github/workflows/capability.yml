@@ -432,6 +432,12 @@ jobs:
           echo "only caddy is published"
 
       - name: the edge network holds Caddy alone
+        # `!= 1` is sound here, unlike the count on the credential-path network below,
+        # which encoded an accident. This one is **structural**: `caddy` is the only
+        # service in `docker-compose.yml` that joins `msout-edge`, and none of them is
+        # profile-gated, so no pool size or profile can add a second member. Stated
+        # because "is this 1 structural or accidental?" is the question worth asking of
+        # every count, and the answer was not obvious from this file alone.
         run: |
           set -euo pipefail
           members=$(docker network inspect "${COMPOSE_PROJECT_NAME}_msout-edge" \

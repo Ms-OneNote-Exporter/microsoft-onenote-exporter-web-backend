@@ -158,7 +158,17 @@ jobs:
           echo "generated $(ls "$SECRETS_DIR" | wc -l) throwaway secret files in $SECRETS_DIR"
 
       - name: build
-        run: docker compose build
+        # `--profile runner`, because the runner service sits behind a profile and a
+        # plain `build` **silently skips it**. That is not a slow build, it is no
+        # build: the image the orchestrator is then told to pull does not exist, and
+        # the only symptom is
+        #
+        #     404 {"message":"No such image: .../msout-runner:8dcf96e"}
+        #
+        # every ten seconds, from a component whose create path this file is now
+        # supposed to be testing. The dev runner is started further down and would
+        # have hit the same wall; `build` was the only thing not doing it.
+        run: docker compose --profile runner build
 
       - name: provision the runner's egress network
         # Compose **prunes** `msout-runner`: the only service that would join it is

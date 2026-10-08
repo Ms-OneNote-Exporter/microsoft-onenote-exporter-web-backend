@@ -245,6 +245,13 @@ jobs:
           # The api image is stamped with this, and an unset one is asserted as a
           # failure rather than defaulted.
           IMAGE_TAG: "0000000"
+          # Absolute host paths, required by compose. The orchestrator hands them to
+          # the Engine as bind sources, and a bind source is resolved on the host —
+          # so a value that only exists inside this container is exactly the bug
+          # these were introduced to stop. Matching `capability.yml` and
+          # `assert-compose.test.mjs`.
+          VAULT_HOST_DIR: /srv/msout/vault-host
+          ARTIFACT_HOST_DIR: /srv/msout/artifacts-host
         run: docker compose --profile runner -f docker-compose.yml config --quiet
 
       - name: the required host name is genuinely required

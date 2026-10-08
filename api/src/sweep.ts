@@ -112,6 +112,16 @@ export function idleExpiresAt(session: SessionRow, now: number): number | null {
  * What this type adds is the orchestrator call that turns a claimed slot into a
  * running container, and the compensation when that call fails.
  */
+/**
+ * CLAIM_ATTEMPTS bounds how many slots one login may try.
+ *
+ * Each attempt costs a container create at most, and a conflict costs none — the
+ * orchestrator refuses before doing work — so three is cheap. The number that matters
+ * is that it is finite: a peer this process cannot agree with should produce an error a
+ * human can see, not a request that never returns.
+ */
+const CLAIM_ATTEMPTS = 3;
+
 export class PoolBinder {
   readonly #db: Db;
   readonly #orchestrator: OrchestratorApi;
@@ -144,7 +154,7 @@ export class PoolBinder {
     | { ok: true; runnerId: string; containerId: string; runnerUrl: string | null }
     | {
         ok: false;
-        reason: "pool-exhausted" | "orchestrator-unreachable";
+        reason: "pool-exhausted" | "orchestrator-unreachable" | "slot-conflict";
         /**
          * Why the pool could not fill, when the orchestrator said.
          *
@@ -153,6 +163,64 @@ export class PoolBinder {
          * being paged. Found by deploying to a host where every create failed: the
          * api said *every session is busy* for hours while `healthz` said `ok`.
          */
+        fillError?: string;
+      }
+  > {
+    // Retried a bounded number of times, and only for a **conflict** — the one
+    // outcome that a different row can fix.
+    //
+    // The point is that this process and the orchestrator keep durable, independent
+    // records of the same pool, and they can drift: the orchestrator renumbers or
+    // removes a slot, and the SQLite row outlives it. A single attempt turns that drift
+    // into a failed login for the user, every time, with no self-correction. Retrying
+    // after dropping the offending row makes the drift self-healing at the moment it is
+    // observed, which is the only point at which the offending row is known.
+    //
+    // Bounded because an unbounded loop against a disagreeing peer is a way to hang a
+    // request. Three is enough to clear the drift seen in practice (a pool renumbered
+    // across a restart) and short enough that a genuine disagreement surfaces as an
+    // error rather than a timeout.
+    for (let attempt = 1; ; attempt++) {
+      const result = await this.#claimOnce(session);
+      if (result.ok) return result;
+      if (result.reason !== "slot-conflict") return result;
+      if (attempt >= CLAIM_ATTEMPTS) {
+        this.#log.warn("every claimed slot was refused; giving up on this session", {
+          session: session.guid,
+          attempts: attempt,
+        });
+        return result;
+      }
+      // Before retrying, ask the orchestrator what the pool actually is. The row that
+      // was just dropped was this process's only evidence about membership, and
+      // without re-learning, `claimRunner` can only pick from what is left — which, if
+      // the drift removed every row, is nothing.
+      const stats = await this.#orchestrator.stats();
+      if (!stats.ok || stats.value.slotIds === undefined) {
+        // No membership to learn from. Retrying would only re-pick the same rows.
+        return result;
+      }
+      const learned = syncPool(this.#db, stats.value.slotIds);
+      if (learned.added > 0) {
+        this.#log.info("pool slots re-learned after a refused claim", {
+          session: session.guid,
+          added: learned.added,
+          total: learned.total,
+          attempt,
+        });
+      }
+    }
+  }
+
+  /**
+   * claimOnce makes one full pass: take a SQLite row, then ask the orchestrator for
+   * that slot. The retry policy lives in `claimForLogin`.
+   */
+  async #claimOnce(session: SessionRow): Promise<
+    | { ok: true; runnerId: string; containerId: string; runnerUrl: string | null }
+    | {
+        ok: false;
+        reason: "pool-exhausted" | "orchestrator-unreachable" | "slot-conflict";
         fillError?: string;
       }
   > {
@@ -236,7 +304,11 @@ export class PoolBinder {
     now: number,
   ): Promise<
     | { ok: true; runnerId: string; containerId: string; runnerUrl: string | null }
-    | { ok: false; reason: "pool-exhausted" | "orchestrator-unreachable"; fillError?: string }
+    | {
+        ok: false;
+        reason: "pool-exhausted" | "orchestrator-unreachable" | "slot-conflict";
+        fillError?: string;
+      }
   > {
     const claimed = this.#db.get<{ id: string }>(
       `SELECT id FROM runners WHERE session_guid = ?`,
@@ -266,6 +338,31 @@ export class PoolBinder {
     );
 
     if (!result.ok) {
+      // A **conflict** means the slot named is not usable: either the orchestrator has
+      // never heard of it, or it holds it for someone else. Both say the same thing
+      // about this process's row — it describes a slot that is not available — so the
+      // row is *removed* rather than released, and another attempt is made.
+      //
+      // Release would leave the row `idle` and claimable, and the next `claimRunner`
+      // picks by `ORDER BY RANDOM()`, so the stale row would be offered again and again
+      // while the orchestrator kept refusing it. Observed on a live host: `api` held
+      // `slot-2` with `runner_url = http://msout-runner-slot-2:3100` while the
+      // orchestrator reported `size: 1, slotIds: ["slot-1"]`, so the login could not
+      // start at all. Every attempt burned a session against the same bad row.
+      //
+      // Removing the row is what the orchestrator's answer means: it does not have this
+      // slot, so this process should stop offering it. `syncPool` puts back the ones
+      // that do exist.
+      if (result.error.kind === "conflict") {
+        this.#db.removeRunner(claimed.id);
+        this.#log.warn("orchestrator refused the claimed slot; row dropped", {
+          session: session.guid,
+          runner: claimed.id,
+          error: result.error.kind as string,
+        });
+        return { ok: false, reason: "slot-conflict" };
+      }
+
       // Compensate. A slot claimed in SQLite but never given a container is a
       // slot that never becomes available again — the pool shrinks by one per
       // failed call and nothing would notice.

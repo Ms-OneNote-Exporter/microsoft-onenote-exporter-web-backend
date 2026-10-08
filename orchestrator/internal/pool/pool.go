@@ -135,6 +135,32 @@ type Pool struct {
 	mu    sync.Mutex
 	slots map[string]*Slot
 
+	// bootstrapped records that this process has established its own pool, as
+	// opposed to having just started.
+	//
+	// It exists because "a container names a slot this pool does not have" has two
+	// completely different meanings, and the older code could only see one of them:
+	//
+	//   - **cold start.** `Reconcile` runs at boot, before `EnsurePool`, so `p.slots`
+	//     is empty and *every* runner the daemon still has looks like an orphan. Reading
+	//     that as "remove it" deleted the entire pool on every restart.
+	//   - **an erase removed the slot** while this process was running, which really
+	//     does leave an orphan with nothing to reconcile into.
+	//
+	// Observed on a live host, at the orchestrator's boot after a redeploy:
+	//
+	//     WARN reconcile: runner for unknown slot, removing  container=329029f8… slot=slot-2
+	//     INFO boot reconciliation complete  slots:0
+	//
+	// One container destroyed — bound to a session mid-login, its vault holding a
+	// cookie jar — and then reconciliation reported an empty pool, which is a
+	// perfectly consistent description of a total loss. Nothing downstream could
+	// tell the difference, which is why this went unnoticed until a user pressed a
+	// button: `/healthz` was honest, CI was green, and the pool was reliably empty.
+	//
+	// The cold start is the case that must adopt. See `Reconcile`.
+	bootstrapped bool
+
 	// rand picks an idle slot at random. PLANNING/PLAN-v2.md §2.4 specifies
 	// ORDER BY RANDOM() in the SQLite claim, so this matches it: spreading
 	// load across runners rather than always handing out the same one, which
@@ -610,15 +636,36 @@ func (p *Pool) EnsurePool(ctx context.Context) error {
 	// slot being refilled and a freshly created one look identical mid-flight.
 	newlyRegistered := make(map[string]bool, need)
 	for i := 0; i < need; i++ {
+		// **Skip an id that is already in use.**
+		//
+		// `nextSlotSeq` is a process-global counter starting at 1, so after a restart it
+		// re-offers ids that boot reconciliation has just adopted from container labels.
+		// Assigning blindly wrote `p.slots["slot-1"] = <new slot>` straight over the
+		// adopted one: the container was still running, its id still in `runner_url`,
+		// and the pool had forgotten it held anything — a second, quieter version of the
+		// same bug, reached inside a single boot rather than across a restart.
+		//
+		// It only matters because adoption became possible. Before this, an adopted slot
+		// could not exist, so there was nothing to collide with.
+		var id string
+		for {
+			id = fmt.Sprintf("slot-%d", nextSlotSeq)
+			nextSlotSeq++
+			if _, taken := p.slots[id]; !taken {
+				break
+			}
+		}
 		slot := &Slot{
-			ID:    fmt.Sprintf("slot-%d", nextSlotSeq),
+			ID:    id,
 			State: StateStarting,
 		}
-		nextSlotSeq++
 		p.slots[slot.ID] = slot
 		created = append(created, slot)
 		newlyRegistered[slot.ID] = true
 	}
+	// From here on, a slot absent from `p.slots` means it was removed deliberately.
+	// See the `bootstrapped` field for why that distinction is load-bearing.
+	p.bootstrapped = true
 	p.mu.Unlock()
 
 	if len(vacant) == 0 && need <= 0 {
@@ -766,9 +813,32 @@ func (p *Pool) Reconcile(ctx context.Context, sessionExpired func(guid string) b
 
 		p.mu.Lock()
 		slot, exists := p.slots[slotID]
+		coldStart := !p.bootstrapped
+		if !exists && coldStart {
+			// **Adopt, do not remove.**
+			//
+			// At boot `p.slots` is empty because this process just started, not because
+			// anything erased the slot. The container's `msout.slot.id` label is the only
+			// durable record that this slot existed, and it outlived the process — which
+			// is the whole premise of the slot/container split in PLAN-v3 §2.5.
+			//
+			// Registering the slot from the label is what makes a restart a restart
+			// rather than a wipe. It also keeps the id stable, which the api depends on:
+			// `sessions.runner_id` and the `runners` table are SQLite rows that outlive
+			// this process and name this slot. Renumbering on every boot made those rows
+			// refer to slots that no longer existed, and the api — which now asks for a
+			// slot by name rather than accepting whichever one it was handed — got a
+			// 409 it correctly read as "your view is stale".
+			slot = &Slot{ID: slotID, State: StateStarting}
+			p.slots[slotID] = slot
+			exists = true
+		}
 		p.mu.Unlock()
 
 		if !exists {
+			// Reached only once the pool is established, so a slot absent here means it
+			// was removed for real — an erase, or a recycle of the last slot — and the
+			// container genuinely has nothing to reconcile into.
 			p.log.Warn("reconcile: runner for unknown slot, removing",
 				"container", id, "slot", slotID)
 			if err := p.docker.RemoveContainer(ctx, id); err != nil {

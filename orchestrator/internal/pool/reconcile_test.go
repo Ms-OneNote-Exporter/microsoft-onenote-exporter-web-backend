@@ -33,6 +33,17 @@ type reconcileFixture struct {
 
 // newReconcileFixture returns a pool with one known slot, ready for
 // Reconcile to describe the daemon's containers against.
+//
+// It seeds `p.slots` directly, which means it stands for an **already-established**
+// pool — a long-running process that has its slots and is reconciling a container that
+// has since lost its slot to an erase. It also marks the pool bootstrapped, so the
+// cold-start path in `Reconcile` is not taken.
+//
+// That is the right default for these tests and it is also how this file managed to be
+// green while the pool was being wiped on every restart: seeding slots is exactly the
+// condition that does not hold at boot. The boot case is `newColdStartFixture` below,
+// and it was written afterwards, once it was clear that no test here could have
+// reached it.
 func newReconcileFixture(t *testing.T, poolSize int, seedSlots ...*Slot) *reconcileFixture {
 	t.Helper()
 	cfg := testConfig(t, poolSize)
@@ -40,10 +51,141 @@ func newReconcileFixture(t *testing.T, poolSize int, seedSlots ...*Slot) *reconc
 	p := New(cfg, d, discardLog())
 	now, _ := nowFixture()
 	p.now = func() time.Time { return now }
+	p.bootstrapped = true
 	for _, s := range seedSlots {
 		p.slots[s.ID] = s
 	}
 	return &reconcileFixture{p: p, d: d, cfg: cfg, now: now}
+}
+
+// newColdStartFixture returns a pool that has just started: no slots, and not
+// bootstrapped, which is the state `Reconcile` finds on boot in main.go — it runs
+// before `EnsurePool`.
+func newColdStartFixture(t *testing.T, poolSize int) *reconcileFixture {
+	t.Helper()
+	cfg := testConfig(t, poolSize)
+	d := newFakeDaemon()
+	p := New(cfg, d, discardLog())
+	now, _ := nowFixture()
+	p.now = func() time.Time { return now }
+	if len(p.slots) != 0 || p.bootstrapped {
+		t.Fatal("a cold-start pool must have no slots and must not be bootstrapped")
+	}
+	return &reconcileFixture{p: p, d: d, cfg: cfg, now: now}
+}
+
+// ---- cold start: the case that was not being tested at all ------------------
+//
+// Boot reconciliation ran before `EnsurePool`, so `p.slots` was empty and every runner
+// the daemon still had read as an orphan. On a real host that destroyed the pool on
+// every restart:
+//
+//     WARN reconcile: runner for unknown slot, removing  container=329029f8… slot=slot-2
+//     INFO boot reconciliation complete  slots:0
+//
+// The container was bound to a session mid-login, holding a cookie jar in its vault.
+// Deleting it is the one outcome boot reconciliation's own comment rules out: "Adopting
+// a container is the recoverable error here; deleting a live session is not."
+
+// A runner that survives a restart must be adopted, not deleted. The slot id comes
+// from the container's own label, which is the only durable record that it existed.
+func TestReconcileAtColdStartAdoptsARatherThanDeletingThePool(t *testing.T) {
+	f := newColdStartFixture(t, 1)
+	created := f.now.Add(-time.Minute)
+	ctr := f.d.add("idle", true, runnerLabels("slot-2", false, created, time.Time{}))
+
+	if err := f.p.Reconcile(t.Context(), nothingExpired); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if _, err := f.d.InspectContainer(t.Context(), ctr.id); err != nil {
+		t.Fatal("boot reconciliation deleted a runner that was still running; " +
+			"a restart must not be a wipe")
+	}
+	slots := f.p.Slots()
+	if len(slots) != 1 {
+		t.Fatalf("slots = %d, want 1", len(slots))
+	}
+	// The id must be the one in the label. Renumbering here is what made the api's
+	// SQLite rows name slots that did not exist.
+	if slots[0].ID != "slot-2" {
+		t.Errorf("adopted slot id = %q, want slot-2 from the container label", slots[0].ID)
+	}
+	if slots[0].ContainerID != ctr.id {
+		t.Errorf("adopted container = %q, want %q", slots[0].ContainerID, ctr.id)
+	}
+	if slots[0].State != StateIdle {
+		t.Errorf("state = %q, want idle", slots[0].State)
+	}
+}
+
+// The vault case: a runner bound to a live session is the one holding a credential, so
+// it is the one whose loss is unrecoverable. main.go passes `NeverExpire` at boot
+// because `api` is not reachable yet — which must not be read as "expire everything".
+func TestReconcileAtColdStartAdoptsABoundRunnerWithItsVault(t *testing.T) {
+	guid := "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+	f := newColdStartFixture(t, 1)
+	created := f.now.Add(-time.Minute)
+	expires := f.now.Add(time.Hour)
+	ctr := f.d.add("bound", true, runnerLabels("slot-2", true, created, expires))
+
+	if err := f.p.Reconcile(t.Context(), nothingExpired); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if _, err := f.d.InspectContainer(t.Context(), ctr.id); err != nil {
+		t.Fatal("boot reconciliation deleted a bound runner; its vault held the " +
+			"cookie jar for a session in progress")
+	}
+	slots := f.p.Slots()
+	if len(slots) != 1 {
+		t.Fatalf("slots = %d, want 1", len(slots))
+	}
+	if slots[0].State != StateBound || slots[0].SessionGUID != guid {
+		t.Errorf("adopted as %q/%q, want bound/%s", slots[0].State, slots[0].SessionGUID, guid)
+	}
+}
+
+// Adoption and pool filling happen back to back on every boot, so they must not fight.
+// `nextSlotSeq` is a process-global starting at 1: without skipping ids already in use,
+// filling a pool that adopted `slot-1` overwrote the entry for a container that was
+// still running.
+func TestEnsurePoolDoesNotOverwriteASlotAdoptedAtColdStart(t *testing.T) {
+	f := newColdStartFixture(t, 2)
+	created := f.now.Add(-time.Minute)
+	ctr := f.d.add("idle", true, runnerLabels("slot-1", false, created, time.Time{}))
+	if err := f.p.Reconcile(t.Context(), nothingExpired); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if err := f.p.EnsurePool(t.Context()); err != nil {
+		t.Fatalf("EnsurePool: %v", err)
+	}
+
+	slots := f.p.Slots()
+	if len(slots) != 2 {
+		t.Fatalf("slots = %d, want 2: %+v", len(slots), slots)
+	}
+	var adopted int
+	for _, s := range slots {
+		if s.ContainerID == ctr.id {
+			adopted++
+			if s.ID != "slot-1" {
+				t.Errorf("adopted container is now in %q, want slot-1", s.ID)
+			}
+		}
+	}
+	if adopted != 1 {
+		t.Errorf("the adopted container appears in %d slots, want exactly 1 — "+
+			"EnsurePool overwrote it", adopted)
+	}
+	ids := map[string]bool{}
+	for _, s := range slots {
+		if ids[s.ID] {
+			t.Errorf("duplicate slot id %q", s.ID)
+		}
+		ids[s.ID] = true
+	}
 }
 
 // nothingExpired is the SessionLookup used where expiry is not under test.

@@ -752,9 +752,7 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
     }
 
     // Listing needs an authenticated session, because the CLI reads auth.json.
-    if (session.auth_state !== "valid") {
-      return reply.code(409).send({ error: "not authenticated" });
-    }
+    if (requireAuthenticated(session, reply) !== null) return reply;
 
     if (session.runner_id === null) {
       return reply.code(409).send({ error: "no runner bound to this session" });
@@ -822,9 +820,7 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
       return reply.code(400).send({ error: "notebook is required" });
     }
 
-    if (session.auth_state !== "valid") {
-      return reply.code(409).send({ error: "not authenticated" });
-    }
+    if (requireAuthenticated(session, reply) !== null) return reply;
 
     // §8.1: one active export per session. Driven from the stored state rather
     // than from anything the client sent, so a second tab cannot start a second
@@ -1121,6 +1117,64 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
   app.get("/healthz", async (_request, reply) =>
     reply.send({ ok: true, protocol: PROTOCOL_VERSION, build: API_BUILD }),
   );
+}
+
+/**
+ * requireAuthenticated refuses a session that cannot use a runner route, and says
+ * **which** way it cannot.
+ *
+ * It used to answer one thing for all four unusable states:
+ *
+ *     if (session.auth_state !== "valid") return reply.code(409).send({ error: "not authenticated" });
+ *
+ * So `authenticating` and `failed` were indistinguishable, and those want opposite
+ * advice. Observed on a live host: a session whose login the runner had already
+ * **rejected** was told, on the next click,
+ *
+ *     "Still signing in — the service is not ready to list notebooks yet. Try again in a moment."
+ *
+ * There was no "in a moment". The credential had been refused by Microsoft, `auth_state`
+ * was `failed`, and the only thing that could change it was a new sign-in.
+ *
+ * This is the cost of #34: `markAuthFailed` made `failed` a state a session can actually
+ * reach, and every consumer of `auth_state` was left reading four states as one. A field
+ * becoming distinguishable in storage is not the same as anything reading it.
+ *
+ * `retryable` is the part that has to be right. Telling a user to retry a rejected
+ * credential sends them round a loop that cannot end, and the client cannot infer which
+ * case it is — that is why `reason` is in the body.
+ */
+function requireAuthenticated(
+  session: SessionRow,
+  reply: FastifyReply,
+): FastifyReply | null {
+  if (session.auth_state === "valid") return null;
+
+  const body =
+    session.auth_state === "authenticating"
+      ? {
+          error: "still signing in; the service is not ready yet",
+          reason: session.auth_state,
+          retryable: true,
+        }
+      : session.auth_state === "failed"
+        ? {
+            error: "sign in again; the last attempt was refused",
+            reason: session.auth_state,
+            // Not retryable. The credential was rejected, and repeating it cannot
+            // change that - only a new sign-in can.
+            retryable: false,
+          }
+        : {
+            error:
+              session.auth_state === "expired"
+                ? "sign in again; the session's Microsoft sign-in has expired"
+                : "sign in before using a runner",
+            reason: session.auth_state,
+            retryable: false,
+          };
+
+  return reply.code(409).send(body);
 }
 
 /**

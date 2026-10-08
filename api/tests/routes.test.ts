@@ -635,7 +635,12 @@ describe("POST /api/session/notebooks", () => {
     seed(GUID, { auth: "none" });
     const response = await post({});
     expect(response.statusCode).toBe(409);
-    expect(response.json().error).toBe("not authenticated");
+    // Used to assert the single string "not authenticated", which was the same answer
+    // for four different states. A session that never signed in now says so, and says
+    // it is not retryable — the exhaustive version is in `auth-state-answer.test.ts`.
+    expect(response.json().error).toBe("sign in before using a runner");
+    expect(response.json().reason).toBe("none");
+    expect(response.json().retryable).toBe(false);
   });
 
   it("requires a bound runner", async () => {

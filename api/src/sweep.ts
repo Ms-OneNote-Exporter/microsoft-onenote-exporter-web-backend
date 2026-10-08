@@ -252,7 +252,18 @@ export class PoolBinder {
       return { ok: false, reason: "orchestrator-unreachable" };
     }
 
-    const result = await this.#orchestrator.claim(session.guid, new Date(session.expires_at));
+    // The slot is **named**, not left to the orchestrator's own random pick.
+    //
+    // `claimRunner` claimed a SQLite row, and that row's id *is* the slot identity
+    // this process will hand back on `release`. If the orchestrator then chose a
+    // different slot, that transaction was locking a row nobody releases — and the
+    // mismatch is invisible until a release 409s against a slot with no container,
+    // while the slot that does have the container leaks.
+    const result = await this.#orchestrator.claim(
+      session.guid,
+      new Date(session.expires_at),
+      claimed.id,
+    );
 
     if (!result.ok) {
       // Compensate. A slot claimed in SQLite but never given a container is a
@@ -277,19 +288,58 @@ export class PoolBinder {
     // instead of being built here, and the NULL is what makes the difference
     // visible: the session gets a runner it cannot call, which reports itself,
     // rather than a 401 from a guessed hostname.
+    // **The orchestrator's answer is what gets recorded, not `claimed.id`.**
+    //
+    // Naming the slot makes them agree, and recording the answer means they agree
+    // *even when they do not* — an orchestrator that has not shipped the field picks
+    // its own slot, and recording that is correct while recording our guess would not
+    // be. The disagreement is then visible as a row whose id differs from
+    // `sessions.runner_id`, rather than as a silent mis-binding.
+    //
+    // `slotId` is absent only from an orchestrator too old to report it, which is a
+    // rolling-deploy state and not a defect — see ClaimResponse.
+    const slotId = result.value.slotId ?? claimed.id;
+    if (slotId !== claimed.id) {
+      // The two disagree, so the bookkeeping is put right in both directions.
+      //
+      // The wrongly-claimed row goes back to idle: nothing is bound to it, and a row
+      // stuck in `claimed` is capacity the pool believes it has lost.
+      //
+      // And the slot actually in use is **claimed for this session**. Leaving that to
+      // one-sided updates was a hole in the first version of this fix: `claimRunner` had
+      // set `session_guid` on the *claimed* row, so the row now holding the container
+      // stayed idle and unclaimed — and the pool would have handed it to a second
+      // session while this one was still using it. Both writes, or the pool does not
+      // know which slot it has given away.
+      this.#db.run(
+        `UPDATE runners SET session_guid = NULL, status = 'idle' WHERE id = ?`,
+        claimed.id,
+      );
+      this.#db.run(
+        `UPDATE runners SET session_guid = ?, status = 'claimed' WHERE id = ?`,
+        session.guid,
+        slotId,
+      );
+      this.#log.warn("orchestrator used a different slot than the one claimed", {
+        session: session.guid,
+        claimed: claimed.id,
+        used: slotId,
+      });
+    }
+
     this.#db.run(
       `UPDATE runners
           SET container_id = ?, runner_url = ?, status = 'active', health = 'unknown'
         WHERE id = ?`,
       result.value.containerId,
       result.value.runnerUrl ?? null,
-      claimed.id,
+      slotId,
     );
     this.#db.run(
       `UPDATE sessions SET runner_id = ?, state = 'authenticating', auth_state = 'authenticating',
                           idle_expires_at = ?, last_activity_at = ?
         WHERE guid = ?`,
-      claimed.id,
+      slotId,
       now + TTL.loginInProgress,
       now,
       session.guid,
@@ -297,7 +347,7 @@ export class PoolBinder {
 
     this.#log.info("runner claimed", {
       session: session.guid,
-      runner: claimed.id,
+      runner: slotId,
       container: result.value.containerId,
       // Logged rather than assumed: an absent address means every subsequent
       // runner call fails, and the warning belongs next to the claim that
@@ -306,7 +356,7 @@ export class PoolBinder {
     });
     return {
       ok: true,
-      runnerId: claimed.id,
+      runnerId: slotId,
       containerId: result.value.containerId,
       runnerUrl: result.value.runnerUrl ?? null,
     };

@@ -288,8 +288,42 @@ func (p *Pool) FillFailures() int { return p.fillFailures() }
 // estimate the caller shows the user is computed from session rows in SQLite,
 // and a queued claim here would hold a request open with no way to communicate
 // when it would be satisfied.
-func (p *Pool) Claim(ctx context.Context, sessionGUID string, sessionExpiresAt time.Time) (*Slot, error) {
+// Claim takes an idle slot and binds it to a session.
+//
+// wantSlot, when non-empty, names the slot to take. The caller has usually already
+// claimed that slot in its own store — `api` claims a row in SQLite precisely so a
+// later `release` is guaranteed to find the same slot — so taking a *different* one
+// would leave that transaction locking a row nobody releases.
+//
+// **A named slot is taken or the claim conflicts. It is never silently substituted.**
+// Answering 200 with a different slot would be the same disagreement in a worse form:
+// the caller records a slot it does not own and finds out at release time, when the
+// release 409s against a slot that has no container.
+//
+// The fallback to a random idle slot is kept for a caller that names none, which is
+// what an `api` that has not yet shipped this field does.
+func (p *Pool) Claim(ctx context.Context, sessionGUID string, sessionExpiresAt time.Time, wantSlot string) (*Slot, error) {
 	p.mu.Lock()
+
+	if wantSlot != "" {
+		slot, ok := p.slots[wantSlot]
+		if !ok {
+			// An unknown slot is not "try another" — it is a disagreement about the
+			// pool's own membership, which is what `syncPool` exists to prevent.
+			p.mu.Unlock()
+			return nil, ErrUnknownSlot
+		}
+		if !slot.IsIdle() {
+			p.mu.Unlock()
+			return nil, ErrAlreadyBound
+		}
+		p.bindLocked(slot, sessionGUID, sessionExpiresAt)
+		idleContainerID := slot.ContainerID
+		slotID := slot.ID
+		p.mu.Unlock()
+		return p.provision(ctx, slot, sessionGUID, sessionExpiresAt, slotID, idleContainerID)
+	}
+
 	idle := make([]*Slot, 0, len(p.slots))
 	for _, s := range p.slots {
 		if s.IsIdle() {
@@ -314,16 +348,42 @@ func (p *Pool) Claim(ctx context.Context, sessionGUID string, sessionExpiresAt t
 		p.mu.Unlock()
 		return nil, ErrNoSlot
 	}
-	// Mark it bound before releasing the lock so a concurrent claim cannot pick
-	// it. The state is provisional: if the container work below fails, p.fail()
-	// puts the slot back to idle.
+	p.bindLocked(slot, sessionGUID, sessionExpiresAt)
+	idleContainerID := slot.ContainerID
+	slotID := slot.ID
+	p.mu.Unlock()
+
+	return p.provision(ctx, slot, sessionGUID, sessionExpiresAt, slotID, idleContainerID)
+}
+
+// bindLocked marks a slot bound. Callers must hold p.mu.
+//
+// Split out so the two arms of `Claim` — named slot and random slot — cannot drift
+// on what "bound" means. The state is provisional: if the container work in
+// `provision` fails, `fail` puts the slot back to idle.
+func (p *Pool) bindLocked(slot *Slot, sessionGUID string, sessionExpiresAt time.Time) {
 	slot.State = StateBound
 	slot.SessionGUID = sessionGUID
 	slot.BoundAt = p.now()
 	slot.SessionExpiresAt = sessionExpiresAt
-	idleContainerID := slot.ContainerID
-	slotID := slot.ID
-	p.mu.Unlock()
+}
+
+// provision replaces an idle container with a session-bound one.
+//
+// The idle container cannot be reused. Docker mounts are fixed at create
+// time, so a runner that must hold vault/<guid> is a different container
+// from one holding a tmpfs /data — and an idle container deliberately holds
+// only a tmpfs, because an idle runner should not have a credential-bearing
+// mount at all. Claim therefore replaces the container.
+//
+// This is also the right security shape rather than merely the necessary
+// one: the browser process tree that was idle is discarded, so no state
+// carries across into the session that is about to type a password.
+func (p *Pool) provision(ctx context.Context, slot *Slot, sessionGUID string,
+	sessionExpiresAt time.Time, slotID, idleContainerID string) (*Slot, error) {
+	// The slot is already bound and the lock already released: `Claim` did both
+	// under p.mu via bindLocked, so a concurrent claim cannot take this slot while
+	// its container is being replaced.
 
 	// The idle container cannot be reused. Docker mounts are fixed at create
 	// time, so a runner that must hold vault/<guid> is a different container

@@ -465,7 +465,7 @@ func TestFailedClaimReturnsTheSlotToThePool(t *testing.T) {
 	// Fail the container creation the claim depends on.
 	d.failNext("remove", fmt.Errorf("daemon refused"))
 
-	_, err := p.Claim(t.Context(), "3f2504e0-4f89-11d3-9a0c-0305e82c3301", time.Now().Add(time.Hour))
+	_, err := p.Claim(t.Context(), "3f2504e0-4f89-11d3-9a0c-0305e82c3301", time.Now().Add(time.Hour), "")
 	if err == nil {
 		t.Fatal("expected an error when the daemon fails mid-claim")
 	}
@@ -497,7 +497,7 @@ func TestClaimReplacesTheIdleContainerWithABoundOne(t *testing.T) {
 	}
 
 	guid := "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
-	slot, err := p.Claim(t.Context(), guid, time.Now().Add(time.Hour))
+	slot, err := p.Claim(t.Context(), guid, time.Now().Add(time.Hour), "")
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -561,7 +561,7 @@ func TestConcurrentClaimsCannotShareAContainer(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			guid := fmt.Sprintf("3f2504e0-4f89-11d3-9a0c-%012d", i)
-			slot, err := p.Claim(t.Context(), guid, time.Now().Add(time.Hour))
+			slot, err := p.Claim(t.Context(), guid, time.Now().Add(time.Hour), "")
 			if err != nil {
 				errs <- err
 				return
@@ -619,7 +619,7 @@ func TestRecycleKeepsTheSessionAndTheSlot(t *testing.T) {
 
 	guid := "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
 	expires := time.Now().Add(time.Hour)
-	claimed, err := p.Claim(t.Context(), guid, expires)
+	claimed, err := p.Claim(t.Context(), guid, expires, "")
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -664,7 +664,7 @@ func TestReleaseFreesTheSlotWithoutDeletingIt(t *testing.T) {
 		t.Fatalf("EnsurePool: %v", err)
 	}
 	guid := "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
-	claimed, err := p.Claim(t.Context(), guid, time.Now().Add(time.Hour))
+	claimed, err := p.Claim(t.Context(), guid, time.Now().Add(time.Hour), "")
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -709,7 +709,7 @@ func TestEnsurePoolRefillsAfterRelease(t *testing.T) {
 		t.Fatalf("EnsurePool: %v", err)
 	}
 	guid := "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
-	claimed, err := p.Claim(t.Context(), guid, time.Now().Add(time.Hour))
+	claimed, err := p.Claim(t.Context(), guid, time.Now().Add(time.Hour), "")
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -735,7 +735,7 @@ func TestEnsurePoolRefillsAfterRelease(t *testing.T) {
 		t.Errorf("idle = %d after refill, want 2: %+v", idle, p.Stats().ByState)
 	}
 	// And the refilled runner is claimable again.
-	if _, err := p.Claim(t.Context(), guid, time.Now().Add(time.Hour)); err != nil {
+	if _, err := p.Claim(t.Context(), guid, time.Now().Add(time.Hour), ""); err != nil {
 		t.Errorf("claim after refill failed: %v", err)
 	}
 }
@@ -749,7 +749,7 @@ func TestClaimOnExhaustedPoolIsErrNoSlot(t *testing.T) {
 	p.slots["slot-1"] = &Slot{ID: "slot-1", State: StateBound, SessionGUID: "a"}
 	p.slots["slot-2"] = &Slot{ID: "slot-2", State: StateBound, SessionGUID: "b"}
 
-	_, err := p.Claim(t.Context(), "3f2504e0-4f89-11d3-9a0c-0305e82c3301", time.Now().Add(time.Hour))
+	_, err := p.Claim(t.Context(), "3f2504e0-4f89-11d3-9a0c-0305e82c3301", time.Now().Add(time.Hour), "")
 	if err != ErrNoSlot {
 		t.Fatalf("claim on exhausted pool = %v, want ErrNoSlot", err)
 	}
@@ -765,7 +765,7 @@ func TestClaimSkipsNonIdleSlots(t *testing.T) {
 	p.slots["slot-2"] = &Slot{ID: "slot-2", State: StateDraining, ContainerID: "c-2"}
 	p.slots["slot-3"] = &Slot{ID: "slot-3", State: StateDead}
 
-	_, err := p.Claim(t.Context(), "3f2504e0-4f89-11d3-9a0c-0305e82c3301", time.Now().Add(time.Hour))
+	_, err := p.Claim(t.Context(), "3f2504e0-4f89-11d3-9a0c-0305e82c3301", time.Now().Add(time.Hour), "")
 	if err != ErrNoSlot {
 		t.Fatalf("claim with no idle slot = %v, want ErrNoSlot", err)
 	}
@@ -1197,4 +1197,108 @@ func slotIDsPool(t *testing.T, n int) *Pool {
 		p.slots[id] = &Slot{ID: id, State: StateIdle}
 	}
 	return p
+}
+
+// ---- Claim with a named slot -------------------------------------------------
+//
+// The api names the slot it already claimed in SQLite, because a lock on a row that is
+// not the slot holding the container is not a lock. Found on a real host, where
+// `slot-1` was recorded active while carrying `slot-2`'s address.
+
+func TestClaimTakesTheNamedSlot(t *testing.T) {
+	cfg := testConfig(t, 2)
+	p := New(cfg, newFakeDaemon(), nil)
+	if err := p.EnsurePool(t.Context()); err != nil {
+		t.Fatalf("EnsurePool: %v", err)
+	}
+	ids := slotIDsOf(p)
+	if len(ids) != 2 {
+		t.Fatalf("slot count = %d, want 2", len(ids))
+	}
+
+	// The one that is *not* first, so a random pick landing on it would be luck.
+	wanted := ids[1]
+	slot, err := p.Claim(t.Context(), "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa",
+		time.Now().Add(time.Hour), wanted)
+	if err != nil {
+		t.Fatalf("claim of %s: %v", wanted, err)
+	}
+	if slot.ID != wanted {
+		t.Errorf("claimed %q, asked for %q", slot.ID, wanted)
+	}
+}
+
+// A named slot that is not idle must **conflict**, never be silently substituted.
+// Answering 200 with a different slot is the same disagreement in a worse form: the
+// caller records a slot it does not own and finds out at release time.
+func TestClaimOfANonIdleSlotConflicts(t *testing.T) {
+	cfg := testConfig(t, 2)
+	p := New(cfg, newFakeDaemon(), nil)
+	if err := p.EnsurePool(t.Context()); err != nil {
+		t.Fatalf("EnsurePool: %v", err)
+	}
+	ids := slotIDsOf(p)
+	taken, err := p.Claim(t.Context(), "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb",
+		time.Now().Add(time.Hour), ids[0])
+	if err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+
+	// The same slot, a second time.
+	again, err := p.Claim(t.Context(), "cccccccc-3333-4333-8333-cccccccccccc",
+		time.Now().Add(time.Hour), taken.ID)
+	if err != ErrAlreadyBound {
+		t.Fatalf("second claim of a bound slot = %v, want ErrAlreadyBound", err)
+	}
+	if again != nil {
+		t.Errorf("a conflicting claim returned slot %q; it must return nothing rather "+
+			"than a slot the caller would record as its own", again.ID)
+	}
+}
+
+// An unknown slot is a disagreement about the pool's own membership, which is what
+// `syncPool` exists to prevent — so it is refused rather than treated as "pick another".
+func TestClaimOfAnUnknownSlotIsRefused(t *testing.T) {
+	cfg := testConfig(t, 1)
+	p := New(cfg, newFakeDaemon(), nil)
+	if err := p.EnsurePool(t.Context()); err != nil {
+		t.Fatalf("EnsurePool: %v", err)
+	}
+
+	slot, err := p.Claim(t.Context(), "dddddddd-4444-4444-8444-dddddddddddd",
+		time.Now().Add(time.Hour), "slot-99")
+	if err != ErrUnknownSlot {
+		t.Fatalf("claim of an unknown slot = %v, want ErrUnknownSlot", err)
+	}
+	if slot != nil {
+		t.Errorf("a refused claim returned slot %q", slot.ID)
+	}
+}
+
+// The unnamed form still works, because an api that has not shipped the field must
+// keep working during a rolling deploy.
+func TestClaimWithoutANamedSlotStillChoosesOne(t *testing.T) {
+	cfg := testConfig(t, 2)
+	p := New(cfg, newFakeDaemon(), nil)
+	if err := p.EnsurePool(t.Context()); err != nil {
+		t.Fatalf("EnsurePool: %v", err)
+	}
+
+	slot, err := p.Claim(t.Context(), "eeeeeeee-5555-4555-8555-eeeeeeeeeeee",
+		time.Now().Add(time.Hour), "")
+	if err != nil {
+		t.Fatalf("unnamed claim: %v", err)
+	}
+	if !slotIDsContain(slotIDsOf(p), slot.ID) {
+		t.Errorf("chose %q, which is not one of the pool's slots", slot.ID)
+	}
+}
+
+func slotIDsContain(haystack []string, needle string) bool {
+	for _, id := range haystack {
+		if id == needle {
+			return true
+		}
+	}
+	return false
 }

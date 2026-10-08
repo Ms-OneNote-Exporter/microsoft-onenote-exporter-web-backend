@@ -70,6 +70,27 @@ export type OrchestratorVerb =
 export interface ClaimBody {
   sessionGuid: string;
   sessionExpiresAtMs: number;
+  /**
+   * The slot to take, when this process has already claimed one.
+   *
+   * Sent because `claimRunner` claims a **SQLite row** and the slot's identity *is*
+   * that row's id — `release` and `recycle` take it straight back. Without this field
+   * the orchestrator picked an idle slot independently, at random, and the two
+   * routinely disagreed. Observed on a real host:
+   *
+   *     runners: slot-1  status=active  runner_url=http://msout-runner-slot-2:3100
+   *     /stats : slotIds=["slot-2"]  byState={"bound":1}
+   *
+   * — a slot recorded as active carrying another slot's address, and no slot-1
+   * container anywhere.
+   *
+   * **A lock on a row that is not the thing being locked is not a lock.** That is the
+   * whole argument for this process choosing rather than the orchestrator.
+   *
+   * Omitted when there is no claim to honour, so the call still works against an
+   * orchestrator that has not shipped the field.
+   */
+  slotId?: string;
 }
 
 /** The claim response. */
@@ -156,7 +177,11 @@ export type OrchestratorError =
  * `secret` and no way to make an unsigned call.
  */
 export interface OrchestratorApi {
-  claim(sessionGuid: string, sessionExpiresAt: Date): Promise<OrchestratorResult<ClaimResponse>>;
+  claim(
+    sessionGuid: string,
+    sessionExpiresAt: Date,
+    slotId?: string,
+  ): Promise<OrchestratorResult<ClaimResponse>>;
   release(slotId: string): Promise<OrchestratorResult<{ released: boolean }>>;
   recycle(slotId: string, reason: string): Promise<OrchestratorResult<{ recycled: boolean }>>;
   remove(slotId: string): Promise<OrchestratorResult<{ removed: boolean }>>;
@@ -303,10 +328,12 @@ export class OrchestratorClient implements OrchestratorApi {
   claim(
     sessionGuid: string,
     sessionExpiresAt: Date,
+    slotId?: string,
   ): Promise<OrchestratorResult<ClaimResponse>> {
     return this.#call<ClaimResponse>("POST", "/claim", {
       sessionGuid,
       sessionExpiresAtMs: sessionExpiresAt.getTime(),
+      ...(slotId === undefined ? {} : { slotId }),
     } satisfies ClaimBody);
   }
 

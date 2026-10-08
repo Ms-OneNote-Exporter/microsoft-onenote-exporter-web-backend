@@ -42,7 +42,7 @@ import (
 // followed by a TTL expiry produces.
 func claimAndRelease(t *testing.T, p *Pool, guid string) {
 	t.Helper()
-	claimed, err := p.Claim(context.Background(), guid, time.Now().Add(time.Hour))
+	claimed, err := p.Claim(context.Background(), guid, time.Now().Add(time.Hour), "")
 	if err != nil {
 		t.Fatalf("claim for %s: %v", guid, err)
 	}
@@ -149,7 +149,7 @@ func TestAVacantSlotIsNotReportedIdle(t *testing.T) {
 	if err := p.EnsurePool(t.Context()); err != nil {
 		t.Fatalf("initial EnsurePool: %v", err)
 	}
-	claimed, err := p.Claim(t.Context(), "55555555-5555-4555-8555-555555555555", time.Now().Add(time.Hour))
+	claimed, err := p.Claim(t.Context(), "55555555-5555-4555-8555-555555555555", time.Now().Add(time.Hour), "")
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}

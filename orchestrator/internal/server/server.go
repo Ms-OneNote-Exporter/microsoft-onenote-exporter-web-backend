@@ -243,9 +243,40 @@ type claimRequest struct {
 	SessionGUID string `json:"sessionGuid"`
 	// SessionExpiresAtMs is the session's absolute cap, in Unix ms.
 	SessionExpiresAtMs int64 `json:"sessionExpiresAtMs"`
+
+	// SlotID names the slot to take, when the caller has already chosen one.
+	//
+	// Optional, and the optionality is load-bearing during a rolling deploy: an
+	// `api` that has already switched sends it, one that has not does not, and both
+	// work because `Claim` falls back to choosing.
+	//
+	// **This field exists because the two sides were choosing independently.** `api`
+	// claimed a row in SQLite with `ORDER BY RANDOM()` and this pool chose an idle
+	// slot at random too, so the row `api` recorded was frequently not the slot that
+	// got the container. Observed on a real host:
+	//
+	//     runners: slot-1  status=active  runner_url=http://msout-runner-slot-2:3100
+	//     /stats : slotIds=["slot-2"]  byState={"bound":1}
+	//
+	// — a slot with an address belonging to a different slot, and no slot-1 container
+	// anywhere. Nothing failed; the api believed it held slot-1 and would ask for a
+	// release against a slot that has no container, while slot-2 leaked.
+	//
+	// The argument for the api choosing rather than this pool: `api` claims a row in
+	// SQLite precisely so that later `release` and `recycle` calls are guaranteed to
+	// find that slot idle again. **A lock on a row that is not the thing being locked
+	// is not a lock.** If this pool chose instead, `api`'s transaction would have to be
+	// redone against whatever came back — two writes where the design has one.
+	SlotID string `json:"slotId,omitempty"`
 }
 
 // handleClaim takes an idle slot and binds it to a session.
+//
+// When the request names a slot, that slot is taken or the claim conflicts. It is
+// **never silently substituted**: a caller holding a SQLite claim on slot-1 and being
+// handed slot-2 is the failure this field was added to remove, and answering 200 with
+// a different slot would reinstate it in a harder form — the caller would record a
+// slot it does not own and learn about the substitution only at release time.
 func (s *Server) handleClaim(c *call) (any, error) {
 	var req claimRequest
 	if err := c.decode(&req); err != nil {
@@ -262,7 +293,7 @@ func (s *Server) handleClaim(c *call) (any, error) {
 	}
 
 	slot, err := s.pool.Claim(c.req.Context(), req.SessionGUID,
-		time.UnixMilli(req.SessionExpiresAtMs))
+		time.UnixMilli(req.SessionExpiresAtMs), req.SlotID)
 	if err != nil {
 		return nil, err
 	}

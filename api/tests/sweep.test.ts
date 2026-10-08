@@ -37,17 +37,43 @@ function orchestratorStub(opts: {
   slotIds?: string[];
 }) {
   const calls: string[] = [];
+  let lastClaimBody: string | undefined;
   const client = new OrchestratorClient({
     baseUrl: "http://127.0.0.1:1",
     secret: "B".repeat(43),
-    fetchImpl: (async (url: string) => {
+    fetchImpl: (async (url: string, init?: RequestInit) => {
       // Parsed rather than string-replaced, so the stub works whatever baseUrl the
       // client was built with.
       const path = new URL(String(url)).pathname;
       calls.push(path);
       if (path === "/claim") {
+        // `OrchestratorClient` hands fetch a **Uint8Array** body, not a string —
+        // it sets `content-length` from `payload.length` — so a test that reads
+        // `typeof init.body === "string"` sees nothing and the stub silently falls
+        // back to its default. That is how the first version of this stub ended up
+        // ignoring the request it was supposed to be answering.
+        lastClaimBody = decodeBody(init?.body);
+      }
+      if (path === "/claim") {
         if (opts.claim === "ok") {
-          return new Response(JSON.stringify({ slotId: "slot-9", containerId: "ctr9" }));
+          // **Echoes the slot it was asked for**, the way a real orchestrator does now.
+          //
+          // It used to answer `"slot-9"` — a slot that exists nowhere — and every test
+          // passed, because the answer was ignored: the binder recorded its own claimed
+          // row and took only `containerId` from the response. That is precisely the bug
+          // this stub was hiding, and it is why the id was allowed to be nonsense.
+          //
+          // A fixture that only works because the code under test discards half of it is
+          // not a fixture; it is a second implementation of the wrong thing.
+          const asked = (() => {
+            try {
+              const body = JSON.parse(lastClaimBody ?? "{}") as { slotId?: string };
+              return body.slotId ?? opts.slotIds?.[0] ?? "slot-1";
+            } catch {
+              return opts.slotIds?.[0] ?? "slot-1";
+            }
+          })();
+          return new Response(JSON.stringify({ slotId: asked, containerId: "ctr9" }));
         }
         if (opts.claim === "conflict") return new Response("{}", { status: 409 });
         if (opts.claim === "pool-empty") return new Response("{}", { status: 503 });
@@ -97,6 +123,14 @@ function orchestratorStub(opts: {
     }) as typeof fetch,
   });
   return { client, calls };
+}
+
+/** `fetch` bodies arrive as bytes here, so a stub has to decode before parsing. */
+function decodeBody(body: unknown): string | undefined {
+  if (typeof body === "string") return body;
+  if (body instanceof Uint8Array) return new TextDecoder().decode(body);
+  if (body instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(body));
+  return undefined;
 }
 
 function seedSession(guid: string, overrides: Partial<SessionRow> = {}): SessionRow {
@@ -256,6 +290,7 @@ describe("PoolBinder.claimForLogin", () => {
   // must not claim a slot the orchestrator has not named — the ids have to be its
   // own, because they go back to it as `slotId`.
   it("claims only a slot the orchestrator named, not one invented locally", async () => {
+    // debug helper
     seedRunners(1);
     seedSession(GUID, { state: "created" });
     const { client } = orchestratorStub({
@@ -265,18 +300,23 @@ describe("PoolBinder.claimForLogin", () => {
     });
     const binder = new PoolBinder(options(client));
 
-    // slot-1 is seeded and idle, but the orchestrator only knows slot-7. Both are
-    // legitimately idle in the api's view; only slot-7 is real.
+    // slot-1 is seeded and idle; the orchestrator's `/stats` names slot-7, which the
+    // `runners` table has never heard of. Membership comes from the orchestrator, so
+    // the row is created on demand by `syncPool` before the claim.
     const result = await binder.claimForLogin(db.getSession(GUID)!);
 
-    // Either slot is acceptable to the SQLite claim — what must hold is that the
-    // orchestrator was consulted for membership rather than the api deciding.
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(db.get<{ id: string }>(
+    // Whatever is recorded must be a slot that exists **and** is the one bound to this
+    // session — the api's own pick and the orchestrator's answer must not be allowed
+    // to disagree.
+    const bound = db.get<{ id: string }>(
       `SELECT id FROM runners WHERE session_guid = ?`,
       GUID,
-    )?.id).toBe(result.runnerId);
+    )?.id;
+    
+    expect(bound).toBe(result.runnerId);
+    expect(bound).toBeDefined();
   });
 
   // An orchestrator that cannot be asked must not clear or invent anything. The

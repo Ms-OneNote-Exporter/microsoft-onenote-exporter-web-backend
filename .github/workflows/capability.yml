@@ -62,6 +62,11 @@ jobs:
       PUBLIC_HOST: one-backend.phttp.com
       ACME_EMAIL: ops@example.com
       ALLOWED_ORIGINS: https://app.example.com
+      # The api's reverse proxies. Required with `:?` in compose, so every job that
+      # renders the file must supply it - and a job that does not is now a *failure
+      # naming the variable*, which is the point: an unset value behind a proxy is a
+      # global rate limit rather than a loud error.
+      API_TRUSTED_PROXIES: 172.24.0.0/16
       # The two bind-mount sources. Compose requires them (`:?`), and they must be
       # absolute host paths — the orchestrator hands them to the Engine as bind
       # sources, which are resolved on the host, not in this container. Named to

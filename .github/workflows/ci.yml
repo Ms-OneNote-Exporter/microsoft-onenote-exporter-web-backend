@@ -241,6 +241,11 @@ jobs:
           PUBLIC_HOST: one-backend.phttp.com
           ACME_EMAIL: ops@example.com
           ALLOWED_ORIGINS: https://app.example.com
+          # The api's reverse proxies. Required with `:?` in compose, so every job that
+          # renders the file must supply it - and a job that does not is now a *failure
+          # naming the variable*, which is the point: an unset value behind a proxy is a
+          # global rate limit rather than a loud error.
+          API_TRUSTED_PROXIES: 172.24.0.0/16
           _DOCKER_GID: "998"
           # The api image is stamped with this, and an unset one is asserted as a
           # failure rather than defaulted.
@@ -279,6 +284,11 @@ jobs:
           COMPOSE_PROJECT_NAME: msout
           ACME_EMAIL: ops@example.com
           ALLOWED_ORIGINS: https://app.example.com
+          # The api's reverse proxies. Required with `:?` in compose, so every job that
+          # renders the file must supply it - and a job that does not is now a *failure
+          # naming the variable*, which is the point: an unset value behind a proxy is a
+          # global rate limit rather than a loud error.
+          API_TRUSTED_PROXIES: 172.24.0.0/16
           _DOCKER_GID: "998"
           IMAGE_TAG: "0000000"
           # Required by compose (`:?`), and absolute host paths: the orchestrator
@@ -315,6 +325,11 @@ jobs:
           PUBLIC_HOST: one-backend.phttp.com
           ACME_EMAIL: ops@example.com
           ALLOWED_ORIGINS: https://app.example.com
+          # The api's reverse proxies. Required with `:?` in compose, so every job that
+          # renders the file must supply it - and a job that does not is now a *failure
+          # naming the variable*, which is the point: an unset value behind a proxy is a
+          # global rate limit rather than a loud error.
+          API_TRUSTED_PROXIES: 172.24.0.0/16
           _DOCKER_GID: "998"
           IMAGE_TAG: "0000000"
           # Required by compose (`:?`), and absolute host paths: the orchestrator
@@ -371,6 +386,11 @@ jobs:
           PUBLIC_HOST: one-backend.phttp.com
           ACME_EMAIL: ops@example.com
           ALLOWED_ORIGINS: https://app.example.com
+          # The api's reverse proxies. Required with `:?` in compose, so every job that
+          # renders the file must supply it - and a job that does not is now a *failure
+          # naming the variable*, which is the point: an unset value behind a proxy is a
+          # global rate limit rather than a loud error.
+          API_TRUSTED_PROXIES: 172.24.0.0/16
           _DOCKER_GID: "998"
           IMAGE_TAG: "0000000"
           # Required by compose (`:?`), and absolute host paths: the orchestrator

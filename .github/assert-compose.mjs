@@ -158,78 +158,69 @@ check(
     "into every runner, so without it Docker creates an empty directory at the " +
     "destination and each runner exits 1 at startup",
 );
-// The vault and artifact roots are named in **three** places that cannot see each
-// other: the orchestrator's config defaults, the compose mount targets, and the
-// directories the image prepares so a fresh named volume inherits `nonroot`
-// ownership.
+// The vault and artifact roots are bind-mount **sources**, which the Engine resolves
+// on the **host** — a different kind of setting from every other path in this file,
+// and one that breaks in a way nothing else here can see.
 //
-// They drifted, and the drift is invisible at every layer that could have looked:
-//   - the config said `/srv/msout/vault`
-//   - compose mounted a volume at `/srv/msout/vault`
-//   - and the image prepared `/srv/vault`
+// What shipped, in two forms:
 //
-// So the volume had nothing to inherit, was created root-owned, and the first real
-// login failed with `mkdir /srv/msout/vault: permission denied` — while `/healthz`
-// said `ok`, because a healthcheck that touches no data path cannot see this.
+//   1. as a **named volume** at `/srv/msout/vault`. On the host that path is
+//      `/var/lib/docker/volumes/msout_vault/_data`, so `/srv/msout/vault` named an
+//      empty root-owned directory that Docker created and nothing wrote to. Every
+//      runner got it as `/data` and could not create its session directory:
 //
-// The Dockerfile is read rather than trusted: a `RUN mkdir` that names the wrong
-// path is precisely the bug, and reading it is what turns three independent names
-// into something checkable.
-const orchestratorDockerfile = readFileSync(
-  new URL("../orchestrator/Dockerfile", import.meta.url),
-  "utf8",
-);
-// `mkdir -p a b c` takes a *list*, and the real line has two arguments. Matching
-// one path per line would have found only the first — a check that reads as if it
-// covers the tree and quietly covers half of it, which is how this class of
-// assertion gets trusted.
-const preparedRoots = [
-  ...orchestratorDockerfile.matchAll(/^\s*RUN mkdir\b(.*)$/gm),
-]
-  .flatMap((m) => m[1].trim().split(/\s+/).slice(1))
-  .filter((p) => p.startsWith("/out/srv/"))
-  .map((p) => p.replace("/out/srv/", "/srv/"))
-  .sort();
-
-for (const [volume, envVar, role] of [
-  ["vault", "ORCH_VAULT_ROOT", "session vault"],
-  ["artifacts", "ORCH_ARTIFACT_ROOT", "finalized exports"],
+//          EACCES: permission denied, mkdir '/data/<guid>'
+//
+//   2. with **no volume at all**, the vault lived in the container's writable layer,
+//      so one `--force-recreate orchestrator` deleted every session's auth.json and
+//      exported vault — with nothing failing and nothing reporting it.
+//
+// So the assertion is the property both fixes depend on: the path the orchestrator
+// hands the Engine must be **the same absolute path** the orchestrator itself has
+// mounted. Then it is unambiguous on both sides of the container boundary.
+//
+// Docker's volume-seeding behaviour is deliberately *not* asserted. It was the
+// right mechanism for a named volume and it worked — ownership came out `65532`, as
+// intended. It was simply the wrong mechanism for a path that has to survive as a
+// string and be resolved on the other side of the boundary.
+for (const [envVar, role] of [
+  ["ORCH_VAULT_ROOT", "session vault"],
+  ["ORCH_ARTIFACT_ROOT", "finalized exports"],
 ]) {
-  const target = `/srv/msout/${volume}`;
-  const mounted = (services.orchestrator?.volumes ?? [])
-    .map((v) => (typeof v === "string" ? v : v?.target))
-    .filter((t) => t === target);
+  const root = services.orchestrator?.environment?.[envVar];
 
   check(
-    mounted.length === 1,
-    `orchestrator: the ${role} path is a volume at ${target}`,
-    `the orchestrator mounts nothing at ${target} (${envVar} defaults to it). Without ` +
-      `a volume the data lives in the container's writable layer and a single ` +
-      `\`docker compose up -d --force-recreate orchestrator\` deletes it mid-session`,
+    typeof root === "string" && root.startsWith("/"),
+    `orchestrator: ${envVar} is an absolute path`,
+    `orchestrator ${envVar} is ${JSON.stringify(root)}. It is the *source* of a bind ` +
+      `mount, so a relative path either cannot be resolved by the Engine or resolves ` +
+      `against a working directory nobody chose`,
   );
 
   check(
-    preparedRoots.includes(target),
-    `orchestrator image: prepares ${target} so a fresh volume is writable`,
-    `orchestrator/Dockerfile prepares [${preparedRoots.join(", ")}] but nothing seeds ` +
-      `${target}, which the orchestrator writes to. Docker copies a new named volume's ` +
-      `ownership from the image's directory at that path, so a path missing from the ` +
-      `image produces a root-owned volume and \`mkdir ${target}: permission denied\``,
+    root !== undefined &&
+      (services.orchestrator?.volumes ?? []).some(
+        (v) => (typeof v === "string" ? v : v?.target) === root,
+      ),
+    `orchestrator: mounts the ${role} at ${root}, the same path it hands the Engine`,
+    `orchestrator ${envVar} is ${JSON.stringify(root)} but nothing is mounted there. A ` +
+      `bind source is resolved on the *host*: if that path only exists inside this ` +
+      `container, the Engine creates an empty root-owned directory there and every ` +
+      `runner mounts a directory nobody writes to (\`EACCES: mkdir '/data/<guid>'\`)`,
   );
 }
 
 // The vault must not be mounted anywhere else. §2.1 forbids the api from reading a
-// cookie jar, and it forbids Caddy reading a vault path; both are asserted
-// elsewhere, but a volume that is *not* where the plan says it is can be mounted in
-// the wrong place without either assertion noticing.
-const vaultTarget = "/srv/msout/vault";
+// cookie jar, and it forbids Caddy reading a vault path.
+const vaultRoot = services.orchestrator?.environment?.ORCH_VAULT_ROOT;
 for (const svc of ["api", "caddy"]) {
   check(
-    !(services[svc]?.volumes ?? []).some(
-      (v) => (typeof v === "string" ? v : v?.target) === vaultTarget,
-    ),
+    typeof vaultRoot !== "string" ||
+      !(services[svc]?.volumes ?? []).some(
+        (v) => (typeof v === "string" ? v : v?.target) === vaultRoot,
+      ),
     `${svc} has no vault mount`,
-    `${svc} mounts ${vaultTarget}; §2.1 requires that only the orchestrator and the ` +
+    `${svc} mounts ${vaultRoot}; §2.1 requires that only the orchestrator and the ` +
       `runners it creates can read a vault`,
   );
 }
@@ -263,12 +254,24 @@ check(
     )}. This value is the *source* of a bind mount, so it must resolve on the host; ` +
     `a container path makes Docker create a directory there and every runner exits 1`,
 );
+// The runner takes no host path of its own choosing. Everything it gets, it is
+// *granted*: the orchestrator builds its create request, and the two mounts there are
+// the per-session vault and the artifact root.
+//
+// The one exception is the artifact root, which the compose `runner` service — the
+// development one behind a profile — also mounts, and that is deliberate: it must be
+// the **same directory** the orchestrator binds from, or a dev runner and an
+// orchestrator-created runner would hand artifacts to two different places. It used
+// to mount the `artifacts` named volume, which is not that directory.
 const runnerBinds = bindsFor("runner").map((v) => String(v.source));
+const grantedRunnerBinds = (src) =>
+  src.endsWith("runner_token") || src === services.orchestrator?.environment?.ORCH_ARTIFACT_ROOT;
 check(
-  runnerBinds.every((src) => src.endsWith("runner_token")),
-  `runner bind-mounts only its token (${runnerBinds.join(", ") || "none"})`,
+  runnerBinds.every(grantedRunnerBinds),
+  `runner bind-mounts only what it is granted (${runnerBinds.join(", ") || "none"})`,
   `runner bind-mounts something unexpected: ${runnerBinds.join(", ")}. §2.1 gives it no host ` +
-    "path — its data root is a named volume and the only bind allowed is its own secret file",
+    `path of its own — only its secret file and, for the compose dev runner, the ` +
+    `artifact root it shares with the orchestrator`,
 );
 for (const key of ["CSRF_KEY", "CSRF_KEY_FILE", "SESSION_SECRET", "ORCHESTRATOR_HMAC_SECRET"]) {
   check(

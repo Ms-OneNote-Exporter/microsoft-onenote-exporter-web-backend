@@ -79,6 +79,18 @@ function stageDockerfile(find, replace) {
 /** A deep clone, so each case starts from the real config untouched. */
 const clone = (cfg) => structuredClone(cfg);
 
+/**
+ * The bind-mount sources the compose file requires. Absolute, and named so the
+ * harness cases can say "nothing is mounted at this path" without repeating a
+ * literal that has to be kept in step with `docker-compose.yml`.
+ *
+ * They are passed to `docker compose` below rather than being asserted against as
+ * constants, because a check that re-declares the value it is checking tests
+ * nothing.
+ */
+const VAULT_DIR = "/srv/msout/vault-host";
+const ARTIFACT_DIR = "/srv/msout/artifacts-host";
+
 const base = JSON.parse(
   // `--profile runner`, because the runner service sits behind a profile and a
   // plain `config` prunes it out — which would make every runner case below
@@ -94,6 +106,8 @@ const base = JSON.parse(
       ALLOWED_ORIGINS: "https://app.example.com",
       IMAGE_TAG: "0000000",
       _DOCKER_GID: "998",
+      VAULT_HOST_DIR: VAULT_DIR,
+      ARTIFACT_HOST_DIR: ARTIFACT_DIR,
     },
   }),
 );
@@ -447,47 +461,55 @@ const cases = [
     expectMessage: /orchestrator's secrets are \[/,
   },
   {
-    // The shipped bug: the vault was not a volume at all, so every session's
-    // auth.json and exported vault lived in the orchestrator container's writable
-    // layer and one `--force-recreate` deleted them. Nothing failed until the data
-    // was gone, which is to say nothing ever reported it.
-    name: "leaves the session vault in the container's writable layer",
+    // The shipped bug, form 1: a named volume. On the host `/srv/msout/vault` is
+    // not the volume at all — it is an empty root-owned directory Docker created —
+    // and every runner mounted it as `/data` and failed with EACCES.
+    //
+    // Resolved config cannot distinguish this from a bind mount on the target, so
+    // this case is expressed the way the mistake was: the env var is right, and the
+    // orchestrator has nothing mounted there.
+    name: "leaves the vault root with nothing mounted at that path",
     mutate: (c) => {
+      c.services.orchestrator.volumes = (c.services.orchestrator.volumes ?? []).filter(
+        (v) => (typeof v === "string" ? v : v?.target) !== VAULT_DIR,
+      );
+    },
+    expectMessage: /resolved on the \*host\*/,
+  },
+  {
+    // The shipped bug, form 2: no mount at all, so the vault lived in the
+    // container's writable layer and one `--force-recreate` deleted every session.
+    // With no volume and no env var, the orchestrator falls back to
+    // `/srv/msout/vault`, which is a container path that resolves nowhere on the host.
+    name: "leaves the vault in the container's writable layer",
+    mutate: (c) => {
+      delete c.services.orchestrator.environment.ORCH_VAULT_ROOT;
       c.services.orchestrator.volumes = (c.services.orchestrator.volumes ?? []).filter(
         (v) => (typeof v === "string" ? v : v?.target) !== "/srv/msout/vault",
       );
     },
-    expectMessage: /writable layer/,
+    expectMessage: /ORCH_VAULT_ROOT is undefined/,
   },
   {
-    // The other half: the volume was mounted, but the *image* prepared
-    // `/srv/vault` rather than `/srv/msout/vault`, so Docker seeded nothing, the
-    // volume came out root-owned, and `mkdir /srv/msout/vault` failed for uid
-    // 65532. Both assertions are needed — either alone passes the other bug.
-    name: "seeds the vault volume from an unrelated image path",
-    mutateFile: { file: "orchestrator/Dockerfile", find: "/out/srv/msout/vault", replace: "/out/srv/vault" },
-    expectMessage: /nothing seeds \/srv\/msout\/vault/,
-  },
-  {
-    // `mkdir -p a b` is one instruction with two paths. An assertion that matched
-    // a single path per line would find only the first and pass while `artifacts`
-    // was broken.
-    name: "prepares only the first path of a multi-path mkdir",
-    mutateFile: {
-      file: "orchestrator/Dockerfile",
-      find: "RUN mkdir -p /out/srv/msout/vault /out/srv/msout/artifacts",
-      replace: "RUN mkdir -p /out/srv/msout/vault",
+    // A relative root cannot be resolved by the Engine at all, and resolves against
+    // whatever working directory it happens to pick if it can be.
+    name: "makes the artifact root relative",
+    mutate: (c) => {
+      c.services.orchestrator.environment.ORCH_ARTIFACT_ROOT = "./artifacts";
     },
-    expectMessage: /nothing seeds \/srv\/msout\/artifacts/,
+    expectMessage: /ORCH_ARTIFACT_ROOT is "\.\/artifacts"/,
   },
   {
     // §2.1: only the orchestrator and the runners it creates may read a vault.
     // A vault mount on the api would hand it every session's cookie jar.
     name: "gives the api the session vault",
     mutate: (c) => {
-      c.services.api.volumes = [...(c.services.api.volumes ?? []), { target: "/srv/msout/vault" }];
+      c.services.api.volumes = [
+        ...(c.services.api.volumes ?? []),
+        { type: "bind", source: VAULT_DIR, target: VAULT_DIR },
+      ];
     },
-    expectMessage: /api mounts \/srv\/msout\/vault/,
+    expectMessage: /api mounts .*vault-host/,
   },
   {
     name: "points the orchestrator's token path at nothing",

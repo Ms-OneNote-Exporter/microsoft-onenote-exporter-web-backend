@@ -62,6 +62,12 @@ jobs:
       PUBLIC_HOST: one-backend.phttp.com
       ACME_EMAIL: ops@example.com
       ALLOWED_ORIGINS: https://app.example.com
+      # The two bind-mount sources. Compose requires them (`:?`), and they must be
+      # absolute host paths — the orchestrator hands them to the Engine as bind
+      # sources, which are resolved on the host, not in this container. Named to
+      # match `assert-compose.test.mjs`, which asserts against the same values.
+      VAULT_HOST_DIR: /srv/msout/vault-host
+      ARTIFACT_HOST_DIR: /srv/msout/artifacts-host
     steps:
       - uses: actions/checkout@v4
 

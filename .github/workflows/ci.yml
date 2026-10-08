@@ -257,6 +257,11 @@ jobs:
           ALLOWED_ORIGINS: https://app.example.com
           _DOCKER_GID: "998"
           IMAGE_TAG: "0000000"
+          # Required by compose (`:?`), and absolute host paths: the orchestrator
+          # hands them to the Engine as bind sources, resolved on the host. The
+          # values match `capability.yml` and `assert-compose.test.mjs`.
+          VAULT_HOST_DIR: /srv/msout/vault-host
+          ARTIFACT_HOST_DIR: /srv/msout/artifacts-host
           PUBLIC_HOST: ""
         run: |
           if docker compose --profile runner -f docker-compose.yml config --quiet 2>/dev/null; then
@@ -277,6 +282,11 @@ jobs:
           ALLOWED_ORIGINS: https://app.example.com
           _DOCKER_GID: "998"
           IMAGE_TAG: "0000000"
+          # Required by compose (`:?`), and absolute host paths: the orchestrator
+          # hands them to the Engine as bind sources, resolved on the host. The
+          # values match `capability.yml` and `assert-compose.test.mjs`.
+          VAULT_HOST_DIR: /srv/msout/vault-host
+          ARTIFACT_HOST_DIR: /srv/msout/artifacts-host
         run: |
           docker compose --profile runner -f docker-compose.yml config --format json \
             | node .github/assert-compose.mjs
@@ -317,6 +327,11 @@ jobs:
           ALLOWED_ORIGINS: https://app.example.com
           _DOCKER_GID: "998"
           IMAGE_TAG: "0000000"
+          # Required by compose (`:?`), and absolute host paths: the orchestrator
+          # hands them to the Engine as bind sources, resolved on the host. The
+          # values match `capability.yml` and `assert-compose.test.mjs`.
+          VAULT_HOST_DIR: /srv/msout/vault-host
+          ARTIFACT_HOST_DIR: /srv/msout/artifacts-host
         run: node .github/assert-compose.test.mjs
 
       - name: nothing logs a request header

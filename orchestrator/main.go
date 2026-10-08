@@ -98,6 +98,34 @@ func run(args []string) error {
 	}
 	log.Info("docker daemon reachable")
 
+	// Prove it can write where it is about to tell the Engine to bind from.
+	//
+	// `VaultRoot` and `ArtifactRoot` are the **source** of a bind mount in every
+	// container create, and a bind source is resolved on the **host**. That makes
+	// them a different kind of setting from everything else in this config, and it
+	// makes them wrong in a way nothing else here catches:
+	//
+	//   - a *named volume* mounted at /srv/msout/vault is at
+	//     /var/lib/docker/volumes/<name>/_data on the host, so /srv/msout/vault
+	//     names an empty root-owned directory that Docker creates on the host and
+	//     nothing writes to
+	//   - a runner then mounts that empty directory at /data, cannot create its
+	//     session directory, and exits 500:
+	//
+	//       EACCES: permission denied, mkdir '/data/<guid>'
+	//
+	// Every container was healthy throughout; `/healthz` said `ok`; the api
+	// reported only "credential handoff failed".
+	//
+	// So the check happens here, at boot, on the two paths this process is about
+	// to hand to the Engine — and the failure names the uid and the remedy,
+	// because "EACCES" inside a runner three layers away is not a diagnosable
+	// error message.
+	if err := checkWritableRoots(cfg); err != nil {
+		log.Error("storage root is not usable", "error", err)
+		return err
+	}
+
 	p := pool.New(cfg, docker, log)
 	srv := server.New(cfg, p, log, nil)
 
@@ -239,4 +267,38 @@ func runMaintenance(ctx context.Context, log *slog.Logger, p *pool.Pool, cfg *co
 			}
 		}
 	}
+}
+
+// checkWritableRoots proves the orchestrator can create a directory under each
+// storage root, and can create one *and* write inside it.
+//
+// Creating a directory is the operation the pool actually performs —
+// `MkdirAll(vault/<guid>)` — so that is what is tested. Writing a file inside it
+// is tested too because a directory can be creatable and not writable, and the
+// runner's first real write is the artifact it hands back.
+func checkWritableRoots(cfg *config.Config) error {
+	for _, root := range []struct{ label, path string }{
+		{"ORCH_VAULT_ROOT", cfg.VaultRoot},
+		{"ORCH_ARTIFACT_ROOT", cfg.ArtifactRoot},
+	} {
+		probe, err := os.MkdirTemp(root.path, ".probe-")
+		if err != nil {
+			return fmt.Errorf(
+				"%s (%s) is not usable: %w. It must exist and be writable by uid %d. "+
+					"Both are bind-mount *sources*, so the Engine resolves them on the host: "+
+					"install -d -o %d -g %d %s",
+				root.label, root.path, err, os.Getuid(), os.Getuid(), os.Getgid(), root.path)
+		}
+		if err := os.WriteFile(probe+"/probe", []byte("x"), 0o600); err != nil {
+			_ = os.RemoveAll(probe)
+			return fmt.Errorf(
+				"%s (%s) accepts a directory but not a write: %w. "+
+					"install -d -o %d -g %d %s",
+				root.label, root.path, err, os.Getuid(), os.Getgid(), root.path)
+		}
+		if err := os.RemoveAll(probe); err != nil {
+			return fmt.Errorf("%s (%s): probe cleanup failed: %w", root.label, root.path, err)
+		}
+	}
+	return nil
 }

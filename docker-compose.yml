@@ -372,6 +372,24 @@ services:
       # is what makes this stick.
       ORCH_RUNNER_TOKEN_FILE: ${RUNNER_TOKEN_HOST_FILE:-${SECRETS_DIR:-./secrets}/runner_token}
 
+      # The two bind-mount *sources*, and the reason they are absolute host paths
+      # rather than the `/srv/msout/...` defaults they used to have.
+      #
+      # The orchestrator hands these to the Engine as the `Source` of a bind when it
+      # creates a runner, and **a bind source is resolved on the host**. A named
+      # volume mounted at `/srv/msout/vault` is at
+      # `/var/lib/docker/volumes/<name>/_data` on the host, so the default named a
+      # host directory Docker created empty and root-owned, and every runner got it
+      # as `/data`:
+      #
+      #     EACCES: permission denied, mkdir '/data/<guid>'
+      #
+      # Set to the *same string* as the volumes above mount them at, so the path is
+      # unambiguous on both sides of the container boundary. `assert-compose.mjs`
+      # requires the three to agree, which is the whole check.
+      ORCH_VAULT_ROOT: ${VAULT_HOST_DIR:?set VAULT_HOST_DIR; see infra/README.md}
+      ORCH_ARTIFACT_ROOT: ${ARTIFACT_HOST_DIR:?set ARTIFACT_HOST_DIR; see infra/README.md}
+
       # No PUBLIC_HOST, no ALLOWED_ORIGINS, no CSRF key. The orchestrator is not a
       # component that should know any of them, and its absence here is a property
       # rather than an omission — CI asserts the runner image sees no session
@@ -418,26 +436,34 @@ services:
       # is the sharpest edge in the deployment and it is why §2.1 gives the
       # orchestrator no egress at all.
       - /var/run/docker.sock:/var/run/docker.sock
-      - artifacts:/srv/msout/artifacts
-      # The session vault, `/srv/msout/vault/<guid>` — a **named volume**, and it
-      # has to be.
+      - ${ARTIFACT_HOST_DIR:?set ARTIFACT_HOST_DIR; see infra/README.md}:${ARTIFACT_HOST_DIR:?set ARTIFACT_HOST_DIR}
+      # The session vault, `/srv/msout/vault/<guid>`.
       #
-      # It was not mounted at all, so the orchestrator created it *inside the
-      # container's writable layer*. The plan's host-path table says this data is
-      # at `/srv/msout/vault/<guid>`; in practice every session's auth.json, its
-      # exported vault and its logs were one `docker compose up -d
-      # --force-recreate orchestrator` away from being deleted, mid-export. Nothing
-      # lost it, so nothing reported it.
+      # **A host path, mounted at the identical path inside the container**, and that
+      # identity is the whole point. It used to be a named volume:
       #
-      # A named volume rather than a bind mount for the reason `runner-data` gives:
-      # erase becomes one directory removal, and no host path has to be created with
-      # the right ownership before the first login.
+      #   - as a named volume it was at /var/lib/docker/volumes/msout_vault/_data on
+      #     the host, so `ORCH_VAULT_ROOT=/srv/msout/vault` — which the orchestrator
+      #     hands the Engine as a bind **source** — named an empty root-owned
+      #     directory on the host that Docker created and nothing wrote to
+      #   - the runner then mounted that empty directory at /data and could not
+      #     create its session directory:
       #
-      # The image prepares this directory owned by `nonroot`, and Docker seeds a
-      # fresh named volume from the image's directory *and its ownership* — so the
-      # orchestrator can create `<guid>` inside it. Without that, the first login
-      # failed with `mkdir /srv/msout/vault: permission denied`.
-      - vault:/srv/msout/vault
+      #       EACCES: permission denied, mkdir '/data/<guid>'
+      #
+      #   - and with no volume at all, the vault lived in the container's writable
+      #     layer, so one `--force-recreate orchestrator` deleted every session's
+      #     auth.json and exported vault
+      #
+      # Two different bugs, one requirement: this path is resolved by the Engine on
+      # the **host**, so it has to be a host path — and it has to be the same string
+      # here, or the two disagree and the runner gets a directory nobody writes to.
+      #
+      # The host directory must exist and be owned by the orchestrator's uid before
+      # the first start; Docker creates a missing bind source as root. `main.go`
+      # checks both roots at boot and fails with the exact `install -d` to run, so
+      # this is a named startup error rather than an EACCES inside a runner.
+      - ${VAULT_HOST_DIR:?set VAULT_HOST_DIR; see infra/README.md}:${VAULT_HOST_DIR:?set VAULT_HOST_DIR}
     cap_drop:
       - ALL
     security_opt:
@@ -496,7 +522,11 @@ services:
       - runner_token
     volumes:
       - runner-data:/data
-      - artifacts:/artifacts
+      # The same host directory the orchestrator binds from, so a dev runner and an
+      # orchestrator-created runner hand artifacts to the same place. It used to be
+      # the `artifacts` named volume, which is not the same directory — see the
+      # orchestrator's mount above.
+      - ${ARTIFACT_HOST_DIR:?set ARTIFACT_HOST_DIR; see infra/README.md}:/artifacts
     cap_drop:
       - ALL
     security_opt:
@@ -539,10 +569,6 @@ services:
 
 volumes:
   api-data:
-  artifacts:
-  # The orchestrator's session vault. See the `vault:` mount above for why it is a
-  # volume and why it was a bug that it was not one.
-  vault:
   caddy-data:
   caddy-config:
   # The runner's session data: one subdirectory per session guid, holding the auth

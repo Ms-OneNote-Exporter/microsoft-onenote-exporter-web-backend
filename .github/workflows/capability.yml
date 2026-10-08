@@ -485,38 +485,57 @@ jobs:
           test -n "$cid" || { echo "no runner container"; docker compose ps; exit 1; }
           echo "runner is up: $(docker inspect -f '{{.State.Health.Status}}' "$cid")"
 
-      - name: the credential-path network holds the api and a runner, and nothing else
+      - name: the credential-path network holds the api and runners, and nothing else
         # Asserted *here*, after the runner exists — the runner is behind a profile,
         # so before this step the network correctly holds only the api and an
         # expectation of two containers fails against a correct configuration.
-        # The network's name is `msout-runner-api`, **unprefixed**, and that is
-        # deliberate: the orchestrator asks the Engine for it *by name* when it
-        # creates a runner, so compose has to create it under that name rather than
-        # `<project>_msout-runner-api`. This step used to build
-        # `${COMPOSE_PROJECT_NAME}_msout-runner-api` and passed, because in CI the
-        # orchestrator never created a runner and nothing ever looked. It failed
-        # only once `name:` was added — which is the point: the prefix assumption
-        # was never checked against the orchestrator, just restated.
         #
-        # Read from `docker-compose.yml` rather than repeated here, so this cannot
-        # drift from it again: the name is already asserted in `assert-compose.mjs`,
-        # and this step's job is to assert *membership*, not the spelling.
+        # **By composition, not by count.** It used to assert exactly 2 (api + one
+        # runner), which was true only while the orchestrator created nothing — i.e.
+        # while the path this file now also tests was untested. Adding the
+        # orchestrator-pool assertion above filled two slots, and this became:
+        #
+        #     msout-runner-api has 4 containers; expected 2 (api and runner)
+        #     msout-slot-1-… msout-slot-2-… msoutcap-api-1 msoutcap-runner-1
+        #
+        # Four correct members. A count cannot express "every member is allowed here",
+        # and it silently breaks the moment POOL_SIZE changes — which is the same
+        # shape as asserting a handler ran.
+        #
+        # The name is read from compose rather than rebuilt as
+        # `${COMPOSE_PROJECT_NAME}_…`: the network carries an explicit `name:`, and
+        # the prefix assumption is asserted once in assert-compose.mjs instead of
+        # restated here.
         env:
           CREDENTIAL_NETWORK: msout-runner-api
         run: |
           set -euo pipefail
           members=$(docker network inspect "$CREDENTIAL_NETWORK" \
             --format '{{range .Containers}}{{.Name}} {{end}}' | tr ' ' '\n' | grep -c . || true)
-          # api + runner = 2. The orchestrator on here would put the credential and
-          # the Docker socket on one network; Caddy would make a runner reachable
-          # from the proxy that terminates TLS.
-          if [ "$members" != "2" ]; then
-            echo "msout-runner-api has $members containers; expected 2 (api and runner)"
+          echo "msout-runner-api has $members containers"
+          [ "$members" -ge 2 ] || {
+            echo "FAIL: expected at least the api and one runner, found $members"
             docker network inspect "$CREDENTIAL_NETWORK" \
               --format '{{range .Containers}}{{.Name}} {{end}}'
             exit 1
+          }
+
+          # The property: nothing on this network may be the orchestrator or Caddy.
+          # Either would put the credential path and the Docker socket — or the TLS
+          # terminator — on one network, which is the whole reason it is separate.
+          forbidden=$(docker network inspect "$CREDENTIAL_NETWORK" \
+            --format '{{range .Containers}}{{.Name}} {{end}}' \
+            | tr ' ' '\n' | grep -E 'orchestrator|caddy' || true)
+          if [ -n "$forbidden" ]; then
+            echo "FAIL: the credential-path network holds $forbidden"
+            echo "§2.1: only api and runners. The orchestrator here would put the"
+            echo "credential and the Docker socket on one network; Caddy would make a"
+            echo "runner reachable from the proxy that terminates TLS."
+            exit 1
           fi
-          echo "msout-runner-api holds two containers"
+          echo "every member is an api or a runner"
+          docker network inspect "$CREDENTIAL_NETWORK" \
+            --format '{{range .Containers}}{{.Name}} {{end}}'
 
       # ---- the runner's egress: unrestricted, and the denies that hold -------
       #

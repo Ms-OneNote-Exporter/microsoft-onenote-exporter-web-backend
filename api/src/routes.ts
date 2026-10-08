@@ -46,7 +46,8 @@ import {
   contentTypeIsAcceptable,
   MAX_CREDENTIAL_BYTES,
 } from "./credential.js";
-import { resolveClientAddress } from "./client-ip.js";
+import { NO_PROXIES, resolveClientAddress } from "./client-ip.js";
+import type { ProxyMatcher } from "./client-ip.js";
 import { readJsonObject } from "./server.js";
 import { expireCookieHeaders, runErase, type EraseDeps } from "./erase.js";
 import type { RunnerAdapter } from "./runner-adapter.js";
@@ -71,7 +72,8 @@ export interface RouteDeps {
   readonly orchestrator: OrchestratorApi;
   readonly sse: SseHub;
   readonly limiter: RateLimiter;
-  knownProxies?: ReadonlySet<string>;
+  /** Matches `ServerDeps.knownProxies`. Mutable here only for the optional-wiring pattern. */
+  knownProxies?: ProxyMatcher;
   eraseRunner?: EraseDeps["runner"];
   /**
    * The route to a runner container. Supplied by the entrypoint, or by a mock —
@@ -199,7 +201,7 @@ function classifyExportFailure(error: unknown): string | null {
 /** registerRoutes attaches every route to the instance. */
 export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: RouteDeps): void {
   const now = deps.now ?? (() => Date.now());
-  const knownProxies = deps.knownProxies ?? new Set<string>();
+  const knownProxies = deps.knownProxies ?? NO_PROXIES;
   const ttlSeconds = config.sessionTtlHours * 3600;
 
   // ---- GET /api/public/version -------------------------------------------
@@ -245,29 +247,67 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
         .send({ error: "secret must be exactly 43 base64url characters" });
     }
 
-    // Rate limited per address: three sessions an hour stops an address farming
-    // sessions to burn the runner pool.
-    const client = resolveClientAddress({
-      peerAddress: request.ip,
-      forwardedFor: typeof request.headers["x-forwarded-for"] === "string"
-        ? request.headers["x-forwarded-for"]
-        : undefined,
-      knownProxies,
-    });
-    const limited = deps.limiter.checkNewSession(client.address);
-    if (!limited.allowed) {
-      reply.header("retry-after", String(limited.retryAfterSeconds));
-      return reply.code(429).send({ error: limited.reason, retryAfterSeconds: limited.retryAfterSeconds });
-    }
-
     // The session already exists and this is a restore, not a creation: the
     // frontend generates the GUID and the secret once and may reload into the
     // same session. Re-creating would throw away a live auth.json, so an existing
     // valid row is left alone and its cookies re-issued.
+    //
+    // **Checked before the limiter, deliberately.** The limiter charges *new
+    // sessions*, and a restore creates nothing — it hands back cookies for a session
+    // that already exists. Charging it meant a page reload burned the quota, and on
+    // the shared-bucket deployment (#37) a user reloading a few times locked
+    // themselves out of creating a session at all. The order here was the bug's
+    // hiding place: the comment below said "this is a restore, not a creation" while
+    // the code above it had already charged one.
     const existing = deps.db.getSession(guid);
     const timestamp = now();
+    // Computed once and used twice. Written inline in both places first, which is
+    // how the two drifted: the limiter charged a session the branch below then
+    // described as not a creation.
+    const restorable =
+      existing !== undefined && existing.expires_at > timestamp && existing.secret_hash !== null;
 
-    if (existing !== undefined && existing.expires_at > timestamp && existing.secret_hash !== null) {
+    if (!restorable) {
+      // Rate limited per address: three sessions an hour stops an address farming
+      // sessions to burn the runner pool.
+      const client = resolveClientAddress({
+        peerAddress: request.ip,
+        forwardedFor: typeof request.headers["x-forwarded-for"] === "string"
+          ? request.headers["x-forwarded-for"]
+          : undefined,
+        knownProxies,
+      });
+      const limited = deps.limiter.checkNewSession(client.address);
+      if (!limited.allowed) {
+        // **The address charged, and how it was arrived at.**
+        //
+        // A 429 that does not say *which* bucket was hit made this undiagnosable in
+        // production: a user reported "Too many attempts", two IPs did not help, and
+        // nothing in any log said why. The answer was in the resolved address - the
+        // proxy's - and it is now stated at the moment it matters.
+        //
+        // `source: "peer"` on a deployment behind a reverse proxy **is** the bug, so
+        // saying it here means the next occurrence names itself. `suspiciousChain`
+        // alongside it is the other half: a forged chain lands here too.
+        request.log.warn(
+          {
+            address: client.address,
+            source: client.source,
+            suspiciousChain: client.suspiciousChain,
+            peer: request.ip,
+            retryAfterSeconds: limited.retryAfterSeconds,
+          },
+          "session creation rate limited",
+        );
+        reply.header("retry-after", String(limited.retryAfterSeconds));
+        return reply.code(429).send({
+          error: limited.reason,
+          retryAfterSeconds: limited.retryAfterSeconds,
+        });
+      }
+    }
+
+    if (restorable && existing !== undefined) {
       // Verify the presented secret against the existing row before re-issuing
       // cookies, or this becomes a way to take over a session by guessing its GUID.
       if (existing.secret_hash !== hashSecret(secret)) {

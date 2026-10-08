@@ -256,6 +256,25 @@ services:
       DATABASE_PATH: /srv/msout/data/api.db
       LOG_LEVEL: ${LOG_LEVEL:-info}
 
+      # Which proxies' `X-Forwarded-For` the api may believe.
+      #
+      # **Required, not optional.** Caddy is in front of the api on every deployment
+      # here and sets the header correctly (`infra/Caddyfile`). Without naming it, the
+      # api falls back to the socket peer — which is Caddy — so every caller on the
+      # internet shares one rate-limit bucket. Observed on the live host: 3 sessions
+      # an hour for everyone, and every request logged
+      # `"remoteAddress":"172.24.0.4"`.
+      #
+      # A whole network rather than one address, because a container's IP changes on
+      # every recreate: an exact address here would be correct only until the next
+      # `compose up`, and would fail by becoming a silent global limit again.
+      #
+      # `${VAR:?}` rather than a default. A default would be a value that looks
+      # configured and is not right on the next host — and this deployment's own
+      # subnet is not knowable from a file. Override it when the proxy lives
+      # elsewhere; list one entry per proxy hop.
+      API_TRUSTED_PROXIES: ${API_TRUSTED_PROXIES:?set the api's reverse proxy address or CIDR, e.g. 172.24.0.0/16}
+
       # Secrets as file *paths*. The env vars carry paths, not values — see the
       # `secrets` block above for why the distinction matters.
       CSRF_KEY_FILE: /run/secrets/csrf_key

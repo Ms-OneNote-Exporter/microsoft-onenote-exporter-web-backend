@@ -54,6 +54,7 @@
 
 import Fastify, { type FastifyInstance } from "fastify";
 
+import { NO_PROXIES } from "../src/client-ip.js";
 import { Db } from "../src/db.js";
 import { SseHub } from "../src/sse.js";
 import { RateLimiter } from "../src/rate-limit.js";
@@ -141,6 +142,11 @@ if (!isLoopbackHostname(HOST)) {
  * not a key to anything, and it is deliberately obvious in source.
  */
 const config: ApiConfig = {
+  // The mock is reached directly by a developer on localhost, so there is no proxy
+  // in front of it and nothing to believe. Named `NO_PROXIES` rather than left as an
+  // empty collection, so it says which of "no proxy" and "not configured" this is —
+  // they are the same to the limiter, and telling them apart is the whole bug.
+  trustedProxies: NO_PROXIES,
   allowedOrigins: new Set(
     MOCK_ORIGINS.map((entry) => {
       // The mock's origins are http, because a development frontend is served over

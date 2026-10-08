@@ -233,6 +233,37 @@ address Caddy actually saw. It never takes the leftmost and never trusts a bare
 `X-Real-IP`. Stripping inbound headers would be correct but brittle, because it is
 one Caddy directive a future edit can silently drop.
 
+**But only if you name Caddy in `API_TRUSTED_PROXIES`, and that variable is
+required.** The rule is not "the header is present, believe it" — it is "the peer is
+a proxy we were told about, and only then is the header evidence" (PLAN-v3 §3.5).
+Unset, the api falls back to the socket peer, which *is* Caddy, so every caller on the
+internet counts against one bucket. Not hypothetical: that is what ran here, at three
+sessions an hour for everyone, with every request logging
+`"remoteAddress":"172.24.0.4"`.
+
+Two things follow, and both are load-bearing:
+
+- **A network, not an address.** A container's IP changes on every recreate, so an
+  exact address is correct until the next `compose up` and then fails by becoming a
+  silent global limit again.
+- **The right network.** api and Caddy share `msout-control`. The api is also on
+  `msout-runner-api`, where Caddy is *not*, so that one looks related and matches
+  nothing.
+
+To find the value on a new host:
+
+```sh
+docker network inspect msout_msout-control --format '{{ (index .IPAM.Config 0).Subnet }}'
+```
+
+The api log states which address it charged, and how it resolved it, whenever a limit
+is refused — so `source:"peer"` on a deployment behind Caddy is visible at once rather
+than inferred from a user's report:
+
+```sh
+docker logs msout-api-1 | grep 'session creation rate limited'
+```
+
 ## What is verified, and how
 
 | checked | by |

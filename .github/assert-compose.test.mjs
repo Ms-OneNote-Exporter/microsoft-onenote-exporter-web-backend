@@ -134,6 +134,11 @@ const base = JSON.parse(
       _DOCKER_GID: "998",
       VAULT_HOST_DIR: VAULT_DIR,
       ARTIFACT_HOST_DIR: ARTIFACT_DIR,
+      SECRETS_DIR: "/srv/msout/secrets",
+      RUNNER_IMAGE: "ghcr.io/ms-one-note-exporter/msout-runner:0000000",
+      // Required by compose with `:?`. Present here so the cases below can assert
+      // about it rather than every case failing on interpolation.
+      API_TRUSTED_PROXIES: "172.24.0.0/16",
     },
   }),
 );
@@ -148,6 +153,27 @@ console.log("ok    the real compose config passes every assertion");
 
 /** @type {{name: string, mutate: (cfg: any) => void, expectMessage: RegExp}[]} */
 const cases = [
+  {
+    // The deployed failure, stated as a mutation. Caddy sets X-Forwarded-For and the
+    // api refuses to believe it, so every caller is rate-limited as the proxy: three
+    // sessions an hour for the whole internet, with every request logging
+    // `"remoteAddress":"172.24.0.4"`. Observed on the live host.
+    name: "drops API_TRUSTED_PROXIES",
+    mutate: (c) => {
+      delete c.services.api.environment.API_TRUSTED_PROXIES;
+    },
+    expectMessage: /API_TRUSTED_PROXIES/,
+  },
+  {
+    // A container's IP changes on recreate, so an exact address works until the next
+    // deploy and then fails by becoming a silent global limit again.
+    name: "trusts a single container address rather than a network",
+    mutate: (c) => {
+      c.services.api.environment.API_TRUSTED_PROXIES = "172.24.0.0/16";
+      c.services.api.environment.API_TRUSTED_PROXIES = "172.24.0.4";
+    },
+    expectMessage: /single address/,
+  },
   {
     name: "msout-control is not internal",
     mutate: (c) => {

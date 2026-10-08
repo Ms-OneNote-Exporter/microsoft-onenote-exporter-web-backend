@@ -263,6 +263,12 @@ jobs:
           # nothing publishes. Written out rather than derived because a workflow
           # `env:` value is not shell-expanded, and `IMAGE_TAG` is stamped later.
           RUNNER_IMAGE: ghcr.io/ms-one-note-exporter/msout-runner:0000000
+          # The reverse proxies whose X-Forwarded-For the api may believe. Required
+          # with `:?`, so this job fails if it is ever removed from compose — which is
+          # the assertion, because an unset value behind a proxy is a *global* rate
+          # limit rather than a loud error. A network rather than an address, since a
+          # container's IP changes on recreate.
+          API_TRUSTED_PROXIES: 172.24.0.0/16
         run: docker compose --profile runner -f docker-compose.yml config --quiet
 
       - name: the required host name is genuinely required

@@ -190,7 +190,7 @@ jobs:
         #
         # `VAULT_HOST_DIR` and `ARTIFACT_HOST_DIR` are bind-mount sources, so Docker
         # creates them on the host **owned by root** if they are missing — and the
-        # orchestrator runs as uid 65532. Its boot check then refuses to start with
+        # orchestrator runs as uid 1000. Its boot check then refuses to start with
         # this exact `install -d` in the message, which is the intended behaviour:
         # without this step the first `up` below fails with the orchestrator
         # unhealthy, and the reason is three steps of output away.
@@ -205,7 +205,7 @@ jobs:
           # attempt at this step got wrong by running unprivileged and failing with
           # `install: cannot create directory '/srv/msout': Permission denied`.
           for d in "$VAULT_HOST_DIR" "$ARTIFACT_HOST_DIR"; do
-            sudo install -d -o 65532 -g 65532 "$d"
+            sudo install -d -o 1000 -g 1000 "$d"
           done
           ls -ldn "$VAULT_HOST_DIR" "$ARTIFACT_HOST_DIR"
 

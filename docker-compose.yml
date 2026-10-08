@@ -396,7 +396,7 @@ services:
       # secret, and this is the same idea one step earlier.
 
     # The docker socket is root:docker mode 0660 on the host, and this image runs
-    # as uid 65532 (distroless `nonroot`). Without this the orchestrator dies with
+    # as uid 1000. Without this the orchestrator dies with
     # "permission denied" on the socket — which it did, on the first deploy.
     #
     # `group_add` rather than running as root, because root would work and would

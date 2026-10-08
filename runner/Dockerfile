@@ -63,14 +63,30 @@ RUN test -n "$(command -v chromium)" || (echo "chromium did not install" && exit
 
 # The session and artifact roots, created while this stage is still root and then
 # handed to the unprivileged user. It has to be *here*, before the first
-# `USER node`: a RUN after that line executes as node, which cannot chown anything.
+# `USER 1000` below: a RUN after that line executes unprivileged, which cannot chown anything.
 #
 # Load-bearing, the same way the api's volume ownership is: Docker creates a fresh
 # named volume from the image's directory *and its ownership*, so a path absent
 # from the image yields a root-owned volume that uid 1000 cannot write to.
 RUN mkdir -p /data /artifacts && chown -R node:node /data /artifacts
 
-USER node
+# Numerically, and not `USER node`.
+#
+# `node` in this base image *is* uid 1000, so the two are the same user -- but a named
+# uid cannot be compared against the orchestrator's by anything reading this file, and
+# comparing them is the point: the two share `/srv/msout/data`, and when they did not
+# agree every login failed with `EACCES: permission denied, mkdir '/data/<guid>'` from
+# a container the orchestrator had just created, with a correct mount and a correct
+# path.
+#
+# `.github/assert-compose.mjs` reads `USER` from this file and from
+# `orchestrator/Dockerfile` and requires them to be equal. It *refuses* a named uid
+# rather than passing it, because a check that cannot compare is not a check.
+#
+# Safe to lose the name: nothing resolves this user. `$HOME` is not read from the image
+# -- each session sets its own `homeDir` for child processes, precisely so nothing lands
+# in a shared home -- and Chromium's sandbox uses the numeric uid.
+USER 1000:1000
 
 WORKDIR /app
 

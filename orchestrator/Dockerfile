@@ -79,7 +79,31 @@ COPY --from=build --chown=nonroot:nonroot /out/srv /srv
 
 # Non-root. The Docker socket is the privilege here, not the uid; running as
 # nonroot keeps everything else unprivileged (PLAN-v3 §2.1).
-USER nonroot:nonroot
+# uid 1000, to match the runner — and this is a **deliberate departure** from
+# distroless's `nonroot`, so it needs saying plainly.
+#
+# The orchestrator and the runner share `/srv/msout/data`. The orchestrator creates a
+# session's vault directory and later sweeps it; the runner writes `auth.json`, the
+# exported notes and the artifact into it. Two processes that share a directory must
+# share an identity, or one of them cannot use what the other made. They did not:
+# `nonroot` is 65532 and the runner is `node`, which is 1000, so every session failed:
+#
+#     EACCES: permission denied, mkdir '/data/<guid>'
+#
+# at `login()`, from a container the orchestrator had just successfully created, with a
+# correct mount and a correct path.
+#
+# **The orchestrator moves, not the runner.** This process does file I/O and nothing
+# else — no subprocesses, no home directory, no Chromium. Running it as a numeric uid
+# distroless does not have a passwd entry for costs nothing. The runner's uid is
+# load-bearing in a way this one is not: it is the uid Chromium's sandbox runs as, and
+# that is exactly the thing not to disturb on the way to fixing a file permission.
+#
+# So `USER 1000:1000` numerically, no passwd entry, and the host directories are
+# created `-o 1000`. `assert-compose.mjs` requires the orchestrator image and the
+# runner image to declare the same uid, so the two cannot drift apart again — which is
+# how this happened once already.
+USER 1000:1000
 
 EXPOSE 9100
 

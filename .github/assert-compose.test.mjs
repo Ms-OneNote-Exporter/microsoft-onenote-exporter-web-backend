@@ -60,19 +60,45 @@ function runScript(scriptPath, cfg) {
  * means an interrupt leaves the repository broken, and a broken repository is a
  * worse outcome than a failed harness.
  */
-function stageDockerfile(find, replace) {
+/**
+ * Copies **every** Dockerfile the script reads, applying the replacement to whichever
+ * one contains `find`.
+ *
+ * All of them, not only the mutated one. The uid check reads `orchestrator/Dockerfile`
+ * *and* `runner/Dockerfile`, so a staged tree carrying just the mutated file makes the
+ * script crash on a missing path — which exits non-zero, which the harness counts as
+ * "caught", which is how two uid cases passed while asserting nothing.
+ *
+ * That is worth more than the cases it hid: a harness case must fail because the
+ * *check* failed, not because the harness broke. So a mutation that matches nothing
+ * throws rather than quietly staging an identical tree.
+ */
+function stageDockerfile(find, replace, only) {
   const root = mkdtempSync(join(tmpdir(), "assert-compose-"));
   mkdirSync(join(root, ".github"));
-  mkdirSync(join(root, "orchestrator"));
-  writeFileSync(
-    join(root, ".github", "assert-compose.mjs"),
-    readFileSync(SCRIPT),
-  );
-  const original = readFileSync("orchestrator/Dockerfile", "utf8");
-  if (!original.includes(find)) {
-    throw new Error(`orchestrator/Dockerfile no longer contains ${JSON.stringify(find)}`);
+  writeFileSync(join(root, ".github", "assert-compose.mjs"), readFileSync(SCRIPT));
+
+  // `only` matters: `USER 1000:1000` is in *both* Dockerfiles, so an unscoped
+  // replacement made them both 65532 — still equal, and the check correctly passed.
+  // The case then reported "not caught" for a mutation that had quietly become a
+  // no-op on the property under test.
+  let matched = false;
+  for (const dir of ["orchestrator", "runner"]) {
+    mkdirSync(join(root, dir));
+    const original = readFileSync(join(dir, "Dockerfile"), "utf8");
+    if (original.includes(find) && (only === undefined || dir === only)) {
+      matched = true;
+      writeFileSync(join(root, dir, "Dockerfile"), original.split(find).join(replace));
+    } else {
+      writeFileSync(join(root, dir, "Dockerfile"), original);
+    }
   }
-  writeFileSync(join(root, "orchestrator", "Dockerfile"), original.split(find).join(replace));
+  if (!matched) {
+    throw new Error(
+      `no Dockerfile contains ${JSON.stringify(find)}; the mutation would stage an ` +
+        `identical tree and the case would pass without asserting anything`,
+    );
+  }
   return join(root, ".github", "assert-compose.mjs");
 }
 
@@ -461,6 +487,37 @@ const cases = [
     expectMessage: /orchestrator's secrets are \[/,
   },
   {
+    // The shipped bug: distroless `nonroot` is 65532 and the runner's `node` is 1000.
+    // They share `/srv/msout/data`, so the orchestrator created a session directory
+    // the runner could not write to, and every login failed with
+    // `EACCES: permission denied, mkdir '/data/<guid>'` — from a container that was
+    // healthy, correctly mounted and correctly addressed.
+    //
+    // Staged as a Dockerfile edit rather than a config edit precisely because the
+    // config carries no uid at all: the two images name the identity independently,
+    // which is why nothing compared them.
+    name: "gives the orchestrator a different uid from the runner",
+    mutateFile: {
+      file: "orchestrator",
+      find: "USER 1000:1000",
+      replace: "USER 65532:65532",
+    },
+    expectMessage: /share \/srv\/msout\/data/,
+  },
+  {
+    // A named uid cannot be compared, so the check refuses rather than passing. The
+    // runner's Dockerfile said `USER node` while the orchestrator's said
+    // `USER 1000:1000`, and a check that skipped the mismatch rather than objecting
+    // to it would have been the thing that let the pair through.
+    name: "declares the runner's uid by name, so it cannot be compared",
+    mutateFile: {
+      file: "runner",
+      find: "USER 1000:1000",
+      replace: "USER node",
+    },
+    expectMessage: /must be numeric/,
+  },
+  {
     // The shipped bug, form 1: a named volume. On the host `/srv/msout/vault` is
     // not the volume at all — it is an empty root-owned directory Docker created —
     // and every runner mounted it as `/data` and failed with EACCES.
@@ -548,7 +605,11 @@ for (const testCase of cases) {
   // towards a filler function that looks like it is asserting something.
   testCase.mutate?.(cfg);
   const script = testCase.mutateFile
-    ? stageDockerfile(testCase.mutateFile.find, testCase.mutateFile.replace)
+    ? stageDockerfile(
+        testCase.mutateFile.find,
+        testCase.mutateFile.replace,
+        testCase.mutateFile.file,
+      )
     : SCRIPT;
 
   if (runScript(script, cfg) === 0) {

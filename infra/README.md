@@ -187,10 +187,11 @@ So they are host directories, mounted by the orchestrator **at the identical pat
 and created once before the first start:
 
 ```sh
-install -d -o 65532 -g 65532 /opt/msout/data/vault /opt/msout/data/artifacts
+install -d -o 1000 -g 1000 /opt/msout/data/vault /opt/msout/data/artifacts
 ```
 
-65532 is distroless's `nonroot`, the uid the orchestrator runs as. Docker creates a
+1000 is the uid **both** the orchestrator and the runner run as, because they share
+this tree. Docker creates a
 missing bind source owned by root, which is why this cannot be left to the daemon.
 The orchestrator checks both roots at boot and refuses to start with that exact
 command in the failure, so a wrong owner is a named startup error rather than an

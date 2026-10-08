@@ -254,6 +254,50 @@ check(
     )}. This value is the *source* of a bind mount, so it must resolve on the host; ` +
     `a container path makes Docker create a directory there and every runner exits 1`,
 );
+// The orchestrator and the runner must run as the **same uid**, because they share
+// `/srv/msout/data`: the orchestrator creates a session's vault directory, the runner
+// writes `auth.json` and the exported notes into it, and the orchestrator sweeps it.
+//
+// They did not. `nonroot` is 65532 and the runner's `node` is 1000, so every login
+// failed from a container the orchestrator had just created, with a correct mount and a
+// correct path:
+//
+//     EACCES: permission denied, mkdir '/data/<guid>'
+//
+// The orchestrator moved to 1000 rather than the runner, because the runner's uid is
+// what Chromium's sandbox runs as. The assertion reads both Dockerfiles, so this is a
+// comparison rather than two literals that can drift.
+//
+// Both are read as text because that is all a static check can do — and it is exactly
+// enough, since the failure mode is two files naming one identity independently.
+function declaredUid(dockerfile) {
+  const match = dockerfile.match(/^USER\s+(\S+)/m);
+  if (match === null) return undefined;
+  const raw = match[1].split(":")[0];
+  // Named users (`node`, `nonroot`) are resolved by the base image, so only a numeric
+  // one can be compared. A named uid here means the check cannot do its job, and says
+  // so rather than passing.
+  return /^\d+$/.test(raw) ? Number(raw) : raw;
+}
+
+const orchestratorUid = declaredUid(
+  readFileSync(new URL("../orchestrator/Dockerfile", import.meta.url), "utf8"),
+);
+const runnerUid = declaredUid(
+  readFileSync(new URL("../runner/Dockerfile", import.meta.url), "utf8"),
+);
+
+check(
+  typeof orchestratorUid === "number" && orchestratorUid === runnerUid,
+  `orchestrator and runner share uid ${orchestratorUid}`,
+  `the orchestrator runs as ${JSON.stringify(orchestratorUid)} and the runner as ` +
+    `${JSON.stringify(runnerUid)}. They share /srv/msout/data — the orchestrator creates ` +
+    `a session's vault directory and the runner writes into it — so a mismatch means ` +
+    `every login fails with \`EACCES: permission denied, mkdir '/data/<guid>'\`, from a ` +
+    `container the orchestrator had just created. Both must be numeric so this can be ` +
+    `compared at all`,
+);
+
 // The runner takes no host path at all.
 //
 // Not "no host path of its own choosing" — **none**. The runner holds the Microsoft

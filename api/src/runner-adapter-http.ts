@@ -709,18 +709,41 @@ function publish(
 
     case "notebooks-listed": {
       const list = Array.isArray(raw.notebooks) ? raw.notebooks : [];
-      sse.emit(sessionId, "notebooks-listed", {
-        notebooks: list.map((entry) => {
-          const n = (typeof entry === "object" && entry !== null ? entry : {}) as Record<
-            string,
-            unknown
-          >;
-          return {
-            name: typeof n.name === "string" ? n.name : "",
-            url: typeof n.url === "string" ? n.url : "",
-          };
-        }),
-      });
+
+      // **The shape here is the snapshot's shape, and that is the whole point.**
+      //
+      // This used to emit `{notebooks: [{name, url}, …]}`. The client reads
+      // `{state, items: string[]}` — the same shape `GET /api/session/status` already
+      // returns for this field — so every notebook was parsed into an empty list:
+      //
+      //     data.state → undefined → "loaded"
+      //     data.items → absent   → []
+      //
+      // No error, no warning, three notebooks found by the runner and nothing on
+      // screen. Found by clicking the button: the api logged `202` and the runner
+      // logged `Found 3 notebooks!`, and the user reported the button did nothing.
+      //
+      // The fix belongs here rather than in the client because **this** was the
+      // deviant: the api already publishes one shape for this field on the REST route
+      // and a second on the event stream, and a contract with two versions is not a
+      // contract. Now there is one, and it is the one the client already parses.
+      //
+      // `items` are **names**, because that is what `POST /api/export` takes — a
+      // notebook name — and what the client's `NotebookList.items` is typed as. The
+      // runner's `url` is deliberately not forwarded: nothing reads it, and inventing
+      // a field would make the next reader hunt for a consumer that does not exist.
+      const items: string[] = [];
+      for (const entry of list) {
+        const n = (typeof entry === "object" && entry !== null ? entry : {}) as Record<
+          string,
+          unknown
+        >;
+        const name = typeof n.name === "string" ? n.name.trim() : "";
+        // A nameless notebook cannot be exported by name and cannot be shown, so it
+        // is dropped here rather than rendered as a blank row the user cannot click.
+        if (name !== "") items.push(name);
+      }
+      sse.emit(sessionId, "notebooks-listed", { state: "loaded", items });
       return "published";
     }
 

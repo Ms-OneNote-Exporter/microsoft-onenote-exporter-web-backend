@@ -740,3 +740,129 @@ describe("the event pump", () => {
     adapter.stopAll();
   });
 });
+// ---------------------------------------------------------------------------
+// The notebook list, as published.
+//
+// Found by clicking the button. Every step worked —
+//
+//     api    POST /api/session/notebooks  →  202        (four times)
+//     runner [SUCCESS] Found 3 notebooks!
+//     runner [DEBUG]  3 of 3 notebooks resolved to a link.
+//     user   "clicking List my notebooks has no effect"
+//
+// — and the result never arrived in a shape anything could read.
+//
+// The api published `{notebooks: [{name, url}, …]}`. The client reads
+// `{state, items: string[]}` (its `parseNotebooks`), which is the shape the api
+// **already** publishes for this field on `GET /api/session/status` via
+// `notebooksFor()`. So three notebooks were parsed into an empty list: no error, no
+// warning, no failed request. Two versions of one field is not a contract, and the
+// event stream was the deviant.
+//
+// These assertions are on the **bytes that arrived at a subscriber**, which is the
+// same rule the rest of this file follows and the only one that can catch a shape
+// mismatch.
+
+describe("the notebook list, as published", () => {
+  /**
+   * The client's parser, mirrored.
+   *
+   * `parseNotebooks` in the frontend's `App.tsx`. Copied rather than imported —
+   * two repositories, two build outputs — and the copy is the point: it fails when
+   * the published shape and the consumed shape disagree, which is the bug. Named
+   * precisely so a future edit knows which file to re-check.
+   */
+  function clientParseNotebooks(data: unknown): { state: string; items: string[] } {
+    if (typeof data !== "object" || data === null) return { state: "loaded", items: [] };
+    const raw = data as Record<string, unknown>;
+    const state = raw.state;
+    return {
+      state:
+        state === "idle" || state === "listing" || state === "loaded" || state === "failed"
+          ? state
+          : "loaded",
+      items: Array.isArray(raw.items)
+        ? (raw.items as unknown[]).filter((i): i is string => typeof i === "string")
+        : [],
+    };
+  }
+
+  async function published(payload: {
+    notebooks: ReadonlyArray<Record<string, unknown>>;
+  }): Promise<unknown> {
+    const runner = await fakeRunner();
+    const adapter = adapterFor(runner);
+    // The runner's real wire frame, per `formatSse` in `runner/src/events.ts`.
+    runner.sseFrames = [`id: 1\ndata: ${JSON.stringify({ type: "notebooks-listed", ...payload })}\n\n`];
+
+    const sub = subscribe(runner.sse);
+    await adapter.listNotebooks(SESSION);
+    const events = await sub.received();
+    adapter.stopAll();
+
+    const listed = events.find((e) => e.type === "notebooks-listed");
+    if (listed === undefined) throw new Error("no notebooks-listed event reached a subscriber");
+    return listed.data;
+  }
+
+  it("is the shape the client parses, not a second shape", async () => {
+    const data = await published({
+      notebooks: [
+        { name: "Work", url: "https://onenote.cloud.microsoft/notebooks/1" },
+        { name: "Personal", url: "https://onenote.cloud.microsoft/notebooks/2" },
+        { name: "Research", url: "https://onenote.cloud.microsoft/notebooks/3" },
+      ],
+    });
+
+    // Stated first, so a shape change is a visible diff rather than a silently
+    // different object.
+    expect(data).toEqual({ state: "loaded", items: ["Work", "Personal", "Research"] });
+  });
+
+  // The bug in one assertion: before the fix this payload was `{notebooks: [...]}` and
+  // the mirror returned three notebooks' worth of nothing.
+  it("survives the client's own parser", async () => {
+    const data = await published({ notebooks: [{ name: "Work", url: "x" }] });
+
+    expect(clientParseNotebooks(data).items).toEqual(["Work"]);
+  });
+
+  it("does not emit a `notebooks` key at all", async () => {
+    // Named explicitly because its absence *is* the fix: an edit that added the old
+    // key back beside the new one would pass every other test here.
+    const data = await published({ notebooks: [{ name: "Work", url: "x" }] });
+
+    expect(Object.keys(data as object).sort()).toEqual(["items", "state"]);
+  });
+
+  it("carries names, because export is asked for a name", async () => {
+    // `POST /api/export` takes `{notebook: string}`, and the client's
+    // `NotebookList.items` is `string[]`. A list of objects would parse into an
+    // empty `items` and offer nothing selectable.
+    const data = await published({ notebooks: [{ name: "Work", url: "x" }] });
+
+    expect(clientParseNotebooks(data).items.every((i) => typeof i === "string")).toBe(true);
+  });
+
+  it("drops a nameless notebook rather than rendering a blank row", async () => {
+    const data = await published({
+      notebooks: [{ name: "   ", url: "x" }, { name: "Work", url: "y" }],
+    });
+
+    expect(clientParseNotebooks(data).items).toEqual(["Work"]);
+  });
+
+  it("trims a name, so what is shown is what is sent", async () => {
+    const data = await published({ notebooks: [{ name: "  Work  ", url: "x" }] });
+
+    expect(clientParseNotebooks(data).items).toEqual(["Work"]);
+  });
+
+  it("is an empty list, not a malformed one, when the runner reports none", async () => {
+    const data = await published({ notebooks: [] });
+
+    // A real list of none, which the picker can render — as against a shape it
+    // cannot read at all, which is what it used to be.
+    expect(data).toEqual({ state: "loaded", items: [] });
+  });
+});

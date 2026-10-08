@@ -158,19 +158,206 @@ check(
     "into every runner, so without it Docker creates an empty directory at the " +
     "destination and each runner exits 1 at startup",
 );
+// The vault and artifact roots are bind-mount **sources**, which the Engine resolves
+// on the **host** — a different kind of setting from every other path in this file,
+// and one that breaks in a way nothing else here can see.
+//
+// What shipped, in two forms:
+//
+//   1. as a **named volume** at `/srv/msout/vault`. On the host that path is
+//      `/var/lib/docker/volumes/msout_vault/_data`, so `/srv/msout/vault` named an
+//      empty root-owned directory that Docker created and nothing wrote to. Every
+//      runner got it as `/data` and could not create its session directory:
+//
+//          EACCES: permission denied, mkdir '/data/<guid>'
+//
+//   2. with **no volume at all**, the vault lived in the container's writable layer,
+//      so one `--force-recreate orchestrator` deleted every session's auth.json and
+//      exported vault — with nothing failing and nothing reporting it.
+//
+// So the assertion is the property both fixes depend on: the path the orchestrator
+// hands the Engine must be **the same absolute path** the orchestrator itself has
+// mounted. Then it is unambiguous on both sides of the container boundary.
+//
+// Docker's volume-seeding behaviour is deliberately *not* asserted. It was the
+// right mechanism for a named volume and it worked — ownership came out `65532`, as
+// intended. It was simply the wrong mechanism for a path that has to survive as a
+// string and be resolved on the other side of the boundary.
+for (const [envVar, role] of [
+  ["ORCH_VAULT_ROOT", "session vault"],
+  ["ORCH_ARTIFACT_ROOT", "finalized exports"],
+]) {
+  const root = services.orchestrator?.environment?.[envVar];
+
+  check(
+    typeof root === "string" && root.startsWith("/"),
+    `orchestrator: ${envVar} is an absolute path`,
+    `orchestrator ${envVar} is ${JSON.stringify(root)}. It is the *source* of a bind ` +
+      `mount, so a relative path either cannot be resolved by the Engine or resolves ` +
+      `against a working directory nobody chose`,
+  );
+
+  check(
+    root !== undefined &&
+      (services.orchestrator?.volumes ?? []).some(
+        (v) => (typeof v === "string" ? v : v?.target) === root,
+      ),
+    `orchestrator: mounts the ${role} at ${root}, the same path it hands the Engine`,
+    `orchestrator ${envVar} is ${JSON.stringify(root)} but nothing is mounted there. A ` +
+      `bind source is resolved on the *host*: if that path only exists inside this ` +
+      `container, the Engine creates an empty root-owned directory there and every ` +
+      `runner mounts a directory nobody writes to (\`EACCES: mkdir '/data/<guid>'\`)`,
+  );
+}
+
+// The vault must not be mounted anywhere else. §2.1 forbids the api from reading a
+// cookie jar, and it forbids Caddy reading a vault path.
+const vaultRoot = services.orchestrator?.environment?.ORCH_VAULT_ROOT;
+for (const svc of ["api", "caddy"]) {
+  check(
+    typeof vaultRoot !== "string" ||
+      !(services[svc]?.volumes ?? []).some(
+        (v) => (typeof v === "string" ? v : v?.target) === vaultRoot,
+      ),
+    `${svc} has no vault mount`,
+    `${svc} mounts ${vaultRoot}; §2.1 requires that only the orchestrator and the ` +
+      `runners it creates can read a vault`,
+  );
+}
+
+// ORCH_RUNNER_TOKEN_FILE must be a **host** path, not the container path the
+// orchestrator mounts the secret at.
+//
+// The previous assertion here checked that it equalled
+// `/run/secrets/runner_token` — the orchestrator's own mount point — and passed.
+// It was checking the wrong thing: this value is used as the **source** of a bind
+// when creating each runner, and a bind source is resolved on the host. On a host
+// where that path does not exist, Docker creates a directory there, the runner
+// mounts a directory over its own secret path, and exits 1:
+//
+//   MSOUT_RUNNER_TOKEN_FILE could not be read at /run/secrets/runner_token: ENOENT
+//
+// Every container started and `/healthz` said `ok`; it surfaced only on the first
+// real login. So the assertion is that the path lives **under SECRETS_DIR**, which
+// is where the `secrets:` block actually reads from.
+const secretsDir = cfg.secrets?.runner_token?.file?.slice(0, -"/runner_token".length);
+const tokenHostFile = services.orchestrator?.environment?.ORCH_RUNNER_TOKEN_FILE;
 check(
-  services.orchestrator?.environment?.ORCH_RUNNER_TOKEN_FILE === "/run/secrets/runner_token",
-  "orchestrator: ORCH_RUNNER_TOKEN_FILE points at the mounted secret",
-  `orchestrator ORCH_RUNNER_TOKEN_FILE is ${JSON.stringify(
-    services.orchestrator?.environment?.ORCH_RUNNER_TOKEN_FILE,
-  )}; it must name the path the token is mounted at, or the mount source is wrong`,
+  secretsDir !== undefined &&
+    tokenHostFile !== undefined &&
+    tokenHostFile.startsWith(secretsDir) &&
+    tokenHostFile.endsWith("/runner_token"),
+  "orchestrator: ORCH_RUNNER_TOKEN_FILE is the HOST path of the token",
+  `orchestrator ORCH_RUNNER_TOKEN_FILE is ${JSON.stringify(tokenHostFile)} but the ` +
+    `runner_token secret is read from ${JSON.stringify(
+      cfg.secrets?.runner_token?.file,
+    )}. This value is the *source* of a bind mount, so it must resolve on the host; ` +
+    `a container path makes Docker create a directory there and every runner exits 1`,
 );
+// The orchestrator must create runners from **the image this stack runs**, not from
+// some other image that happens to share a name.
+//
+// `ORCH_RUNNER_IMAGE` comes from the operator's `RUNNER_IMAGE`, and the `runner`
+// service's `image:` comes from `${IMAGE_TAG:-local}`. Two independent names for one
+// image, and nothing compared them.
+//
+// It cost a whole afternoon of "the rebuild did nothing": the deployment's `.env` had
+//
+//     RUNNER_IMAGE=ghcr.io/ms-onenote-exporter/msout-runner:<sha>     # one "one"
+//
+// while compose builds
+//
+//     ghcr.io/ms-one-note-exporter/msout-runner:<sha>                # two
+//
+// — a hyphen short. Every rebuild succeeded and went to a *different repository*, and
+// the orchestrator went on creating runners from a 15-hour-old image under the wrong
+// name. Nothing failed. `docker images` showed a fresh build, so the only symptom was
+// that the code in the container never changed.
+//
+// The canonical name is the lowercased repository owner, which is what `publish.yml`
+// writes to `REGISTRY_PREFIX`; these lines use that spelling literally.
+const runnerImage = services.runner?.image;
+const orchRunnerImage = services.orchestrator?.environment?.ORCH_RUNNER_IMAGE;
+check(
+  runnerImage !== undefined && runnerImage === orchRunnerImage,
+  `orchestrator creates runners from the image the stack runs (${runnerImage})`,
+  `the runner service runs ${JSON.stringify(runnerImage)} but the orchestrator creates ` +
+    `runners from ${JSON.stringify(orchRunnerImage)}. The two names are set independently ` +
+    `— \`image: \${IMAGE_TAG}\` and the operator's RUNNER_IMAGE — and nothing compared them. ` +
+    `A rebuild then lands in a different repository while the orchestrator keeps using ` +
+    `a stale image, and the only symptom is that the code in the container never changes. ` +
+    `The canonical prefix is the lowercased repository owner, as publish.yml sets it`,
+);
+
+// The orchestrator and the runner must run as the **same uid**, because they share
+// `/srv/msout/data`: the orchestrator creates a session's vault directory, the runner
+// writes `auth.json` and the exported notes into it, and the orchestrator sweeps it.
+//
+// They did not. `nonroot` is 65532 and the runner's `node` is 1000, so every login
+// failed from a container the orchestrator had just created, with a correct mount and a
+// correct path:
+//
+//     EACCES: permission denied, mkdir '/data/<guid>'
+//
+// The orchestrator moved to 1000 rather than the runner, because the runner's uid is
+// what Chromium's sandbox runs as. The assertion reads both Dockerfiles, so this is a
+// comparison rather than two literals that can drift.
+//
+// Both are read as text because that is all a static check can do — and it is exactly
+// enough, since the failure mode is two files naming one identity independently.
+function declaredUid(dockerfile) {
+  const match = dockerfile.match(/^USER\s+(\S+)/m);
+  if (match === null) return undefined;
+  const raw = match[1].split(":")[0];
+  // Named users (`node`, `nonroot`) are resolved by the base image, so only a numeric
+  // one can be compared. A named uid here means the check cannot do its job, and says
+  // so rather than passing.
+  return /^\d+$/.test(raw) ? Number(raw) : raw;
+}
+
+const orchestratorUid = declaredUid(
+  readFileSync(new URL("../orchestrator/Dockerfile", import.meta.url), "utf8"),
+);
+const runnerUid = declaredUid(
+  readFileSync(new URL("../runner/Dockerfile", import.meta.url), "utf8"),
+);
+
+check(
+  typeof orchestratorUid === "number" && orchestratorUid === runnerUid,
+  `orchestrator and runner share uid ${orchestratorUid}`,
+  `the orchestrator runs as ${JSON.stringify(orchestratorUid)} and the runner as ` +
+    `${JSON.stringify(runnerUid)}. They share /srv/msout/data — the orchestrator creates ` +
+    `a session's vault directory and the runner writes into it — so a mismatch means ` +
+    `every login fails with \`EACCES: permission denied, mkdir '/data/<guid>'\`, from a ` +
+    `container the orchestrator had just created. Both must be numeric so this can be ` +
+    `compared at all`,
+);
+
+// The runner takes no host path at all.
+//
+// Not "no host path of its own choosing" — **none**. The runner holds the Microsoft
+// credential and is the only component pointed at the open internet, so it gets its
+// data and its artifacts as named volumes and its token as a Docker secret, and
+// nothing else.
+//
+// This is asserted against the compose `runner` service, which is the *development*
+// runner: nothing creates it through the orchestrator, so no grants are in play and
+// the full property is available. An orchestrator-created runner cannot have it — the
+// orchestrator binds that one the per-session vault and the artifact root, because
+// artifacts must leave the container and the vault must persist. T-X-R2 in
+// `capability.yml` asserts the same property against a running container.
+//
+// The temptation this guards against: pointing the dev runner at
+// `ARTIFACT_HOST_DIR` "so both runners share an artifacts directory". That is a
+// convenience, and it costs the only assertion about the runner's mounts on a real
+// container. It was tried, and reverted.
 const runnerBinds = bindsFor("runner").map((v) => String(v.source));
 check(
   runnerBinds.every((src) => src.endsWith("runner_token")),
   `runner bind-mounts only its token (${runnerBinds.join(", ") || "none"})`,
   `runner bind-mounts something unexpected: ${runnerBinds.join(", ")}. §2.1 gives it no host ` +
-    "path — its data root is a named volume and the only bind allowed is its own secret file",
+    `path — its data root and its artifact root are named volumes, and the only bind ` +
+    `allowed is its own secret file`,
 );
 for (const key of ["CSRF_KEY", "CSRF_KEY_FILE", "SESSION_SECRET", "ORCHESTRATOR_HMAC_SECRET"]) {
   check(
@@ -272,6 +459,59 @@ check(
   "api is on msout-runner-api",
   "FAIL: the api is not on msout-runner-api, so it has no route to a runner and " +
     "every credential submission would fail",
+);
+
+// The two runner networks must exist under the names the orchestrator asks for.
+//
+// Compose prefixes a network with the project name — `msout_msout-runner` — while
+// `ORCH_RUNNER_NETWORK` names it `msout-runner`. The orchestrator builds its create
+// request by name, so a mismatch means it asks the Engine for a network that does
+// not exist and every slot fails with `404 network not found`.
+//
+// CI could not see it: in the capability suite compose creates the runner, so the
+// orchestrator's create path never runs. The first real deployment failed on it.
+// `name:` on the network is what makes the two agree by construction; this asserts
+// they do.
+for (const [network, envVar] of [
+  ["msout-runner", "ORCH_RUNNER_NETWORK"],
+  ["msout-runner-api", "ORCH_RUNNER_CONTROL_NETWORK"],
+]) {
+  check(
+    cfg.networks?.[network]?.name === network,
+    `${network} exists under its own name`,
+    `${network} would be created as "<project>_${network}" by Compose, but the ` +
+      `orchestrator asks for "${network}" by name (${envVar}). Add \`name: ${network}\` ` +
+      `under it, or every runner create fails with "network not found" — and CI cannot ` +
+      `see it, because the capability suite creates the runner through Compose`,
+  );
+}
+
+// `msout-runner` must be `external`, and it is the only network that can be.
+//
+// Compose prunes a network no **non-profile** service joins, and the only service that
+// joins this one is the `runner` service, which sits behind a profile. So a plain
+// `docker compose up` creates it and then removes it, and the orchestrator — which asks
+// the Engine for it by name — gets:
+//
+//     404 {"message":"network msout-runner not found"}
+//
+// There is no compose expression for "keep a network nothing joins", so it is declared
+// operator-provided. Without `external: true` this check cannot be made at all,
+// because Compose's own error when the network already exists is:
+//
+//     network msout-runner was found but has incorrect label
+//     com.docker.compose.network set to "" (expected: "msout-runner")
+//
+// — which is a deploy step failing, not an assertion.
+check(
+  cfg.networks?.["msout-runner"]?.external === true,
+  "msout-runner is external, so Compose cannot prune the network nothing joins",
+  `msout-runner is not external. Compose prunes any network no non-profile service ` +
+    `joins, and the only service that joins this one is behind the runner profile — so ` +
+    `a plain \`docker compose up\` creates it and deletes it, and the orchestrator's ` +
+    `first runner create fails with "network msout-runner not found". Create it first ` +
+    `(docker network create --driver bridge msout-runner) and mark it external. ` +
+    `\`capability.yml\` does this`,
 );
 
 // The api must not be on the egress network. This is the error the whole
@@ -411,8 +651,19 @@ for (const svc of Object.keys(services)) {
   }
 
   // Every *_FILE that is present must point at a real secret path.
+  //
+  // **`ORCH_RUNNER_TOKEN_FILE` is the exception, and it is a real one.** It is the
+  // *source* of a bind mount when the orchestrator creates each runner, and a bind
+  // source is resolved on the **host** — so it must be a host path under
+  // SECRETS_DIR, not `/run/secrets/...`. It was `/run/secrets/runner_token` until a
+  // deployment created a runner for the first time and every runner exited 1,
+  // because Docker had created a directory at a host path that did not exist.
+  //
+  // It is asserted separately and correctly above; excluding it here is what keeps
+  // that assertion from being contradicted by this generic rule.
   for (const [key, value] of Object.entries(env)) {
     if (!key.endsWith("_FILE")) continue;
+    if (svc === "orchestrator" && key === "ORCH_RUNNER_TOKEN_FILE") continue;
     check(
       typeof value === "string" && value.startsWith("/run/secrets/"),
       `${svc}: ${key} points into /run/secrets`,

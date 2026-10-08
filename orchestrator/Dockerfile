@@ -36,7 +36,19 @@ RUN if go list -m all | tail -n +2 | grep -q .; then \
 
 # The directory tree copied into the runtime image below. Built here because the
 # runtime stage has no shell to create it with.
-RUN mkdir -p /out/srv/artifacts /out/srv/vault
+#
+# The paths must be exactly `ORCH_VAULT_ROOT` and `ORCH_ARTIFACT_ROOT`'s parent, or
+# exactly where `docker-compose.yml` mounts the volumes — all three agree on
+# `/srv/msout/{vault,artifacts}`, and this line **was `/out/srv/{vault,artifacts}`**.
+# So the directories below were never the ones being mounted, Docker had nothing to
+# seed a fresh volume from, and the first real login failed:
+#
+#     mkdir /srv/msout/vault: permission denied
+#
+# with `/healthz` reporting `ok` throughout. `.github/assert-compose.mjs` now
+# cross-checks this line against the compose mount targets, because three files
+# naming the same path independently is how it drifted.
+RUN mkdir -p /out/srv/msout/vault /out/srv/msout/artifacts
 
 # ---- runtime --------------------------------------------------------------
 # distroless/static has no shell and no package manager. The orchestrator never
@@ -59,11 +71,39 @@ COPY --from=build /out/orchestrator /usr/local/bin/orchestrator
 # runtime.
 
 # `nonroot` is distroless's uid 65532, the same user the container runs as.
+#
+# Copied to `/srv`, so the image's directories land at `/srv/msout/{vault,artifacts}`
+# — the paths `ORCH_VAULT_ROOT` and `ORCH_ARTIFACT_ROOT` default to and the paths
+# `docker-compose.yml` mounts. All three names must agree; CI asserts it.
 COPY --from=build --chown=nonroot:nonroot /out/srv /srv
 
 # Non-root. The Docker socket is the privilege here, not the uid; running as
 # nonroot keeps everything else unprivileged (PLAN-v3 §2.1).
-USER nonroot:nonroot
+# uid 1000, to match the runner — and this is a **deliberate departure** from
+# distroless's `nonroot`, so it needs saying plainly.
+#
+# The orchestrator and the runner share `/srv/msout/data`. The orchestrator creates a
+# session's vault directory and later sweeps it; the runner writes `auth.json`, the
+# exported notes and the artifact into it. Two processes that share a directory must
+# share an identity, or one of them cannot use what the other made. They did not:
+# `nonroot` is 65532 and the runner is `node`, which is 1000, so every session failed:
+#
+#     EACCES: permission denied, mkdir '/data/<guid>'
+#
+# at `login()`, from a container the orchestrator had just successfully created, with a
+# correct mount and a correct path.
+#
+# **The orchestrator moves, not the runner.** This process does file I/O and nothing
+# else — no subprocesses, no home directory, no Chromium. Running it as a numeric uid
+# distroless does not have a passwd entry for costs nothing. The runner's uid is
+# load-bearing in a way this one is not: it is the uid Chromium's sandbox runs as, and
+# that is exactly the thing not to disturb on the way to fixing a file permission.
+#
+# So `USER 1000:1000` numerically, no passwd entry, and the host directories are
+# created `-o 1000`. `assert-compose.mjs` requires the orchestrator image and the
+# runner image to declare the same uid, so the two cannot drift apart again — which is
+# how this happened once already.
+USER 1000:1000
 
 EXPOSE 9100
 

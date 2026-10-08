@@ -17,14 +17,32 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const SCRIPT = ".github/assert-compose.mjs";
 
 /** Runs the assertion script against a config object; returns its exit code. */
 function run(cfg) {
+  return runScript(SCRIPT, cfg);
+}
+
+/**
+ * runScript runs the assertion script from *some* directory.
+ *
+ * Two cases need the script and the Dockerfile to be read from a scratch tree: the
+ * assertion reads `../orchestrator/Dockerfile` relative to itself, so a Dockerfile
+ * violation can only be staged if the script sits next to a mutated copy of it.
+ *
+ * Deliberately **not** a `dockerfile` field on the config passed to the script. That
+ * would be a test-only backdoor in the assertion — the thing being tested would gain
+ * a way to be told what to check, which is exactly the shape of an assertion that
+ * cannot be trusted.
+ */
+function runScript(scriptPath, cfg) {
   try {
-    execFileSync("node", [SCRIPT], {
+    execFileSync("node", [scriptPath], {
       input: JSON.stringify(cfg),
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -34,8 +52,70 @@ function run(cfg) {
   }
 }
 
+/**
+ * stages a mutated copy of the orchestrator Dockerfile beside a copy of the script,
+ * and returns the path to that copy of the script.
+ *
+ * A temp tree rather than an in-place edit-and-restore: restoring in a `finally`
+ * means an interrupt leaves the repository broken, and a broken repository is a
+ * worse outcome than a failed harness.
+ */
+/**
+ * Copies **every** Dockerfile the script reads, applying the replacement to whichever
+ * one contains `find`.
+ *
+ * All of them, not only the mutated one. The uid check reads `orchestrator/Dockerfile`
+ * *and* `runner/Dockerfile`, so a staged tree carrying just the mutated file makes the
+ * script crash on a missing path — which exits non-zero, which the harness counts as
+ * "caught", which is how two uid cases passed while asserting nothing.
+ *
+ * That is worth more than the cases it hid: a harness case must fail because the
+ * *check* failed, not because the harness broke. So a mutation that matches nothing
+ * throws rather than quietly staging an identical tree.
+ */
+function stageDockerfile(find, replace, only) {
+  const root = mkdtempSync(join(tmpdir(), "assert-compose-"));
+  mkdirSync(join(root, ".github"));
+  writeFileSync(join(root, ".github", "assert-compose.mjs"), readFileSync(SCRIPT));
+
+  // `only` matters: `USER 1000:1000` is in *both* Dockerfiles, so an unscoped
+  // replacement made them both 65532 — still equal, and the check correctly passed.
+  // The case then reported "not caught" for a mutation that had quietly become a
+  // no-op on the property under test.
+  let matched = false;
+  for (const dir of ["orchestrator", "runner"]) {
+    mkdirSync(join(root, dir));
+    const original = readFileSync(join(dir, "Dockerfile"), "utf8");
+    if (original.includes(find) && (only === undefined || dir === only)) {
+      matched = true;
+      writeFileSync(join(root, dir, "Dockerfile"), original.split(find).join(replace));
+    } else {
+      writeFileSync(join(root, dir, "Dockerfile"), original);
+    }
+  }
+  if (!matched) {
+    throw new Error(
+      `no Dockerfile contains ${JSON.stringify(find)}; the mutation would stage an ` +
+        `identical tree and the case would pass without asserting anything`,
+    );
+  }
+  return join(root, ".github", "assert-compose.mjs");
+}
+
 /** A deep clone, so each case starts from the real config untouched. */
 const clone = (cfg) => structuredClone(cfg);
+
+/**
+ * The bind-mount sources the compose file requires. Absolute, and named so the
+ * harness cases can say "nothing is mounted at this path" without repeating a
+ * literal that has to be kept in step with `docker-compose.yml`.
+ *
+ * They are passed to `docker compose` below rather than being asserted against as
+ * constants, because a check that re-declares the value it is checking tests
+ * nothing.
+ */
+const VAULT_DIR = "/srv/msout/vault-host";
+const ARTIFACT_DIR = "/srv/msout/artifacts-host";
 
 const base = JSON.parse(
   // `--profile runner`, because the runner service sits behind a profile and a
@@ -52,6 +132,8 @@ const base = JSON.parse(
       ALLOWED_ORIGINS: "https://app.example.com",
       IMAGE_TAG: "0000000",
       _DOCKER_GID: "998",
+      VAULT_HOST_DIR: VAULT_DIR,
+      ARTIFACT_HOST_DIR: ARTIFACT_DIR,
     },
   }),
 );
@@ -331,6 +413,21 @@ const cases = [
     expectMessage: /msout-runner is internal/,
   },
   {
+    // The one CI structurally cannot see. In the capability suite the *compose
+    // file* creates the runner, so the orchestrator's own create path never runs —
+    // which is exactly how a name mismatch between the two survived every job.
+    //
+    // The fix is `name:` on the network, and this is the assertion for it: without
+    // it Compose creates `<project>_msout-runner` while the orchestrator asks for
+    // `msout-runner`, and every slot fails on a real host.
+    name: "lets Compose prefix the runner networks the orchestrator names",
+    mutate: (c) => {
+      delete c.networks["msout-runner"].name;
+      delete c.networks["msout-runner-api"].name;
+    },
+    expectMessage: /network not found/,
+  },
+  {
     name: "removes the api from the credential-path network",
     mutate: (c) => {
       delete c.services.api.networks["msout-runner-api"];
@@ -390,11 +487,141 @@ const cases = [
     expectMessage: /orchestrator's secrets are \[/,
   },
   {
+    // A hyphen short. `RUNNER_IMAGE` said `ms-onenote-exporter`, compose builds
+    // `ms-one-note-exporter`, and every rebuild landed in a different repository while
+    // the orchestrator kept creating runners from a 15-hour-old image — with
+    // `docker images` showing a fresh build the whole time.
+    //
+    // This is the one assertion in this file about a value the *operator* supplies,
+    // and it is here because two independent names for one image is the same shape as
+    // every other drift in this PR: a place where nothing checks that two namings mean
+    // the same thing.
+    name: "has the orchestrator create runners from a different image than the stack runs",
+    mutate: (c) => {
+      c.services.orchestrator.environment.ORCH_RUNNER_IMAGE =
+        "ghcr.io/ms-onenote-exporter/msout-runner:0000000";
+    },
+    expectMessage: /image the stack runs|independent/,
+  },
+  {
+    // Dropping `external` makes Compose prune the network it just created, because
+    // the only service that joins it is behind a profile. The failure appears as
+    // `404 network msout-runner not found` at the first runner create — on a real
+    // host, and in CI only because the orchestrator-create step was added.
+    //
+    // Without the flag, compose itself refuses to start: `network msout-runner was
+    // found but has incorrect label com.docker.compose.network`. Which is a deploy
+    // step failing loudly, not an assertion.
+    name: "lets Compose prune the runner's egress network",
+    mutate: (c) => {
+      c.networks["msout-runner"].external = false;
+    },
+    expectMessage: /external/,
+  },
+  {
+    // The shipped bug: distroless `nonroot` is 65532 and the runner's `node` is 1000.
+    // They share `/srv/msout/data`, so the orchestrator created a session directory
+    // the runner could not write to, and every login failed with
+    // `EACCES: permission denied, mkdir '/data/<guid>'` — from a container that was
+    // healthy, correctly mounted and correctly addressed.
+    //
+    // Staged as a Dockerfile edit rather than a config edit precisely because the
+    // config carries no uid at all: the two images name the identity independently,
+    // which is why nothing compared them.
+    name: "gives the orchestrator a different uid from the runner",
+    mutateFile: {
+      file: "orchestrator",
+      find: "USER 1000:1000",
+      replace: "USER 65532:65532",
+    },
+    expectMessage: /share \/srv\/msout\/data/,
+  },
+  {
+    // A named uid cannot be compared, so the check refuses rather than passing. The
+    // runner's Dockerfile said `USER node` while the orchestrator's said
+    // `USER 1000:1000`, and a check that skipped the mismatch rather than objecting
+    // to it would have been the thing that let the pair through.
+    name: "declares the runner's uid by name, so it cannot be compared",
+    mutateFile: {
+      file: "runner",
+      find: "USER 1000:1000",
+      replace: "USER node",
+    },
+    expectMessage: /must be numeric/,
+  },
+  {
+    // The shipped bug, form 1: a named volume. On the host `/srv/msout/vault` is
+    // not the volume at all — it is an empty root-owned directory Docker created —
+    // and every runner mounted it as `/data` and failed with EACCES.
+    //
+    // Resolved config cannot distinguish this from a bind mount on the target, so
+    // this case is expressed the way the mistake was: the env var is right, and the
+    // orchestrator has nothing mounted there.
+    name: "leaves the vault root with nothing mounted at that path",
+    mutate: (c) => {
+      c.services.orchestrator.volumes = (c.services.orchestrator.volumes ?? []).filter(
+        (v) => (typeof v === "string" ? v : v?.target) !== VAULT_DIR,
+      );
+    },
+    expectMessage: /resolved on the \*host\*/,
+  },
+  {
+    // The shipped bug, form 2: no mount at all, so the vault lived in the
+    // container's writable layer and one `--force-recreate` deleted every session.
+    // With no volume and no env var, the orchestrator falls back to
+    // `/srv/msout/vault`, which is a container path that resolves nowhere on the host.
+    name: "leaves the vault in the container's writable layer",
+    mutate: (c) => {
+      delete c.services.orchestrator.environment.ORCH_VAULT_ROOT;
+      c.services.orchestrator.volumes = (c.services.orchestrator.volumes ?? []).filter(
+        (v) => (typeof v === "string" ? v : v?.target) !== "/srv/msout/vault",
+      );
+    },
+    expectMessage: /ORCH_VAULT_ROOT is undefined/,
+  },
+  {
+    // A relative root cannot be resolved by the Engine at all, and resolves against
+    // whatever working directory it happens to pick if it can be.
+    name: "makes the artifact root relative",
+    mutate: (c) => {
+      c.services.orchestrator.environment.ORCH_ARTIFACT_ROOT = "./artifacts";
+    },
+    expectMessage: /ORCH_ARTIFACT_ROOT is "\.\/artifacts"/,
+  },
+  {
+    // §2.1: only the orchestrator and the runners it creates may read a vault.
+    // A vault mount on the api would hand it every session's cookie jar.
+    name: "gives the api the session vault",
+    mutate: (c) => {
+      c.services.api.volumes = [
+        ...(c.services.api.volumes ?? []),
+        { type: "bind", source: VAULT_DIR, target: VAULT_DIR },
+      ];
+    },
+    expectMessage: /api mounts .*vault-host/,
+  },
+  {
     name: "points the orchestrator's token path at nothing",
     mutate: (c) => {
       c.services.orchestrator.environment.ORCH_RUNNER_TOKEN_FILE = "/etc/passwd";
     },
     expectMessage: /ORCH_RUNNER_TOKEN_FILE is/,
+  },
+  {
+    // The mistake that shipped. The value looked correct — it named a path the
+    // orchestrator really does mount — but it was a *container* path used as a
+    // bind *source*, so on a host where it does not exist Docker created a
+    // directory and every runner exited 1. The previous assertion checked for
+    // exactly this value and passed.
+    name: "gives the orchestrator the container path as a bind source",
+    mutate: (c) => {
+      c.services.orchestrator.environment.ORCH_RUNNER_TOKEN_FILE = "/run/secrets/runner_token";
+    },
+    // Matches on the *reason* rather than the variable name, because the variable
+    // name is in the message too and a regex written against the old message
+    // would fail on a correct rejection — which is how a check gets "fixed" by
+    // being weakened.
+    expectMessage: /must resolve on the host/,
   },
 ];
 
@@ -404,9 +631,20 @@ let missed = 0;
 
 for (const testCase of cases) {
   const cfg = clone(base);
-  testCase.mutate(cfg);
+  // `mutateFile` cases stage the *other* half of the violation — the Dockerfile —
+  // and still need a config mutation, so a no-op is allowed rather than each of
+  // them having to invent one. A required `mutate` would push every file-level case
+  // towards a filler function that looks like it is asserting something.
+  testCase.mutate?.(cfg);
+  const script = testCase.mutateFile
+    ? stageDockerfile(
+        testCase.mutateFile.find,
+        testCase.mutateFile.replace,
+        testCase.mutateFile.file,
+      )
+    : SCRIPT;
 
-  if (run(cfg) === 0) {
+  if (runScript(script, cfg) === 0) {
     console.error(`FAIL  not caught: ${testCase.name}`);
     missed++;
     continue;
@@ -416,7 +654,7 @@ for (const testCase of cases) {
   // non-zero for an unrelated reason is no better than one that passes.
   let output = "";
   try {
-    execFileSync("node", [SCRIPT], { input: JSON.stringify(cfg), stdio: ["pipe", "pipe", "pipe"] });
+    execFileSync("node", [script], { input: JSON.stringify(cfg), stdio: ["pipe", "pipe", "pipe"] });
   } catch (error) {
     output = String(error.stderr ?? "");
   }

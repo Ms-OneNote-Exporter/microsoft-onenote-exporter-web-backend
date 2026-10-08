@@ -1,0 +1,882 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MSOUT // Component B — Anatomy of an Export · Pool Theatre</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/fontsource/css/inter@latest/index.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/fontsource/css/jetbrains-mono@latest/index.css">
+<style>
+:root{
+  --bg:#06080b; --panel:#0b0f15; --panel2:#080b10; --line:#1b2530; --line2:#243240;
+  --txt:#cfd9e2; --mut:#6d7c8a; --dim:#465462;
+  --acc:#5fd4e0; --cred:#e0708a; --sse:#7fd49a; --file:#d9b06b;
+  --mono:'JetBrains Mono',ui-monospace,monospace; --sans:'Inter',system-ui,sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+[hidden]{display:none !important}
+html{scroll-behavior:smooth}
+body{
+  background:
+    radial-gradient(1100px 520px at 75% -12%, #0d151e 0%, transparent 62%),
+    radial-gradient(800px 400px at -10% 110%, #0a1118 0%, transparent 60%),
+    var(--bg);
+  color:var(--txt); font-family:var(--sans); font-size:14px; line-height:1.6;
+  min-height:100vh; overflow-x:hidden;
+}
+body::before{
+  content:""; position:fixed; inset:0; pointer-events:none; z-index:0;
+  background-image:
+    linear-gradient(rgba(140,180,210,.028) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(140,180,210,.028) 1px, transparent 1px);
+  background-size:46px 46px;
+  mask-image:radial-gradient(ellipse 90% 80% at 50% 30%, #000 30%, transparent 100%);
+}
+.wrap{position:relative; z-index:1; max-width:1440px; margin:0 auto; padding:0 22px 60px}
+
+/* ---------- header ---------- */
+header{
+  display:flex; align-items:center; justify-content:space-between; gap:16px;
+  padding:20px 0 16px; border-bottom:1px solid var(--line); flex-wrap:wrap;
+}
+.brand{display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; min-width:0}
+.brand h1{font-family:var(--mono); font-size:15px; font-weight:600; letter-spacing:.22em; color:var(--txt); text-transform:uppercase}
+.brand h1 b{color:var(--acc); font-weight:600}
+.brand .sub{font-family:var(--mono); font-size:11px; color:var(--mut); letter-spacing:.08em}
+.badge{
+  font-family:var(--mono); font-size:10px; letter-spacing:.14em; color:var(--acc);
+  border:1px solid rgba(95,212,224,.35); background:rgba(95,212,224,.06);
+  padding:3px 9px; border-radius:3px; text-transform:uppercase; white-space:nowrap;
+}
+.controls{display:flex; gap:8px; align-items:center; flex-wrap:wrap}
+.btn{
+  font-family:var(--mono); font-size:11px; letter-spacing:.1em; color:var(--mut);
+  background:transparent; border:1px solid var(--line2); border-radius:4px;
+  padding:7px 13px; cursor:pointer; transition:all .18s ease; text-transform:uppercase;
+}
+.btn:hover{color:var(--acc); border-color:rgba(95,212,224,.5); background:rgba(95,212,224,.05)}
+.btn.playing{color:var(--sse); border-color:rgba(127,212,154,.5); background:rgba(127,212,154,.06)}
+.btn.on{color:var(--acc); border-color:rgba(95,212,224,.6); background:rgba(95,212,224,.09)}
+.btn:disabled{opacity:.35; cursor:not-allowed}
+.btn.danger:hover{color:var(--cred); border-color:rgba(224,112,138,.5); background:rgba(224,112,138,.06)}
+.counter{font-family:var(--mono); font-size:11px; color:var(--dim); letter-spacing:.15em; min-width:64px; text-align:center}
+.counter b{color:var(--acc)}
+.seg{display:flex; border:1px solid var(--line2); border-radius:5px; overflow:hidden}
+.seg .btn{border:none; border-radius:0}
+.seg .btn + .btn{border-left:1px solid var(--line2)}
+
+/* ---------- panels ---------- */
+.panel{
+  background:linear-gradient(180deg, var(--panel) 0%, var(--panel2) 100%);
+  border:1px solid var(--line); border-radius:10px; position:relative; overflow:hidden;
+}
+.panel::before{
+  content:""; position:absolute; top:0; left:0; width:26px; height:26px; pointer-events:none;
+  border-top:1px solid rgba(95,212,224,.4); border-left:1px solid rgba(95,212,224,.4);
+  border-top-left-radius:10px; z-index:2;
+}
+.panel::after{
+  content:""; position:absolute; bottom:0; right:0; width:26px; height:26px; pointer-events:none;
+  border-bottom:1px solid rgba(95,212,224,.25); border-right:1px solid rgba(95,212,224,.25);
+  border-bottom-right-radius:10px; z-index:2;
+}
+.phead{
+  display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; row-gap:4px;
+  padding:11px 16px; border-bottom:1px solid var(--line);
+  font-family:var(--mono); font-size:10px; letter-spacing:.2em; color:var(--dim); text-transform:uppercase;
+}
+.phead em{font-style:normal; color:var(--mut); letter-spacing:.1em}
+
+/* ---------- step rail ---------- */
+.rail{display:flex; gap:7px; padding:16px 0; overflow-x:auto; scrollbar-width:thin; -webkit-overflow-scrolling:touch}
+.chip{
+  flex:0 0 auto; font-family:var(--mono); font-size:10.5px; letter-spacing:.06em;
+  color:var(--mut); border:1px solid var(--line); background:var(--panel2);
+  padding:7px 12px; border-radius:4px; cursor:pointer; transition:all .2s ease; white-space:nowrap;
+}
+.chip:hover{border-color:var(--line2); color:var(--txt)}
+.chip.on{color:var(--acc); border-color:rgba(95,212,224,.55); background:rgba(95,212,224,.07); box-shadow:0 0 14px rgba(95,212,224,.08)}
+.chip i{font-style:normal; color:var(--dim); margin-right:7px}
+.chip.on i{color:var(--acc)}
+
+/* ---------- main grid / diagram ---------- */
+.grid{display:grid; grid-template-columns:minmax(0,1.55fr) minmax(0,1fr); gap:14px; align-items:start}
+.svgwrap{-webkit-overflow-scrolling:touch; scrollbar-width:thin}
+.svgwrap svg{display:block; width:100%; height:auto}
+.scrollhint{
+  display:none; font-family:var(--mono); font-size:9px; color:var(--dim);
+  letter-spacing:.22em; text-transform:uppercase; padding:7px 16px 11px;
+  border-top:1px dashed var(--line);
+}
+.node rect{fill:#0d141c; stroke:var(--line2); stroke-width:1; transition:all .35s ease}
+.node text{font-family:var(--mono); fill:var(--txt); font-size:11px; letter-spacing:.04em}
+.node .nsub{fill:var(--mut); font-size:8.5px}
+.node .ntag{fill:var(--dim); font-size:7.5px; letter-spacing:.16em; text-transform:uppercase}
+.node.active rect{stroke:var(--acc); fill:#0e1a22; filter:drop-shadow(0 0 7px rgba(95,212,224,.28))}
+.node.credzone.active rect{stroke:var(--cred); fill:#1a0f14; filter:drop-shadow(0 0 7px rgba(224,112,138,.3))}
+.edge{fill:none; stroke:var(--line2); stroke-width:1; opacity:.85}
+.edge.dash{stroke-dasharray:4 4; opacity:.55}
+.elabel{font-family:var(--mono); font-size:8px; fill:var(--dim); letter-spacing:.06em}
+.zone{fill:none; stroke:var(--line); stroke-dasharray:2 5; opacity:.8}
+.zlabel{font-family:var(--mono); font-size:8px; fill:var(--dim); letter-spacing:.22em; text-transform:uppercase}
+.legend{display:flex; gap:16px; padding:10px 16px; border-top:1px solid var(--line); flex-wrap:wrap}
+.legend span{font-family:var(--mono); font-size:9.5px; color:var(--mut); letter-spacing:.08em; display:flex; align-items:center; gap:6px}
+.legend i{width:9px; height:9px; border-radius:50%; display:inline-block}
+
+/* ---------- inspector ---------- */
+.insp{padding:18px 18px 20px}
+.stepcode{font-family:var(--mono); font-size:10px; letter-spacing:.3em; color:var(--acc); text-transform:uppercase}
+.insp h2{font-family:var(--mono); font-size:19px; font-weight:600; margin:6px 0 2px}
+.tagline{font-family:var(--mono); font-size:11px; color:var(--mut); margin-bottom:14px}
+.tagline::before{content:"// "; color:var(--dim)}
+.narr{list-style:none; margin-bottom:16px}
+.narr li{position:relative; padding-left:16px; margin-bottom:9px; font-size:12.8px; color:#aebbc7; opacity:0; transform:translateY(5px); transition:all .45s ease}
+.narr li.show{opacity:1; transform:none}
+.narr li::before{content:"▸"; position:absolute; left:0; top:0; color:var(--acc); font-size:10px}
+.narr li b{color:var(--txt)}
+.narr li code{font-family:var(--mono); font-size:11px; color:var(--acc); background:rgba(95,212,224,.07); padding:1px 5px; border-radius:3px}
+.plabel{font-family:var(--mono); font-size:9.5px; letter-spacing:.22em; color:var(--dim); text-transform:uppercase; margin-bottom:7px; display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap}
+.plabel em{font-style:normal; color:var(--cred); letter-spacing:.1em}
+.payload{background:#05080c; border:1px solid var(--line); border-radius:7px; padding:13px 14px; font-family:var(--mono); font-size:11.3px; line-height:1.85; overflow-x:auto; white-space:pre; color:#93a3b1; -webkit-overflow-scrolling:touch}
+.payload .ln{display:block; opacity:0; transform:translateY(4px); transition:all .4s ease}
+.payload .ln.show{opacity:1; transform:none}
+.k{color:var(--acc)} .c{color:var(--cred)} .g{color:var(--sse)} .f{color:var(--file)} .m{color:var(--dim)} .w{color:var(--txt)}
+
+/* ---------- custody ---------- */
+.custody{margin-top:14px; padding:15px 18px 17px}
+.custody .phead{border:none; padding:0 0 12px}
+.stages{display:flex; align-items:stretch; flex-wrap:wrap}
+.stage{flex:1 1 120px; position:relative; padding:9px 12px 9px 26px; border:1px solid var(--line); margin:-1px 0 0 -1px; background:var(--panel2); transition:all .4s ease; font-family:var(--mono); font-size:10px; color:var(--dim)}
+.stage:first-child{border-radius:6px 0 0 6px; margin-left:0}
+.stage:last-child{border-radius:0 6px 6px 0}
+.stage .idx{position:absolute; left:9px; top:9px; font-size:8.5px; color:var(--dim)}
+.stage.hot{color:var(--cred); border-color:rgba(224,112,138,.55); background:rgba(224,112,138,.07)}
+.stage.hot .idx{color:var(--cred)}
+.stage.hot::after{content:""; position:absolute; inset:0; border:1px solid rgba(224,112,138,.4); animation:pulse 1.6s ease-in-out infinite; pointer-events:none}
+.stage.done{color:var(--mut); opacity:.62}
+.stage.done .idx{color:var(--sse)}
+@keyframes pulse{0%,100%{opacity:.9}50%{opacity:.15}}
+
+/* ---------- cards / footer ---------- */
+.cards{display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:12px; margin-top:14px}
+.card{padding:15px 16px 16px; transition:border-color .25s ease, transform .25s ease}
+.card:hover{border-color:var(--line2); transform:translateY(-2px)}
+.card h3{font-family:var(--mono); font-size:11px; letter-spacing:.18em; color:var(--acc); text-transform:uppercase; margin-bottom:8px}
+.card h3 span{color:var(--dim); margin-right:8px}
+.card p{font-size:12px; color:#93a3b1}
+.card p code{font-family:var(--mono); font-size:10.5px; color:var(--file)}
+footer{margin-top:26px; padding-top:14px; border-top:1px solid var(--line); display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; font-family:var(--mono); font-size:10px; color:var(--dim); letter-spacing:.1em}
+
+/* ============ POOL MODE ============ */
+.poolbar{margin-top:16px; padding:12px 16px; display:flex; gap:14px; align-items:center; flex-wrap:wrap; justify-content:space-between}
+.poolbar .grp{display:flex; gap:8px; align-items:center; flex-wrap:wrap}
+.poolstats{font-family:var(--mono); font-size:10.5px; color:var(--mut); letter-spacing:.03em}
+.poolstats b{color:var(--acc); font-weight:500}
+.poolstats .verb{color:var(--file)}
+.poolgrid{display:grid; grid-template-columns:minmax(0,1.6fr) minmax(0,1fr); gap:14px; margin-top:14px; align-items:start}
+.slots{display:grid; grid-template-columns:repeat(3,1fr); gap:12px}
+.slot{
+  --sc:var(--dim);
+  background:linear-gradient(180deg,var(--panel) 0%,var(--panel2) 100%);
+  border:1px solid var(--line); border-radius:9px; padding:12px 13px 11px; position:relative; overflow:hidden;
+  transition:border-color .3s ease, box-shadow .3s ease; min-width:0;
+}
+.slot.live{border-color:color-mix(in srgb, var(--sc) 55%, transparent); box-shadow:0 0 18px color-mix(in srgb, var(--sc) 12%, transparent), inset 0 0 30px color-mix(in srgb, var(--sc) 4%, transparent)}
+.slot.spin::before{
+  content:""; position:absolute; inset:0; pointer-events:none;
+  background:repeating-linear-gradient(0deg, transparent 0 3px, color-mix(in srgb, var(--sc) 7%, transparent) 3px 4px);
+  animation:scan 1.1s linear infinite;
+}
+@keyframes scan{from{transform:translateY(-100%)}to{transform:translateY(100%)}}
+.s-head{display:flex; align-items:center; gap:8px; font-family:var(--mono); font-size:10.5px; letter-spacing:.12em; color:var(--txt); text-transform:uppercase; min-width:0}
+.s-lamp{width:8px; height:8px; border-radius:50%; background:var(--dim); flex:0 0 auto; transition:all .3s ease}
+.slot.live .s-lamp{background:var(--sc); box-shadow:0 0 8px var(--sc)}
+.slot.spin .s-lamp{background:var(--file); box-shadow:0 0 8px var(--file); animation:pulse 1s infinite}
+.s-state{margin-left:auto; font-size:9px; color:var(--dim); letter-spacing:.14em; white-space:nowrap}
+.slot.live .s-state{color:var(--sc)}
+.s-guid{font-family:var(--mono); font-size:9.5px; color:var(--mut); margin:7px 0 2px; letter-spacing:.04em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.s-stage{font-family:var(--mono); font-size:10.5px; color:#aebbc7; min-height:17px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.s-bar{height:3px; background:var(--line); border-radius:2px; margin:8px 0 9px; overflow:hidden}
+.s-bar i{display:block; height:100%; width:0%; background:var(--sc); transition:width .25s linear; border-radius:2px}
+.slot:not(.live) .s-bar i{background:var(--line2)}
+.s-cust{display:flex; gap:4px; margin-bottom:9px}
+.s-cust i{width:100%; height:5px; border-radius:1px; background:var(--line); transition:all .3s ease}
+.s-cust i.hot{background:var(--cred); box-shadow:0 0 6px rgba(224,112,138,.5)}
+.s-cust i.done{background:rgba(127,212,154,.4)}
+.s-mounts{font-family:var(--mono); font-size:8.8px; color:var(--dim); letter-spacing:.02em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.s-foot{display:flex; justify-content:space-between; align-items:center; margin-top:8px; gap:8px}
+.s-net{font-family:var(--mono); font-size:8.8px; color:var(--dim); letter-spacing:.1em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.slot.live .s-net{color:color-mix(in srgb, var(--sc) 70%, var(--mut))}
+.s-erase{font-family:var(--mono); font-size:8.8px; letter-spacing:.12em; text-transform:uppercase; color:var(--dim); background:none; border:1px solid var(--line); border-radius:3px; padding:3px 8px; cursor:pointer; transition:all .2s; flex:0 0 auto}
+.s-erase:hover{color:var(--cred); border-color:rgba(224,112,138,.5)}
+.s-erase:disabled{opacity:.3; cursor:not-allowed}
+
+.poolside{display:flex; flex-direction:column; gap:14px; min-width:0}
+#elog{height:332px; overflow-y:auto; padding:10px 14px; font-family:var(--mono); font-size:10.3px; line-height:1.75; scrollbar-width:thin; -webkit-overflow-scrolling:touch}
+#elog .t{color:var(--dim)}
+#elog .cmp{color:var(--mut)}
+#elog .row{white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.probebody{padding:12px 14px 14px}
+.pmwrap{overflow-x:auto; -webkit-overflow-scrolling:touch}
+table.pm{width:100%; border-collapse:collapse; font-family:var(--mono); font-size:9.6px; letter-spacing:.02em; min-width:430px}
+table.pm th{color:var(--dim); text-transform:uppercase; letter-spacing:.1em; font-weight:500; text-align:left; padding:4px 6px; border-bottom:1px solid var(--line); white-space:nowrap}
+table.pm td{padding:4px 6px; border-bottom:1px solid rgba(27,37,48,.6); color:var(--mut); white-space:nowrap}
+table.pm td.den{color:var(--cred)}
+table.pm td.opn{color:var(--sse)}
+table.pm td.ses{color:var(--txt)}
+.pnote{font-family:var(--mono); font-size:9px; color:var(--dim); margin-top:9px; line-height:1.7}
+
+/* ============ RESPONSIVE ============ */
+@media (max-width:1180px){ .slots{grid-template-columns:repeat(2,1fr)} .poolgrid{grid-template-columns:1fr} }
+@media (max-width:1020px){
+  .grid{grid-template-columns:1fr; gap:12px}
+  header{justify-content:center; text-align:center}
+  .controls{justify-content:center}
+}
+/* the topology svg keeps a legible floor width and pans horizontally instead of shrinking to unreadable type */
+@media (max-width:960px){
+  .svgwrap{overflow-x:auto}
+  .svgwrap svg{min-width:840px}
+  .scrollhint{display:block}
+}
+@media (max-width:700px){
+  .stages{display:grid; grid-template-columns:1fr 1fr; gap:6px}
+  .stage{margin:0; border-radius:6px; padding:8px 10px 8px 26px}
+  .stage:first-child,.stage:last-child{border-radius:6px}
+  #elog{height:250px}
+  .insp{padding:15px 14px 17px}
+  .insp h2{font-size:16px}
+  .payload{font-size:10.4px; padding:11px 12px}
+  .poolstats{font-size:9.3px}
+  .s-head{font-size:9.8px}
+  .custody{padding:13px 14px 15px}
+}
+@media (max-width:640px){
+  .wrap{padding:0 14px 46px}
+  header{padding:14px 0 12px; gap:10px}
+  .brand{gap:8px; justify-content:center}
+  .brand h1{font-size:12.5px; letter-spacing:.14em}
+  .brand .sub{font-size:9.5px; letter-spacing:.05em}
+  .badge{font-size:9px; padding:2px 7px}
+  .slots{grid-template-columns:1fr}
+  .poolbar{padding:11px 12px; gap:10px}
+  .legend{gap:10px 14px; padding:9px 12px}
+  .legend span{font-size:9px}
+  .cards{grid-template-columns:1fr}
+  footer{justify-content:center; text-align:center}
+}
+/* bigger tap targets on touch devices */
+@media (pointer:coarse){
+  .btn{padding:10px 14px}
+  .chip{padding:10px 13px}
+  .s-erase{padding:6px 10px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="brand">
+    <h1>MSOUT <b>//</b> COMPONENT B</h1>
+    <span class="sub">anatomy of a onenote export · pool theatre</span>
+    <span class="badge">plan-v3 · apiProtocol 3</span>
+  </div>
+  <div class="controls">
+    <div class="seg">
+      <button class="btn on" id="modeAB">anatomy</button>
+      <button class="btn" id="modePB">pool · 6 users</button>
+    </div>
+    <span id="anatCtl" class="controls" style="display:contents">
+      <button class="btn" id="prevB">◀ prev</button>
+      <span class="counter"><b id="cNow">00</b> / 08</span>
+      <button class="btn" id="nextB">next ▶</button>
+      <button class="btn" id="playB">▶ auto</button>
+    </span>
+  </div>
+</header>
+
+<!-- ================= MODE: ANATOMY ================= -->
+<section id="modeAnatomy">
+<div class="rail" id="rail"></div>
+<main class="grid">
+  <section class="panel">
+    <div class="phead"><span>topology · live packet view</span><em>msout-control / msout-runner</em></div>
+    <div class="svgwrap">
+    <svg viewBox="0 0 980 560" id="svg" aria-label="architecture diagram">
+      <rect class="zone" x="205" y="248" width="370" height="272"></rect>
+      <text class="zlabel" x="215" y="242">component b · vps</text>
+      <rect class="zone" x="600" y="248" width="360" height="272" style="stroke:rgba(224,112,138,.25)"></rect>
+      <text class="zlabel" x="610" y="242" style="fill:rgba(224,112,138,.5)">the cage · runner net</text>
+
+      <path class="edge" id="e-b_f" d="M95,268 L95,137"></path>
+      <path class="edge" id="e-b_c" d="M170,300 L225,300"></path>
+      <path class="edge" id="e-c_a" d="M375,300 L400,300"></path>
+      <path class="edge" id="e-a_o" d="M475,332 L475,438"></path>
+      <path class="edge" id="e-o_r" d="M550,455 H595 V285 H615"></path>
+      <path class="edge" id="e-a_r" d="M550,300 L615,300"></path>
+      <path class="edge" id="e-r_m" d="M740,268 C740,190 880,190 880,137"></path>
+      <path class="edge" id="e-r_v" d="M690,332 L690,438"></path>
+      <path class="edge" id="e-r_art" d="M765,310 H840 V438"></path>
+      <path class="edge dash" id="e-c_art" d="M300,332 V522 H880 V502"></path>
+
+      <text class="elabel" x="102" y="205">static spa</text>
+      <text class="elabel" x="172" y="292">cross-origin fetch</text>
+      <text class="elabel" x="378" y="292">/api/*</text>
+      <text class="elabel" x="481" y="392">claim·release·recycle</text>
+      <text class="elabel" x="548" y="448">docker verbs</text>
+      <text class="elabel" x="556" y="292">raw stream / sse</text>
+      <text class="elabel" x="792" y="182">https</text>
+      <text class="elabel" x="696" y="392">rw mount</text>
+      <text class="elabel" x="770" y="302">zip → finalize</text>
+      <text class="elabel" x="520" y="515">file_server ro · sendfile · range</text>
+
+      <g class="node" id="n-browser" data-n="browser">
+        <rect x="20" y="268" width="150" height="64" rx="6"></rect>
+        <text class="ntag" x="32" y="286">user</text><text x="32" y="303">BROWSER</text>
+        <text class="nsub" x="32" y="318">password enters here</text>
+      </g>
+      <g class="node" id="n-frontendA" data-n="frontendA">
+        <rect x="20" y="73" width="150" height="64" rx="6"></rect>
+        <text class="ntag" x="32" y="91">component a · other host</text><text x="32" y="108">FRONTEND</text>
+        <text class="nsub" x="32" y="123">static spa · no /api route</text>
+      </g>
+      <g class="node" id="n-caddy" data-n="caddy">
+        <rect x="225" y="268" width="150" height="64" rx="6"></rect>
+        <text class="ntag" x="237" y="286">edge</text><text x="237" y="303">CADDY</text>
+        <text class="nsub" x="237" y="318">tls · hsts · no body logs</text>
+      </g>
+      <g class="node" id="n-api" data-n="api">
+        <rect x="400" y="268" width="150" height="64" rx="6"></rect>
+        <text class="ntag" x="412" y="286">fastify · ts</text><text x="412" y="303">API</text>
+        <text class="nsub" x="412" y="318">sqlite wal · sse hub</text>
+      </g>
+      <g class="node" id="n-orch" data-n="orch">
+        <rect x="400" y="438" width="150" height="64" rx="6"></rect>
+        <text class="ntag" x="412" y="456">go · zero deps</text><text x="412" y="473">ORCHESTRATOR</text>
+        <text class="nsub" x="412" y="488">sole docker.sock holder</text>
+      </g>
+      <g class="node credzone" id="n-runner" data-n="runner">
+        <rect x="615" y="268" width="150" height="64" rx="6"></rect>
+        <text class="ntag" x="627" y="286">container · pooled</text><text x="627" y="303">RUNNER</text>
+        <text class="nsub" x="627" y="318">sidecar + playwright</text>
+      </g>
+      <g class="node" id="n-ms" data-n="ms">
+        <rect x="805" y="73" width="150" height="64" rx="6"></rect>
+        <text class="ntag" x="817" y="91">external</text><text x="817" y="108">MICROSOFT</text>
+        <text class="nsub" x="817" y="123">login · onenote web</text>
+      </g>
+      <g class="node credzone" id="n-vault" data-n="vault">
+        <rect x="615" y="438" width="150" height="64" rx="6"></rect>
+        <text class="ntag" x="627" y="456">host volume</text><text x="627" y="473">vault/&lt;guid&gt;</text>
+        <text class="nsub" x="627" y="488">auth.json · rw orch+runner</text>
+      </g>
+      <g class="node" id="n-artifacts" data-n="artifacts">
+        <rect x="805" y="438" width="150" height="64" rx="6"></rect>
+        <text class="ntag" x="817" y="456">host volume</text><text x="817" y="473">artifacts/&lt;id&gt;</text>
+        <text class="nsub" x="817" y="488">rw orch+runner · ro caddy</text>
+      </g>
+      <g id="pktLayer"></g>
+    </svg>
+    </div>
+    <div class="scrollhint">↔ drag sideways to pan the topology</div>
+    <div class="legend">
+      <span><i style="background:var(--acc)"></i>control / session</span>
+      <span><i style="background:var(--cred)"></i>credential bytes</span>
+      <span><i style="background:var(--sse)"></i>sse events</span>
+      <span><i style="background:var(--file)"></i>artifact bytes</span>
+    </div>
+  </section>
+
+  <aside class="panel">
+    <div class="phead"><span>inspector</span><em id="inspTag">step</em></div>
+    <div class="insp">
+      <div class="stepcode" id="sCode">step 00</div>
+      <h2 id="sTitle">—</h2>
+      <div class="tagline" id="sTag">—</div>
+      <ul class="narr" id="sNarr"></ul>
+      <div class="plabel"><span>wire capture</span><em id="pWarn"></em></div>
+      <div class="payload" id="sPayload"></div>
+    </div>
+  </aside>
+</main>
+
+<section class="panel custody">
+  <div class="phead"><span>credential custody ledger — where the password is, right now</span><em>never buffered · never logged · never accumulated</em></div>
+  <div class="stages" id="stages"></div>
+</section>
+</section>
+
+<!-- ================= MODE: POOL ================= -->
+<section id="modePool" hidden>
+  <div class="panel poolbar">
+    <div class="grp">
+      <button class="btn" id="spawnB">+ spawn user</button>
+      <button class="btn" id="spawn6B">spawn 6 staggered</button>
+      <button class="btn danger" id="eraseAllB">erase all</button>
+    </div>
+    <div class="grp">
+      <span class="poolstats" id="statsJson"></span>
+    </div>
+    <div class="grp">
+      <span class="poolstats">speed</span>
+      <button class="btn sp" data-sp="0.5">0.5×</button>
+      <button class="btn sp on" data-sp="1">1×</button>
+      <button class="btn sp" data-sp="2.5">2.5×</button>
+      <span class="poolstats" style="color:var(--dim)">slot = 1 chromium · nano-cpus · mem cap</span>
+    </div>
+  </div>
+
+  <div class="poolgrid">
+    <div class="slots" id="slots"></div>
+    <aside class="poolside">
+      <section class="panel">
+        <div class="phead"><span>live event feed · all sessions</span><em>sse + verbs + proxy</em></div>
+        <div id="elog"></div>
+      </section>
+      <section class="panel">
+        <div class="phead"><span>isolation probe · from inside each cage</span><em>T-N8 / T-N9</em></div>
+        <div class="probebody">
+          <button class="btn" id="probeB" style="margin-bottom:10px">run cross-probe</button>
+          <div class="pmwrap"><table class="pm" id="pmatrix"></table></div>
+          <div class="pnote">topology, not an allowlist: runners share the msout-runner net but each holds only its own vault/&lt;guid&gt; and artifacts/&lt;id&gt; mounts. denies are routing properties asserted from live containers; internet egress stays open by decision.</div>
+        </div>
+      </section>
+    </aside>
+  </div>
+</section>
+
+<!-- ================= SHARED INVARIANTS ================= -->
+<section class="cards">
+  <div class="panel card"><h3><span>01</span>socket monopoly</h3><p>Only the orchestrator mounts <code>/var/run/docker.sock</code>. Verbs are allowlisted — claim · release · recycle · remove · stat — and <b>no request field ever reaches a docker argv</b>.</p></div>
+  <div class="panel card"><h3><span>02</span>credential physics</h3><p>No JSON parser exists on <code>/api/credential</code>. Bytes stream browser → caddy → api → runner via undici, unparsed. Body logging off everywhere, asserted by buffer equality over a real socket.</p></div>
+  <div class="panel card"><h3><span>03</span>one user, one cage</h3><p>A session binds <b>lazily</b> to exactly one runner slot at credential time; an abandoned session never holds a slot. Slots are recycled, never reused warm — six users means six containers, six netns, six mount sets.</p></div>
+  <div class="panel card"><h3><span>04</span>opaque artifacts</h3><p>Downloads are <code>/files/&lt;artifactId&gt;</code> with <code>artifactId = base64url(randomBytes(32))</code>. No GUID, no notebook name in any URL; partials self-label <code>.partial.zip</code>, server-enforced.</p></div>
+  <div class="panel card"><h3><span>05</span>busy ≠ stuck</h3><p>No idle slot and a pool that cannot fill are <b>different answers</b>: the 503 carries <code>cause: "pool-unfillable"</code> with the orchestrator's <code>fillError</code>, so a client told "busy" has something to escalate with.</p></div>
+</section>
+
+<footer>
+  <span>source: Ms-OneNote-Exporter/microsoft-onenote-exporter-web-backend · PLANNING/PLAN-v3.md</span>
+  <span>anatomy: ← → step · space autoplay — pool: spawn up to 6 concurrent users</span>
+</footer>
+</div>
+
+<script>
+(function(){
+"use strict";
+var COLORS = {ctrl:"#5fd4e0", cred:"#e0708a", sse:"#7fd49a", file:"#d9b06b"};
+var STAGES = ["browser memory","tls socket → b","api route · raw stream","undici pipe → runner","runner sealed memory","chromium login form","vault auth.json","shredded ✓"];
+
+/* ================= ANATOMY DATA ================= */
+var STEPS = [
+ {code:"00", rail:"static shell", title:"Static shell, foreign origin", tag:"component A never touches /api/*",
+  narr:["The user lands on <b>Component A</b>: a static SPA on a different host and a different origin. It holds no secrets and defines no <code>/api</code> route — by construction, not by review rule.",
+        "The bundle knows only two things: the <b>absolute API origin</b> and a pinned <code>EXPECTED_PROTOCOL</code> integer for the handshake.",
+        "Everything from here on is cross-origin on purpose; the CORS allowlist and CSP header policy police the boundary."],
+  warn:"", nodes:["browser","frontendA"],
+  packets:[{e:"b_f",d:1,c:"ctrl"},{e:"b_f",d:-1,c:"ctrl"}],
+  pay:['<span class="k">GET</span> / <span class="m">HTTP/1.1</span>  <span class="m">→ 200 text/html</span>',
+       '<span class="m">content-security-policy:</span> … connect-src <span class="k">https://api.origin</span> …',
+       '<span class="m">bundle ▸</span> <span class="w">const</span> EXPECTED_PROTOCOL = <span class="k">3</span>',
+       '<span class="m">// no /api route exists on this host at all</span>'],
+  hot:[], done:[]},
+ {code:"01", rail:"session guid", title:"Session GUID, cookie, CSRF", tag:"state → sqlite wal · token → response body",
+  narr:["The browser POSTs <code>/api/session</code> straight to Component B. The API mints a <b>session GUID</b> and writes authoritative state into SQLite (WAL mode).",
+        "The session cookie is <code>__Host-msout</code>: Secure, HttpOnly, SameSite=None and <b>no Domain attribute</b> — so the browser will only ever send it to B's origin.",
+        "The CSRF token returns <b>in the response body</b>, not a readable cookie: Component A can never read Component B's cookies."],
+  warn:"", nodes:["browser","caddy","api"],
+  packets:[{e:"b_c",d:1,c:"ctrl"},{e:"c_a",d:1,c:"ctrl"},{e:"c_a",d:-1,c:"ctrl"},{e:"b_c",d:-1,c:"ctrl"}],
+  pay:['<span class="k">POST</span> /api/session  <span class="m">→ 201</span>',
+       '<span class="m">set-cookie:</span> <span class="k">__Host-msout=&lt;guid&gt;</span>; Secure; HttpOnly;',
+       '            SameSite=None; Path=/   <span class="m">// no Domain — by design</span>',
+       '{ <span class="w">"csrfToken"</span>: <span class="g">"9f2c…"</span>, <span class="w">"apiProtocol"</span>: <span class="k">3</span> }'],
+  hot:[], done:[]},
+ {code:"02", rail:"raw credential", title:"The credential, as raw octets", tag:"there is no JSON parser on this route",
+  narr:["The browser POSTs the Microsoft password as a <b>raw octet stream</b> — framed and size-capped. The route deliberately has <b>no JSON body parser</b>.",
+        "Order of business: framing checks → <b>lazy pool claim</b> (<code>claimForLogin</code> moves a runners row idle→claimed; the row id <i>is</i> the orchestrator slot id) → undici pipe.",
+        "Bytes flow browser → Caddy → API → runner sidecar <b>unbuffered and unlogged</b>. An oversized or unframed request never creates a container."],
+  warn:"no parse · no buffer · no log", nodes:["browser","caddy","api","orch","runner"],
+  packets:[{e:"b_c",d:1,c:"cred"},{e:"c_a",d:1,c:"cred"},{e:"a_r",d:1,c:"cred"},{e:"a_o",d:1,c:"ctrl"},{e:"o_r",d:1,c:"ctrl"}],
+  pay:['<span class="k">POST</span> /api/credential',
+       '<span class="m">cookie:</span> __Host-msout=&lt;guid&gt;  <span class="m">x-csrf-token:</span> 9f2c…',
+       '<span class="m">content-type:</span> <span class="c">application/octet-stream</span>',
+       '<span class="m">body ▸</span> <span class="c">50 41 53 53 57 4F 52 44 …</span>   <span class="m">// raw · redacted</span>',
+       '<span class="m">→ 202 accepted · sse:</span> <span class="g">login-started</span>'],
+  hot:[0,1,2,3], done:[]},
+ {code:"03", rail:"@msout/microsoft-webauth", title:"Runner: bytes → keystrokes", tag:"@msout/microsoft-webauth drives a real chromium",
+  narr:["The sidecar seals the bytes <b>in memory only</b>, then hands them to <code>@msout/microsoft-webauth</code>, which drives a real Playwright Chromium through the Microsoft login form.",
+        "MFA: <b>push approval</b> completes silently. A typed-code challenge is <b>refused by name</b> (501) rather than left to expire in silence.",
+        "On success <code>auth.json</code> is written to <code>vault/&lt;guid&gt;/</code> — the single place credentials rest, inside the cage."],
+  warn:"credential at rest: vault only", nodes:["runner","ms","vault","api","caddy","browser"],
+  packets:[{e:"r_m",d:1,c:"cred"},{e:"r_m",d:-1,c:"ctrl"},{e:"r_v",d:1,c:"cred"},{e:"a_r",d:-1,c:"sse"},{e:"c_a",d:-1,c:"sse"},{e:"b_c",d:-1,c:"sse"}],
+  pay:['<span class="c">SealedBuffer</span> <span class="m">(memory only)</span> → webauth.login(page, buf)',
+       '<span class="m">page ▸</span> login.live.com → type · submit · <span class="g">approve</span>',
+       '<span class="m">mfa  ▸</span> push <span class="g">✓</span>   |   typed-code → <span class="c">501 refused by name</span>',
+       '<span class="m">write ▸</span> /srv/msout/vault/&lt;guid&gt;/<span class="c">auth.json</span> · 0600'],
+  hot:[4,5,6], done:[0,1,2,3]},
+ {code:"04", rail:"list notebooks", title:"Listing notebooks", tag:"@msout/microsoft-onenote-list-notebooks",
+  narr:["With <code>auth.json</code> in hand, the runner invokes the list package against the OneNote web app — inside the cage, over plain internet egress.",
+        "Results ride back as <b>SSE frames</b> through the API hub: ring buffer, replay on reconnect, keepalive, multi-tab fan-out.",
+        "The API relays small JSON frames and keeps authority in SQLite. It never proxies content."],
+  warn:"", nodes:["runner","ms","api","caddy","browser"],
+  packets:[{e:"r_m",d:1,c:"ctrl"},{e:"r_m",d:-1,c:"ctrl"},{e:"a_r",d:-1,c:"sse"},{e:"c_a",d:-1,c:"sse"},{e:"b_c",d:-1,c:"sse"}],
+  pay:['listNotebooks(auth) <span class="m">→</span>',
+       '[ { <span class="w">id</span>, <span class="w">name</span>, <span class="w">sections</span> }, … ]',
+       '<span class="m">sse ▸</span> <span class="g">event: export-log</span> · state: <span class="k">"listing"</span>'],
+  hot:[6], done:[0,1,2,3,4,5]},
+ {code:"05", rail:"export notebooks", title:"Exporting notebooks", tag:"@msout/microsoft-onenote-export-notebook",
+  narr:["Per notebook, the export package pulls sections and pages into the <b>vault cache</b>; progress emits <code>export-log</code> frames.",
+        "Failures surface as <code>export.error</code> drawn from a <b>closed set of fixed strings</b> — never raw exporter text, which leaks paths and notebook names.",
+        "Idle-TTL and orphan sweepers watch the session throughout; an abandoned session never holds a slot."],
+  warn:"", nodes:["runner","ms","vault","api","caddy","browser"],
+  packets:[{e:"r_m",d:1,c:"ctrl"},{e:"r_m",d:-1,c:"ctrl"},{e:"r_v",d:1,c:"file"},{e:"a_r",d:-1,c:"sse"},{e:"c_a",d:-1,c:"sse"},{e:"b_c",d:-1,c:"sse"}],
+  pay:['<span class="w">for</span> nb <span class="w">of</span> notebooks:',
+       '  exportNotebook(auth, nb, vaultDir)',
+       '<span class="m">sse ▸</span> <span class="g">progress 42%</span> · state: <span class="k">"running"</span>',
+       '<span class="m">on fail ▸</span> export.error ∈ { <span class="c">quota, network, …</span> }  <span class="m">// closed set</span>'],
+  hot:[6], done:[0,1,2,3,4,5]},
+ {code:"06", rail:"finalize artifact", title:"Finalize: an opaque artifact", tag:"orchestrator /finalize · base64url(randomBytes(32))",
+  narr:["The vault streams into a zip; the orchestrator's <code>/finalize</code> promotes it under <code>artifacts/&lt;artifactId&gt;</code>.",
+        "<b>No GUID and no notebook name in any URL</b> — the id→path mapping lives only in SQLite. Aborts leave <code>X-Artifact-Partial: 1</code> and a <code>.partial.zip</code> name.",
+        "The snapshot now carries an <b>absolute</b> <code>downloadUrl</code> built from <code>PUBLIC_ORIGIN</code>."],
+  warn:"", nodes:["runner","artifacts","api","caddy","browser"],
+  packets:[{e:"r_art",d:1,c:"file"},{e:"a_r",d:-1,c:"sse"},{e:"c_a",d:-1,c:"sse"},{e:"b_c",d:-1,c:"sse"}],
+  pay:['<span class="m">streaming zip ▸</span> /srv/msout/artifacts/<span class="f">&lt;artifactId&gt;</span>',
+       '<span class="k">POST</span> /finalize { slot, artifactId } → <span class="g">marker cleared</span>',
+       '<span class="m">snapshot.downloadUrl =</span> <span class="f">"https://b.origin/files/&lt;artifactId&gt;"</span>'],
+  hot:[6], done:[0,1,2,3,4,5]},
+ {code:"07", rail:"download", title:"Download that never touches Node", tag:"caddy forward_auth → file_server sendfile",
+  narr:["The browser GETs the absolute <code>/files/&lt;artifactId&gt;</code>. Caddy pauses and asks the API via <code>forward_auth</code> → <code>/internal/authorize-download</code>, copying the Cookie.",
+        "On 200, <code>file_server</code> serves straight from disk with <b>sendfile + Range</b> — multi-gigabyte bytes bypass Node entirely.",
+        "The notebook name appears only in <code>Content-Disposition</code>, which is never logged."],
+  warn:"", nodes:["browser","caddy","api","artifacts"],
+  packets:[{e:"b_c",d:1,c:"ctrl"},{e:"c_a",d:1,c:"ctrl"},{e:"c_a",d:-1,c:"ctrl"},{e:"c_art",d:-1,c:"file"},{e:"b_c",d:-1,c:"file"}],
+  pay:['<span class="k">GET</span> /files/<span class="f">&lt;artifactId&gt;</span>   <span class="m">// cookie rides along</span>',
+       '<span class="m">caddy ▸</span> forward_auth → /internal/authorize-download → <span class="g">200</span>',
+       '<span class="m">file_server ▸</span> sendfile · <span class="f">Range: bytes=…</span>  <span class="m">// node untouched</span>',
+       '<span class="m">content-disposition:</span> attachment; filename="Notebook.zip"'],
+  hot:[6], done:[0,1,2,3,4,5]},
+ {code:"08", rail:"erase", title:"Erase: the machine closes", tag:"release · recycle · sweep · shred",
+  narr:["Session ends: the orchestrator <b>releases then recycles</b> the slot — the container is rebuilt, never reused warm.",
+        "The idle-TTL sweeper and orphan sweep delete <code>vault/&lt;guid&gt;/</code>; the SSE ring buffer evicts; the cookie expires.",
+        "Final ledger: the password existed only in browser memory, two TLS sockets, runner memory, the login form, and <code>auth.json</code> — <b>all now shredded</b>."],
+  warn:"custody closed", nodes:["api","orch","runner","vault"],
+  packets:[{e:"a_o",d:1,c:"ctrl"},{e:"o_r",d:1,c:"ctrl"},{e:"r_v",d:-1,c:"cred"}],
+  pay:['<span class="k">POST</span> /release { slot } → <span class="k">POST</span> /recycle { slot }',
+       '<span class="m">sweeper ▸</span> <span class="c">shred</span> /srv/msout/vault/&lt;guid&gt;/',
+       '<span class="m">cookie ▸</span> expired · <span class="m">ring buffer ▸</span> evicted',
+       '<span class="m">ledger ▸</span> <span class="g">credential existed nowhere else. ever.</span>'],
+  hot:[7], done:[0,1,2,3,4,5,6]}
+];
+
+/* ================= ANATOMY RENDER ================= */
+var rail = document.getElementById("rail");
+STEPS.forEach(function(s,i){
+  var b = document.createElement("button");
+  b.className = "chip"; b.innerHTML = "<i>"+s.code+"</i>"+s.rail;
+  b.onclick = function(){ go(i); };
+  rail.appendChild(b);
+});
+var stagesEl = document.getElementById("stages");
+STAGES.forEach(function(t,i){
+  var d = document.createElement("div");
+  d.className = "stage"; d.id = "stg"+i;
+  d.innerHTML = '<span class="idx">'+String(i).padStart(2,"0")+'</span>'+t;
+  stagesEl.appendChild(d);
+});
+
+var pktLayer = document.getElementById("pktLayer");
+var edgeCache = {}, packets = [], raf = null, lastT = 0;
+function edgeLen(id){
+  if(!edgeCache[id]){ var p = document.getElementById("e-"+id); edgeCache[id] = {el:p, len:p.getTotalLength()}; }
+  return edgeCache[id];
+}
+function stopPackets(){ if(raf){ cancelAnimationFrame(raf); raf = null; } }
+function buildPackets(list){
+  stopPackets();
+  pktLayer.innerHTML = "";
+  packets = list.map(function(pk,i){
+    var ec = edgeLen(pk.e), g = document.createElementNS("http://www.w3.org/2000/svg","g"), dots = [];
+    for(var k=0;k<3;k++){
+      var c = document.createElementNS("http://www.w3.org/2000/svg","circle");
+      c.setAttribute("r", k===0?3.2:2.2-k*0.5);
+      c.setAttribute("fill", COLORS[pk.c]);
+      c.setAttribute("opacity", k===0?0.95:(0.4-k*0.13));
+      g.appendChild(c); dots.push(c);
+    }
+    pktLayer.appendChild(g);
+    return {ec:ec, dots:dots, t:(i*97)%ec.len, speed:95, dir:pk.d};
+  });
+  lastT = performance.now(); raf = requestAnimationFrame(tick);
+}
+function tick(now){
+  var dt = Math.min(0.05,(now-lastT)/1000); lastT = now;
+  packets.forEach(function(pk){
+    pk.t += pk.speed*dt;
+    var L = pk.ec.len, m = pk.t % (L+40);
+    for(var k=0;k<pk.dots.length;k++){
+      var s = Math.max(0, Math.min(L, m - k*9));
+      var pos = pk.dir===1 ? pk.ec.el.getPointAtLength(s) : pk.ec.el.getPointAtLength(L-s);
+      pk.dots[k].setAttribute("cx",pos.x); pk.dots[k].setAttribute("cy",pos.y);
+    }
+  });
+  raf = requestAnimationFrame(tick);
+}
+
+var cur = -1, playing = false, timer = null;
+function go(i){
+  i = (i+STEPS.length)%STEPS.length; cur = i;
+  var s = STEPS[i];
+  document.getElementById("cNow").textContent = s.code;
+  document.getElementById("inspTag").textContent = "step "+s.code+" / 08";
+  document.getElementById("sCode").textContent = "step "+s.code;
+  document.getElementById("sTitle").textContent = s.title;
+  document.getElementById("sTag").textContent = s.tag;
+  document.getElementById("pWarn").textContent = s.warn || "";
+  Array.prototype.forEach.call(rail.children,function(c,k){ c.classList.toggle("on",k===i); });
+  var ul = document.getElementById("sNarr"); ul.innerHTML = "";
+  s.narr.forEach(function(txt,k){
+    var li = document.createElement("li"); li.innerHTML = txt; ul.appendChild(li);
+    setTimeout(function(){ li.classList.add("show"); }, 90+k*130);
+  });
+  var pv = document.getElementById("sPayload"); pv.innerHTML = "";
+  s.pay.forEach(function(line,k){
+    var sp = document.createElement("span"); sp.className = "ln"; sp.innerHTML = line; pv.appendChild(sp);
+    setTimeout(function(){ sp.classList.add("show"); }, 260+k*150);
+  });
+  document.querySelectorAll(".node").forEach(function(n){ n.classList.toggle("active", s.nodes.indexOf(n.dataset.n) > -1); });
+  STAGES.forEach(function(_,k){
+    var el = document.getElementById("stg"+k);
+    el.classList.toggle("hot", s.hot.indexOf(k)>-1);
+    el.classList.toggle("done", s.done.indexOf(k)>-1);
+  });
+  buildPackets(s.packets);
+}
+document.getElementById("prevB").onclick = function(){ go(cur-1); };
+document.getElementById("nextB").onclick = function(){ go(cur+1); };
+var playB = document.getElementById("playB");
+function setPlay(on){
+  playing = on; playB.classList.toggle("playing",on); playB.textContent = on ? "❚❚ auto" : "▶ auto";
+  if(timer){ clearInterval(timer); timer = null; }
+  if(on){ timer = setInterval(function(){ go(cur+1); }, 7600); }
+}
+playB.onclick = function(){ setPlay(!playing); };
+document.addEventListener("keydown", function(e){
+  if(mode!=="anatomy") return;
+  if(e.key === "ArrowRight"){ go(cur+1); }
+  else if(e.key === "ArrowLeft"){ go(cur-1); }
+  else if(e.key === " "){ e.preventDefault(); setPlay(!playing); }
+});
+
+/* ================= MODE SWITCH ================= */
+var mode = "anatomy";
+var modeAB = document.getElementById("modeAB"), modePB = document.getElementById("modePB");
+function setMode(m){
+  mode = m;
+  modeAB.classList.toggle("on", m==="anatomy"); modePB.classList.toggle("on", m==="pool");
+  document.getElementById("modeAnatomy").hidden = (m!=="anatomy");
+  document.getElementById("modePool").hidden = (m!=="pool");
+  document.getElementById("anatCtl").style.display = (m==="anatomy") ? "contents" : "none";
+  if(m==="anatomy"){ go(cur<0?0:cur); } else { stopPackets(); renderStats(); refreshMatrix(); }
+}
+modeAB.onclick = function(){ setMode("anatomy"); };
+modePB.onclick = function(){ setMode("pool"); };
+
+/* ================= POOL ENGINE ================= */
+var POOL = 6;
+var SESSCOLORS = ["#5fd4e0","#e0708a","#d9b06b","#7fd49a","#b48ce0","#6f9fe8"];
+var SPEED = 1;
+var PSTAGES = [
+  {k:"claim",    ms:1000},
+  {k:"cred",     ms:1400},
+  {k:"login",    ms:3000},
+  {k:"list",     ms:1700},
+  {k:"export",   ms:5000},
+  {k:"finalize", ms:1500},
+  {k:"download", ms:2000},
+  {k:"erase",    ms:1400},
+  {k:"recycle",  ms:1700}
+];
+var CUSTODY_MAP = {claim:[], cred:[0,1,2,3], login:[4,5,6], list:[6], export:[6], finalize:[6], download:[6], erase:[7], recycle:[]};
+var DONE_MAP = {claim:[], cred:[], login:[0,1,2,3], list:[0,1,2,3,4,5], export:[0,1,2,3,4,5], finalize:[0,1,2,3,4,5], download:[0,1,2,3,4,5], erase:[0,1,2,3,4,5,6], recycle:[0,1,2,3,4,5,6,7]};
+var STAGE_LABEL = {claim:"claiming slot · idle→claimed", cred:"credential octets streaming → sealed", login:"@msout/microsoft-webauth · chromium login", list:"@msout/microsoft-onenote-list-notebooks", export:"@msout/microsoft-onenote-export-notebook", finalize:"streaming zip · /finalize", download:"GET /files/… · sendfile + range", erase:"shred vault · release slot", recycle:"recycling container · never warm"};
+
+var slots = [], colorPool = SESSCOLORS.slice();
+var slotsEl = document.getElementById("slots"), elog = document.getElementById("elog");
+
+function hex(n){ var s=""; while(n-->0) s += "0123456789abcdef"[Math.floor(Math.random()*16)]; return s; }
+function b64id(n){ var A="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"; var s=""; while(n-->0) s+=A[Math.floor(Math.random()*A.length)]; return s; }
+function now(){ var d=new Date(); return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0")+":"+String(d.getSeconds()).padStart(2,"0")+"."+String(d.getMilliseconds()).padStart(3,"0"); }
+
+for(var i=1;i<=POOL;i++){
+  slots.push({id:i, state:"idle", sess:null});
+  var d = document.createElement("div");
+  d.className = "slot"; d.id = "slot"+i;
+  d.innerHTML =
+    '<div class="s-head"><span class="s-lamp"></span>slot '+String(i).padStart(2,"0")+' · runner-'+i+'<span class="s-state">idle · pooled</span></div>'+
+    '<div class="s-guid">guid — · artifact —</div>'+
+    '<div class="s-stage">pooled chromium · waiting for a claim</div>'+
+    '<div class="s-bar"><i></i></div>'+
+    '<div class="s-cust">'+Array(8).fill("<i></i>").join("")+'</div>'+
+    '<div class="s-mounts">vault/— · artifacts/—</div>'+
+    '<div class="s-foot"><span class="s-net">cage ✓ · netns isolated</span><button class="s-erase" data-slot="'+i+'" disabled>erase</button></div>';
+  slotsEl.appendChild(d);
+}
+slotsEl.addEventListener("click", function(e){
+  var b = e.target.closest(".s-erase"); if(!b) return;
+  var sl = slots[+b.dataset.slot-1];
+  if(sl.sess && sl.sess.stageIdx < 7) eraseNow(sl.sess);
+});
+
+function plog(slot, comp, msg, color){
+  var near = elog.scrollHeight - elog.scrollTop - elog.clientHeight < 46;
+  var row = document.createElement("div"); row.className = "row";
+  row.innerHTML = '<span class="t">'+now()+'</span> <span style="color:'+(color||"var(--mut)")+'">'+(slot?("s"+slot):" · ")+'</span> <span class="cmp">'+comp.padEnd(9," ")+'</span> '+msg;
+  elog.appendChild(row);
+  while(elog.children.length > 150) elog.removeChild(elog.firstChild);
+  if(near) elog.scrollTop = elog.scrollHeight;
+}
+function renderStats(verb){
+  var idle=0, claimed=0, rec=0;
+  slots.forEach(function(s){ if(s.state==="idle") idle++; else if(s.state==="recycling") rec++; else claimed++; });
+  document.getElementById("statsJson").innerHTML =
+    'GET /stats ▸ { <b>"pool":'+POOL+'</b>, "idle":<b>'+idle+'</b>, "claimed":<b>'+claimed+'</b>, "recycling":'+rec+', "fillError":<span class="g">null</span> }'+
+    (verb ? '  <span class="verb">· last verb: '+verb+'</span>' : '');
+}
+function renderSlot(sl){
+  var el = document.getElementById("slot"+sl.id);
+  var s = sl.sess;
+  el.classList.toggle("live", !!s);
+  el.classList.toggle("spin", sl.state==="recycling" || (s && s.stage==="claim"));
+  el.style.setProperty("--sc", s ? s.color : "var(--dim)");
+  el.querySelector(".s-state").textContent = s ? s.stage : (sl.state==="recycling" ? "recycling…" : "idle · pooled");
+  el.querySelector(".s-guid").textContent = s ? ("guid "+s.guid.slice(0,8)+"… · artifact "+(s.art||"—")) : "guid — · artifact —";
+  el.querySelector(".s-stage").textContent = s ? (s.stage==="export" ? ("export "+Math.round(s.progress)+"% · nb "+s.nbDone+"/"+s.nbs) : STAGE_LABEL[s.stage]) : (sl.state==="recycling" ? "docker create · shm 1gb · capped mem" : "pooled chromium · waiting for a claim");
+  el.querySelector(".s-bar i").style.width = s ? (s.stage==="export" ? s.progress+"%" : (PSTAGES.findIndex(function(p){return p.k===s.stage;})+1)/PSTAGES.length*100+"%") : "0%";
+  var hot = s ? CUSTODY_MAP[s.stage] : [], done = s ? DONE_MAP[s.stage] : [];
+  Array.prototype.forEach.call(el.querySelectorAll(".s-cust i"), function(dot,k){
+    dot.className = hot.indexOf(k)>-1 ? "hot" : (done.indexOf(k)>-1 ? "done" : "");
+  });
+  el.querySelector(".s-mounts").textContent = s ? ("vault/"+s.guid.slice(0,6)+"… · artifacts/"+(s.art?s.art.slice(0,8)+"…":"—")) : "vault/— · artifacts/—";
+  el.querySelector(".s-erase").disabled = !(s && s.stageIdx < 7);
+}
+function refreshMatrix(){
+  var act = slots.filter(function(s){ return s.sess && ["claim","cred","login","list","export","finalize","download"].indexOf(s.sess.stage)>-1; });
+  var t = document.getElementById("pmatrix");
+  if(!act.length){ t.innerHTML = '<tr><td style="color:var(--dim)">no live cages — spawn a user to probe isolation.</td></tr>'; return; }
+  var h = '<tr><th>from cage</th><th>other vault</th><th>api</th><th>orchestrator</th><th>metadata</th><th>internet</th></tr>';
+  act.forEach(function(s){
+    h += '<tr><td class="ses" style="color:'+s.sess.color+'">runner-'+s.id+'</td><td class="den">ENOTFOUND</td><td class="den">ENOTFOUND</td><td class="den">ENOTFOUND</td><td class="den">DROP</td><td class="opn">OPEN</td></tr>';
+  });
+  t.innerHTML = h;
+}
+
+function spawnSession(){
+  var free = slots.filter(function(s){ return s.state==="idle"; });
+  if(!free.length){
+    plog(null,"api",'503 { "error":"every session is busy", "retryable":true }  <span class="m">// pool full: 6 cages live</span>', "var(--cred)");
+    renderStats("claim→ErrNoSlot");
+    return null;
+  }
+  var sl = free[0];
+  var color = colorPool.length ? colorPool.shift() : SESSCOLORS[(sl.id-1)%6];
+  var sess = {slot:sl.id, color:color, guid:hex(4)+"-"+hex(4)+"-"+hex(4)+"-"+hex(4)+"-"+hex(12), art:null, stage:"claim", stageIdx:0, progress:0, nbs:2+Math.floor(Math.random()*4), nbDone:0, token:0, dead:false, iv:null, mb:(180+Math.random()*2400).toFixed(0)};
+  sl.sess = sess; sl.state = "live";
+  plog(sl.id,"api",'POST /api/session → 201 · guid=<span style="color:'+color+'">'+sess.guid.slice(0,8)+'…</span> · cookie __Host-msout set', color);
+  plog(sl.id,"orch",'verb claim(slot='+sl.id+') · idle → claimed  <span class="m">// lazy bind: abandoned sessions hold nothing</span>', color);
+  renderStats("claim(slot="+sl.id+")");
+  renderSlot(sl); refreshMatrix();
+  runStage(sess, 0);
+  return sess;
+}
+function runStage(sess, idx){
+  if(sess.dead) return;
+  if(idx >= PSTAGES.length){ finishSession(sess); return; }
+  var sl = slots[sess.slot-1], st = PSTAGES[idx];
+  sess.stage = st.k; sess.stageIdx = idx;
+  onStageStart(sess, st.k);
+  var my = sess.token;
+  sess.timer = setTimeout(function(){
+    if(sess.token!==my || sess.dead) return;
+    if(sess.iv){ clearInterval(sess.iv); sess.iv = null; }
+    runStage(sess, idx+1);
+  }, (st.ms/SPEED) * (0.85+Math.random()*0.3));
+  renderSlot(sl);
+}
+function onStageStart(sess, k){
+  var id = sess.slot, c = sess.color;
+  if(k==="cred"){
+    plog(id,"api",'POST /api/credential · <span class="c">octet-stream</span> · no json parser · pipe → runner-'+id, c);
+  } else if(k==="login"){
+    plog(id,"webauth",'login.live.com · typing sealed buffer · keystroke by keystroke', c);
+    setTimeout(function(){ if(!sess.dead && sess.stage==="login") plog(id,"webauth",'mfa push <span class="g">approved</span> · auth.json → vault/'+sess.guid.slice(0,6)+'…', c); }, 1500/SPEED);
+  } else if(k==="list"){
+    plog(id,"list-nb",'@msout/microsoft-onenote-list-notebooks → '+sess.nbs+' notebooks', c);
+  } else if(k==="export"){
+    sess.progress = 0; sess.nbDone = 0;
+    sess.iv = setInterval(function(){
+      if(sess.dead) return;
+      sess.progress = Math.min(100, sess.progress + 2.4+Math.random()*4);
+      sess.nbDone = Math.min(sess.nbs, Math.floor(sess.progress/100*sess.nbs + 0.0001));
+      renderSlot(slots[id-1]);
+    }, 110);
+    plog(id,"export-nb",'@msout/microsoft-onenote-export-notebook · streaming pages → vault cache', c);
+  } else if(k==="finalize"){
+    sess.art = b64id(22);
+    plog(id,"orch",'verb stat · POST /finalize { slot:'+id+' } → artifacts/<span class="f">'+sess.art.slice(0,10)+'…</span>', c);
+  } else if(k==="download"){
+    plog(id,"caddy",'GET /files/'+sess.art.slice(0,10)+'… · forward_auth → 200 · sendfile '+sess.mb+' MB · range ✓', c);
+  } else if(k==="erase"){
+    plog(id,"sweeper","<span class=\"c\">shred</span> vault/"+sess.guid.slice(0,6)+"…/ · ring buffer evicted · cookie expired", c);
+    plog(id,"orch",'verb release(slot='+id+')', c);
+  } else if(k==="recycle"){
+    slots[id-1].state = "recycling";
+    plog(id,"orch",'verb recycle(slot='+id+') · docker create fresh · <span class="m">never reused warm</span>', c);
+    renderStats("recycle(slot="+id+")");
+  }
+}
+function finishSession(sess){
+  var sl = slots[sess.slot-1];
+  sl.state = "idle"; sl.sess = null;
+  colorPool.push(sess.color);
+  plog(sess.slot,"pool",'slot '+String(sess.slot).padStart(2,"0")+' back to idle · cage empty · ledger closed', "var(--sse)");
+  renderStats(); renderSlot(sl); refreshMatrix();
+}
+function eraseNow(sess){
+  if(sess.dead || sess.stageIdx >= 7) return;
+  sess.token++; if(sess.iv){ clearInterval(sess.iv); sess.iv = null; }
+  plog(sess.slot,"user",'session terminated by viewer · jumping to erase', sess.color);
+  runStage(sess, 7);
+}
+
+document.getElementById("spawnB").onclick = function(){ spawnSession(); };
+document.getElementById("spawn6B").onclick = function(){
+  for(var i=0;i<POOL;i++) setTimeout(function(){ spawnSession(); }, i*380);
+};
+document.getElementById("eraseAllB").onclick = function(){
+  slots.forEach(function(sl){ if(sl.sess && sl.sess.stageIdx < 7) eraseNow(sl.sess); });
+};
+document.getElementById("probeB").onclick = function(){
+  var act = slots.filter(function(s){ return s.sess; });
+  if(!act.length){ plog(null,"probe",'no live cages to probe from', "var(--dim)"); return; }
+  act.forEach(function(s){
+    plog(s.id,"probe",'→ other-vault <span class="c">ENOTFOUND</span> · api <span class="c">ENOTFOUND</span> · orch <span class="c">ENOTFOUND</span> · metadata <span class="c">DROP</span> · internet <span class="g">OPEN</span>', s.sess.color);
+  });
+  refreshMatrix();
+};
+Array.prototype.forEach.call(document.querySelectorAll(".sp"), function(b){
+  b.onclick = function(){
+    SPEED = parseFloat(b.dataset.sp);
+    Array.prototype.forEach.call(document.querySelectorAll(".sp"), function(x){ x.classList.toggle("on", x===b); });
+    plog(null,"pool",'sim speed → '+SPEED+'×', "var(--dim)");
+  };
+});
+
+/* boot */
+renderStats();
+refreshMatrix();
+go(0);
+})();
+</script>
+</body>
+</html>

@@ -245,6 +245,24 @@ jobs:
           # The api image is stamped with this, and an unset one is asserted as a
           # failure rather than defaulted.
           IMAGE_TAG: "0000000"
+          # Absolute host paths, required by compose. The orchestrator hands them to
+          # the Engine as bind sources, and a bind source is resolved on the host —
+          # so a value that only exists inside this container is exactly the bug
+          # these were introduced to stop. Matching `capability.yml` and
+          # `assert-compose.test.mjs`.
+          VAULT_HOST_DIR: /srv/msout/vault-host
+          ARTIFACT_HOST_DIR: /srv/msout/artifacts-host
+          # Absolute: compose resolves a `secrets:` `file:` to an absolute path but
+          # leaves environment values verbatim, so a relative value is how
+          # `ORCH_RUNNER_TOKEN_FILE` became a relative bind source. `config` does not
+          # read the files, so the directory need not exist here.
+          SECRETS_DIR: /srv/msout/secrets
+          # Must be the same string as the `runner` service's `image:`, which
+          # `assert-compose.mjs` now requires — it caught this job falling through to
+          # the orchestrator's built-in default, `…/runner:0.0.0`, which is a name
+          # nothing publishes. Written out rather than derived because a workflow
+          # `env:` value is not shell-expanded, and `IMAGE_TAG` is stamped later.
+          RUNNER_IMAGE: ghcr.io/ms-one-note-exporter/msout-runner:0000000
         run: docker compose --profile runner -f docker-compose.yml config --quiet
 
       - name: the required host name is genuinely required
@@ -257,6 +275,22 @@ jobs:
           ALLOWED_ORIGINS: https://app.example.com
           _DOCKER_GID: "998"
           IMAGE_TAG: "0000000"
+          # Required by compose (`:?`), and absolute host paths: the orchestrator
+          # hands them to the Engine as bind sources, resolved on the host. The
+          # values match `capability.yml` and `assert-compose.test.mjs`.
+          VAULT_HOST_DIR: /srv/msout/vault-host
+          ARTIFACT_HOST_DIR: /srv/msout/artifacts-host
+          # Absolute: compose resolves a `secrets:` `file:` to an absolute path but
+          # leaves environment values verbatim, so a relative value is how
+          # `ORCH_RUNNER_TOKEN_FILE` became a relative bind source. `config` does not
+          # read the files, so the directory need not exist here.
+          SECRETS_DIR: /srv/msout/secrets
+          # Must be the same string as the `runner` service's `image:`, which
+          # `assert-compose.mjs` now requires — it caught this job falling through to
+          # the orchestrator's built-in default, `…/runner:0.0.0`, which is a name
+          # nothing publishes. Written out rather than derived because a workflow
+          # `env:` value is not shell-expanded, and `IMAGE_TAG` is stamped later.
+          RUNNER_IMAGE: ghcr.io/ms-one-note-exporter/msout-runner:0000000
           PUBLIC_HOST: ""
         run: |
           if docker compose --profile runner -f docker-compose.yml config --quiet 2>/dev/null; then
@@ -277,6 +311,22 @@ jobs:
           ALLOWED_ORIGINS: https://app.example.com
           _DOCKER_GID: "998"
           IMAGE_TAG: "0000000"
+          # Required by compose (`:?`), and absolute host paths: the orchestrator
+          # hands them to the Engine as bind sources, resolved on the host. The
+          # values match `capability.yml` and `assert-compose.test.mjs`.
+          VAULT_HOST_DIR: /srv/msout/vault-host
+          ARTIFACT_HOST_DIR: /srv/msout/artifacts-host
+          # Absolute: compose resolves a `secrets:` `file:` to an absolute path but
+          # leaves environment values verbatim, so a relative value is how
+          # `ORCH_RUNNER_TOKEN_FILE` became a relative bind source. `config` does not
+          # read the files, so the directory need not exist here.
+          SECRETS_DIR: /srv/msout/secrets
+          # Must be the same string as the `runner` service's `image:`, which
+          # `assert-compose.mjs` now requires — it caught this job falling through to
+          # the orchestrator's built-in default, `…/runner:0.0.0`, which is a name
+          # nothing publishes. Written out rather than derived because a workflow
+          # `env:` value is not shell-expanded, and `IMAGE_TAG` is stamped later.
+          RUNNER_IMAGE: ghcr.io/ms-one-note-exporter/msout-runner:0000000
         run: |
           docker compose --profile runner -f docker-compose.yml config --format json \
             | node .github/assert-compose.mjs
@@ -317,6 +367,22 @@ jobs:
           ALLOWED_ORIGINS: https://app.example.com
           _DOCKER_GID: "998"
           IMAGE_TAG: "0000000"
+          # Required by compose (`:?`), and absolute host paths: the orchestrator
+          # hands them to the Engine as bind sources, resolved on the host. The
+          # values match `capability.yml` and `assert-compose.test.mjs`.
+          VAULT_HOST_DIR: /srv/msout/vault-host
+          ARTIFACT_HOST_DIR: /srv/msout/artifacts-host
+          # Absolute: compose resolves a `secrets:` `file:` to an absolute path but
+          # leaves environment values verbatim, so a relative value is how
+          # `ORCH_RUNNER_TOKEN_FILE` became a relative bind source. `config` does not
+          # read the files, so the directory need not exist here.
+          SECRETS_DIR: /srv/msout/secrets
+          # Must be the same string as the `runner` service's `image:`, which
+          # `assert-compose.mjs` now requires — it caught this job falling through to
+          # the orchestrator's built-in default, `…/runner:0.0.0`, which is a name
+          # nothing publishes. Written out rather than derived because a workflow
+          # `env:` value is not shell-expanded, and `IMAGE_TAG` is stamped later.
+          RUNNER_IMAGE: ghcr.io/ms-one-note-exporter/msout-runner:0000000
         run: node .github/assert-compose.test.mjs
 
       - name: nothing logs a request header

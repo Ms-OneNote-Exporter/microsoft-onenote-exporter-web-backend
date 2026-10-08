@@ -1,0 +1,70 @@
+graph TD
+    subgraph User ["User Browser"]
+        Browser["Web Browser<br/>Holds password in memory"]
+    end
+
+    subgraph Component_A ["Component A: Frontend (Separate Host/Repo)"]
+        Frontend["Static React SPA<br/>No secrets, no /api/* routing"]
+    end
+
+    subgraph Component_B ["Component B: Backend (Dedicated VPS)"]
+        subgraph Edge ["Edge Layer"]
+            Caddy["Caddy Reverse Proxy<br/>TLS / HSTS<br/>NO body logging<br/>Serves /files/* via forward_auth"]
+        end
+
+        subgraph Core_API ["API Service (Fastify / TypeScript)"]
+            API["API Server<br/>SQLite WAL State Management<br/>SSE Hub and Rate Limiter<br/>Raw Credential Stream Forwarder<br/>CORS / CSRF / Session Verification"]
+        end
+
+        subgraph Orch ["Orchestrator (Go)"]
+            Orchestrator["Orchestrator<br/>ONLY holder of /var/run/docker.sock<br/>Allowlisted verbs: claim, release, recycle, stat<br/>ZERO egress / no user input to Docker argv"]
+        end
+
+        subgraph Runners ["Runner Pool (Isolated Docker Containers)"]
+            Runner["Runner Instance<br/>Fastify sidecar + Playwright Chromium<br/>Receives raw credential stream<br/>Executes OneNote web automation"]
+        end
+        
+        subgraph Storage ["Host Volumes (Persistent)"]
+            Vault["/srv/msout/vault/guid/<br/>auth.json, cache, logs"]
+            Artifacts["/srv/msout/artifacts/artifactId/<br/>finalized .zip, partial marker"]
+        end
+    end
+
+    subgraph External ["External Services"]
+        MS["Microsoft OneNote Web"]
+    end
+
+    %% Data Flow Connections
+    Browser -->|"1. Load UI"| Frontend
+    Frontend -.->|"Provides absolute API URL"| Browser
+    
+    Browser -->|"2. POST /api/session (Get Session ID and CSRF)"| Caddy
+    Caddy -->|"Route /api/*"| API
+    API -->|"Claim idle runner slot"| Orchestrator
+    Orchestrator -->|"Manage via Docker Socket"| Runner
+    
+    Browser -->|"3. POST /api/credential (Raw Stream, NO JSON parse)"| Caddy
+    Caddy -->|"Route /api/*"| API
+    API -->|"4. Pipe raw stream directly"| Runner
+    
+    Runner -->|"5. Automated Login and Export"| MS
+    Runner -->|"6. Write export data"| Vault
+    Runner -->|"7. Finalize artifact"| Artifacts
+    
+    Runner -.->|"8. SSE Progress Events"| API
+    API -.->|"SSE Fan-out to Browser"| Browser
+    
+    Browser -->|"9. GET /files/opaque-artifact-id"| Caddy
+    Caddy -->|"10. forward_auth (Authorize Cookie)"| API
+    API -->|"11. Authz OK"| Caddy
+    Caddy -->|"12. Direct file_server (sendfile/Range)"| Browser
+
+    %% Styling
+    classDef security fill:#f9d0c4,stroke:#e74c3c,stroke-width:2px;
+    classDef component fill:#d4e6f1,stroke:#2980b9,stroke-width:2px;
+    classDef storage fill:#d5f5e3,stroke:#27ae60,stroke-width:2px;
+    
+    class Caddy,API,Orchestrator,Runner security;
+    class Frontend component;
+    class Vault,Artifacts storage;
+

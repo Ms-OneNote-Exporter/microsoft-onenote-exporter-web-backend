@@ -59,6 +59,24 @@ networks:
   # credential should be one hop away from it rather than on it.
   msout-runner-api:
     internal: true
+    # An explicit `name`, and it is load-bearing rather than cosmetic.
+    #
+    # Compose prefixes a network with the **project name** — `msout_msout-runner` —
+    # while `ORCH_RUNNER_NETWORK` names it `msout-runner`. The orchestrator builds
+    # its create request by name, so it asked the Engine for a network that does not
+    # exist and every slot failed with:
+    #
+    #     404 {"message":"network msout-runner not found"}
+    #
+    # CI never caught it because in the capability suite the **compose** file
+    # creates the runner, so the orchestrator's create path is never exercised. The
+    # first real deployment failed on it.
+    #
+    # Declaring `name:` here makes the network the orchestrator expects, by
+    # construction rather than by the two defaults happening to agree. Both runner
+    # networks need it: `msout-control` and `msout-edge` are only ever used through
+    # compose's service DNS, so nothing outside compose names them.
+    name: msout-runner-api
 
   # ---- the runner's egress: deliberately unrestricted ------------------------
   #
@@ -102,7 +120,34 @@ networks:
   # reachable on instance types that have them, they are a credential-theft path for
   # the *instance* rather than for us, and denying them constrains nothing Microsoft
   # does. See infra/README.md.
-  msout-runner: {}
+  msout-runner:
+    # `name:` for the same reason as `msout-runner-api` above — the orchestrator
+    # names this network when it creates a container, so it must exist under that
+    # name and not under `<project>_msout-runner`.
+    name: msout-runner
+    # **`external: true`, and it is the only way this network can exist.**
+    #
+    # Compose **prunes** a network no non-profile service joins, and the only service
+    # that joins this one is the `runner` service, which sits behind a profile. So a
+    # plain `docker compose up` creates it and then deletes it, and the orchestrator —
+    # which asks the Engine for it *by name* — gets:
+    #
+    #     404 {"message":"network msout-runner not found"}
+    #
+    # There is no compose expression for "keep a network nothing joins", so the
+    # network is declared **operator-provided** instead. That is also the honest
+    # description: it is a property of the deployment (its subnet is what the
+    # `iptables` deny rules in `infra/README.md` are written against), not of the file.
+    #
+    # It must be created before the first `up`, which is a deploy step:
+    #
+    #     docker network create --driver bridge \
+    #       --subnet 172.30.0.0/16 --gateway 172.30.0.1 msout-runner
+    #
+    # `capability.yml` does exactly that, and `assert-compose.mjs` requires this flag,
+    # because dropping it makes Compose delete the network it just created and the
+    # failure surfaces at the first runner create rather than here.
+    external: true
 
 # ---- secrets ----------------------------------------------------------------
 
@@ -113,9 +158,9 @@ secrets:
   #
   # The files are created by the operator; see .env.example and infra/README.md.
   csrf_key:
-    file: ${SECRETS_DIR:-./secrets}/csrf_key
+    file: ${SECRETS_DIR:?set SECRETS_DIR to an absolute path; see infra/README.md}/csrf_key
   orchestrator_hmac_secret:
-    file: ${SECRETS_DIR:-./secrets}/orchestrator_hmac_secret
+    file: ${SECRETS_DIR:?set SECRETS_DIR to an absolute path; see infra/README.md}/orchestrator_hmac_secret
   # The runner's bearer token, so the orchestrator can authenticate to it.
   #
   # Not a session credential: it authorises the orchestrator to *start* work in a
@@ -123,7 +168,7 @@ secrets:
   # than an environment variable for the same reason as the other two — an env var
   # is visible in `docker inspect` to anything that can read the container config.
   runner_token:
-    file: ${SECRETS_DIR:-./secrets}/runner_token
+    file: ${SECRETS_DIR:?set SECRETS_DIR to an absolute path; see infra/README.md}/runner_token
 
 # ---- services ---------------------------------------------------------------
 
@@ -319,17 +364,54 @@ services:
       # The tag must be a commit SHA. A mutable tag would let a container start
       # with code nobody reviewed.
       ORCH_RUNNER_IMAGE: ${RUNNER_IMAGE:-ghcr.io/ms-one-note-exporter/runner:0.0.0}
-      # The host path of the bearer token every runner mounts read-only.
+      # The **host** path of the bearer token every runner mounts read-only.
       #
       # A *path*, like every other secret here: the orchestrator never reads the
-      # value, it bind-mounts the file into each runner, and the runner reads it
-      # from its own /run/secrets. So the value is never in this container's
+      # value, it bind-mounts the file into each runner, and the runner reads it from
+      # its own /run/secrets. So the value is never in this container's
       # environment, and never in `docker inspect`.
       #
-      # It defaults to /run/secrets/runner_token, which is where the `runner_token`
-      # secret below is mounted in the orchestrator — so the default is correct
-      # and the variable exists only for a deployment that puts secrets elsewhere.
-      ORCH_RUNNER_TOKEN_FILE: /run/secrets/runner_token
+      # **This must be a host path, not the container path the orchestrator itself
+      # mounts the secret at.** It used to be hardcoded to
+      # `/run/secrets/runner_token` — which is the *container's* path — and the
+      # comment above it claimed that made the default correct. It does not:
+      #
+      #   1. the orchestrator bind-mounts this value as the **source** when creating
+      #      each runner, and a bind source is resolved on the host
+      #   2. that path does not exist on the host
+      #   3. so Docker **creates a directory** there
+      #   4. so the runner mounts a directory over its own secret path, tries to
+      #      read a file inside it, and exits 1:
+      #
+      #      MSOUT_RUNNER_TOKEN_FILE could not be read at /run/secrets/runner_token:
+      #      ENOENT: no such file or directory, open '/run/secrets/runner_token'
+      #
+      # Every container still started and `/healthz` still said `ok`. It only
+      # surfaced on the first real login attempt, on a real host.
+      #
+      # So it points at `SECRETS_DIR`, the same directory the `secrets:` block
+      # below reads, and `RUNNER_TOKEN_HOST_FILE` overrides it for a deployment that
+      # keeps them elsewhere. `assert-compose.mjs` requires the two to agree, which
+      # is what makes this stick.
+      ORCH_RUNNER_TOKEN_FILE: ${RUNNER_TOKEN_HOST_FILE:-${SECRETS_DIR:?set SECRETS_DIR to an absolute path; see infra/README.md}/runner_token}
+
+      # The two bind-mount *sources*, and the reason they are absolute host paths
+      # rather than the `/srv/msout/...` defaults they used to have.
+      #
+      # The orchestrator hands these to the Engine as the `Source` of a bind when it
+      # creates a runner, and **a bind source is resolved on the host**. A named
+      # volume mounted at `/srv/msout/vault` is at
+      # `/var/lib/docker/volumes/<name>/_data` on the host, so the default named a
+      # host directory Docker created empty and root-owned, and every runner got it
+      # as `/data`:
+      #
+      #     EACCES: permission denied, mkdir '/data/<guid>'
+      #
+      # Set to the *same string* as the volumes above mount them at, so the path is
+      # unambiguous on both sides of the container boundary. `assert-compose.mjs`
+      # requires the three to agree, which is the whole check.
+      ORCH_VAULT_ROOT: ${VAULT_HOST_DIR:?set VAULT_HOST_DIR; see infra/README.md}
+      ORCH_ARTIFACT_ROOT: ${ARTIFACT_HOST_DIR:?set ARTIFACT_HOST_DIR; see infra/README.md}
 
       # No PUBLIC_HOST, no ALLOWED_ORIGINS, no CSRF key. The orchestrator is not a
       # component that should know any of them, and its absence here is a property
@@ -337,7 +419,7 @@ services:
       # secret, and this is the same idea one step earlier.
 
     # The docker socket is root:docker mode 0660 on the host, and this image runs
-    # as uid 65532 (distroless `nonroot`). Without this the orchestrator dies with
+    # as uid 1000. Without this the orchestrator dies with
     # "permission denied" on the socket — which it did, on the first deploy.
     #
     # `group_add` rather than running as root, because root would work and would
@@ -377,7 +459,34 @@ services:
       # is the sharpest edge in the deployment and it is why §2.1 gives the
       # orchestrator no egress at all.
       - /var/run/docker.sock:/var/run/docker.sock
-      - artifacts:/srv/msout/artifacts
+      - ${ARTIFACT_HOST_DIR:?set ARTIFACT_HOST_DIR; see infra/README.md}:${ARTIFACT_HOST_DIR:?set ARTIFACT_HOST_DIR}
+      # The session vault, `/srv/msout/vault/<guid>`.
+      #
+      # **A host path, mounted at the identical path inside the container**, and that
+      # identity is the whole point. It used to be a named volume:
+      #
+      #   - as a named volume it was at /var/lib/docker/volumes/msout_vault/_data on
+      #     the host, so `ORCH_VAULT_ROOT=/srv/msout/vault` — which the orchestrator
+      #     hands the Engine as a bind **source** — named an empty root-owned
+      #     directory on the host that Docker created and nothing wrote to
+      #   - the runner then mounted that empty directory at /data and could not
+      #     create its session directory:
+      #
+      #       EACCES: permission denied, mkdir '/data/<guid>'
+      #
+      #   - and with no volume at all, the vault lived in the container's writable
+      #     layer, so one `--force-recreate orchestrator` deleted every session's
+      #     auth.json and exported vault
+      #
+      # Two different bugs, one requirement: this path is resolved by the Engine on
+      # the **host**, so it has to be a host path — and it has to be the same string
+      # here, or the two disagree and the runner gets a directory nobody writes to.
+      #
+      # The host directory must exist and be owned by the orchestrator's uid before
+      # the first start; Docker creates a missing bind source as root. `main.go`
+      # checks both roots at boot and fails with the exact `install -d` to run, so
+      # this is a named startup error rather than an EACCES inside a runner.
+      - ${VAULT_HOST_DIR:?set VAULT_HOST_DIR; see infra/README.md}:${VAULT_HOST_DIR:?set VAULT_HOST_DIR}
     cap_drop:
       - ALL
     security_opt:
@@ -436,6 +545,23 @@ services:
       - runner_token
     volumes:
       - runner-data:/data
+      # A named volume, deliberately, and not the host directory the orchestrator uses.
+      # This service is the **development** runner: nothing creates it through the
+      # orchestrator, so nothing is granting it anything, and the strongest property
+      # available is available — the runner holds the Microsoft credential and is the
+      # only component pointed at the open internet, so it gets **no host path at
+      # all**. T-X-R2 asserts that, against the running container.
+      #
+      # An orchestrator-created runner cannot have this: the orchestrator binds it the
+      # per-session vault and the artifact root, because artifacts must leave the
+      # container and the vault must persist. So the two runners differ here, and the
+      # difference is the *grants*, not a difference in posture.
+      #
+      # I briefly pointed this at `ARTIFACT_HOST_DIR` so a dev runner and an
+      # orchestrator-created runner would share an artifacts directory. That is a
+      # convenience, and it costs T-X-R2 — the one assertion about the runner's
+      # mounts on a real container. Not a trade worth making for symmetry nobody
+      # depends on; the cost is that this runner's artifacts are throwaway.
       - artifacts:/artifacts
     cap_drop:
       - ALL
@@ -479,6 +605,10 @@ services:
 
 volumes:
   api-data:
+  # The **development** runner's artifacts only. Production artifacts go to
+  # `ARTIFACT_HOST_DIR`, because the orchestrator needs that path to bind it into a
+  # runner it creates — and a named volume has no host path to bind from. See the
+  # `runner` service's `volumes`.
   artifacts:
   caddy-data:
   caddy-config:

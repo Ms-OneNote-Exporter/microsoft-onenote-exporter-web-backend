@@ -137,10 +137,28 @@ func (p *Pool) buildCreateRequest(slotID, containerID, sessionGUID string, sessi
 		HealthConfig: &dockerapi.HealthConfig{
 			Test: []string{"CMD", "node", "/app/dist/healthcheck.js"},
 			// The Engine takes these as nanoseconds.
-			Interval:    (15 * time.Second).Nanoseconds(),
-			Timeout:     (5 * time.Second).Nanoseconds(),
-			Retries:     3,
-			StartPeriod: (20 * time.Second).Nanoseconds(),
+			//
+			// **Short, on purpose, because the claim path waits on this.** The
+			// orchestrator returns from `claim` only once the runner reports
+			// healthy, so these values are login latency rather than background
+			// cost: with a 20s start period and a 15s interval, a login would wait
+			// up to 35 seconds for a runner that is actually listening in ~600ms.
+			//
+			// 3s is still far more often than a runner needs. The cost of a short
+			// interval is a `/healthz` request every few seconds per runner, on a
+			// loopback socket, from a process that is idle anyway.
+			Interval: (3 * time.Second).Nanoseconds(),
+			Timeout:  (5 * time.Second).Nanoseconds(),
+			Retries:  3,
+			// Equal to the interval, which is the floor the contract test requires.
+			// A runner's own HTTP sidecar binds in ~600ms — measured on a real host —
+			// so 3s is ample; `Retries: 3` then leaves ~9s of grace before the Engine
+			// will call it unhealthy at all.
+			//
+			// Note this healthcheck probes `/healthz`, which does **not** launch
+			// Chromium. Chromium starts per login, inside the runner process, and is
+			// gated by that request's own timeout rather than by this period.
+			StartPeriod: (3 * time.Second).Nanoseconds(),
 		},
 		// Two networks, both pinned, and what each one is for is the whole
 		// topology:

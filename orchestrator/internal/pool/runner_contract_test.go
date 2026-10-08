@@ -40,15 +40,31 @@ func TestCreateRequestNamesAHealthCheckTheImageActuallyHas(t *testing.T) {
 	if !strings.Contains(joined, "/app/dist/healthcheck.js") {
 		t.Errorf("health check = %q, want a probe of /app/dist/healthcheck.js", joined)
 	}
-	// The start period has to be *long* enough to cover a Chromium launch, which
-	// is tens of seconds on a cold container. An earlier version of this asserted
-	// the opposite — start period must be shorter than the interval — which is
-	// simply wrong: a slow-starting runner would be failed and recycled during the
-	// one window it is allowed to come up in.
+	// The start period must be at least the interval. An earlier version of this
+	// asserted the opposite — start period must be *shorter* than the interval —
+	// which is simply wrong: a slow-starting runner would be failed and recycled
+	// during the one window it is allowed to come up in.
+	//
+	// What this must **not** be is long because of Chromium. The probe is the
+	// runner's HTTP sidecar, which measured ~600ms to bind on a real host; Chromium
+	// is launched per login, after this has already passed, and is bounded by that
+	// request's own timeout. The previous comment here credited the start period
+	// with covering "a Chromium launch, which is tens of seconds on a cold
+	// container", which this healthcheck never does — and a reader would have sized
+	// the interval from it and made every login wait 35 seconds for a runner that
+	// was listening in under a second.
+	//
+	// The real ceiling is `Retries`: the Engine will not call the container
+	// unhealthy before that many consecutive failures.
 	if req.HealthConfig.StartPeriod < req.HealthConfig.Interval {
 		t.Errorf("start period %v is shorter than the %v interval; a runner "+
 			"still booting would be failed rather than given room",
 			req.HealthConfig.StartPeriod, req.HealthConfig.Interval)
+	}
+	if req.HealthConfig.Interval > (10 * time.Second).Nanoseconds() {
+		t.Errorf("health check interval is %v; `claim` blocks until this reports "+
+			"healthy, so the interval is login latency, not background cost",
+			req.HealthConfig.Interval)
 	}
 	if req.HealthConfig.Retries < 2 {
 		t.Errorf("retries = %d; a single transient probe failure would mark a "+

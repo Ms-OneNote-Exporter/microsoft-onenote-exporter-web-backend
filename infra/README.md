@@ -154,8 +154,8 @@ URL is silently wrong.
 ## Host paths
 
 ```
-/srv/msout/vault/<guid>/           auth.json, notebook cache, logs   (orch rw, runner rw)
-/srv/msout/artifacts/<artifactId>/ finalised zip, partial marker    (orch rw, caddy ro)
+$VAULT_HOST_DIR/<guid>/           auth.json, notebook cache, logs   (orch rw, runner rw)
+$ARTIFACT_HOST_DIR/<artifactId>/  finalised zip, partial marker    (orch rw, api-mediated)
 ```
 
 Split, not shared. v2 mounted one tree and let Caddy `file_server` it, which meant
@@ -163,6 +163,42 @@ Caddy could also read `auth.json` — a live Microsoft cookie jar. Keeping them 
 means the component in the credential path (Caddy) and the component that decides
 who may download (`api`) can *neither* read session data. That is a genuine
 improvement over v2 and the split is what makes it cheap (§2.2).
+
+### These two paths must be host paths, not named volumes
+
+The orchestrator hands them to the Engine as the `Source` of a bind mount when it
+creates a runner, and **a bind source is resolved on the host**. That makes them a
+different kind of setting from every other path here, and one that fails quietly:
+
+- as a **named volume** mounted at `/srv/msout/vault`, the host path is
+  `/var/lib/docker/volumes/msout_vault/_data` — so `/srv/msout/vault` named an empty
+  root-owned directory that Docker created and nothing wrote to, and every runner
+  mounted it as `/data` and failed:
+
+  ```
+  EACCES: permission denied, mkdir '/data/<guid>'
+  ```
+
+- with **no volume at all**, the vault lived in the container's writable layer, so a
+  single `docker compose up -d --force-recreate orchestrator` deleted every session's
+  `auth.json` and exported vault. Nothing failed and nothing reported it.
+
+So they are host directories, mounted by the orchestrator **at the identical path**,
+and created once before the first start:
+
+```sh
+install -d -o 1000 -g 1000 /opt/msout/data/vault /opt/msout/data/artifacts
+```
+
+1000 is the uid **both** the orchestrator and the runner run as, because they share
+this tree. Docker creates a
+missing bind source owned by root, which is why this cannot be left to the daemon.
+The orchestrator checks both roots at boot and refuses to start with that exact
+command in the failure, so a wrong owner is a named startup error rather than an
+`EACCES` inside a runner three layers away.
+
+`.github/assert-compose.mjs` requires the path the orchestrator hands the Engine and
+the path it has mounted to be the same string — that identity is the whole check.
 
 ## Caddy
 

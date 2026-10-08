@@ -62,6 +62,17 @@ jobs:
       PUBLIC_HOST: one-backend.phttp.com
       ACME_EMAIL: ops@example.com
       ALLOWED_ORIGINS: https://app.example.com
+      # The two bind-mount sources. Compose requires them (`:?`), and they must be
+      # absolute host paths — the orchestrator hands them to the Engine as bind
+      # sources, which are resolved on the host, not in this container. Named to
+      # match `assert-compose.test.mjs`, which asserts against the same values.
+      VAULT_HOST_DIR: /srv/msout/vault-host
+      ARTIFACT_HOST_DIR: /srv/msout/artifacts-host
+      # Absolute, because compose resolves a `secrets:` `file:` to an absolute path
+      # but leaves an environment value verbatim — so a relative value gives the
+      # orchestrator a relative bind source, which it refuses to start with.
+      SECRETS_DIR: ${{ github.workspace }}/secrets
+
     steps:
       - uses: actions/checkout@v4
 
@@ -69,7 +80,22 @@ jobs:
         # `build` on /api/public/version is this value, and compose requires it.
         # Taken from the checkout rather than pinned to a literal, so the stamp is
         # the commit that is actually being tested.
-        run: echo "IMAGE_TAG=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+        run: |
+          echo "IMAGE_TAG=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          # Point the orchestrator at the image *this job builds*, so its own
+          # container-create path runs. It is the path that failed on the first real
+          # deployment and that CI could not see, because the capability suite creates
+          # the runner through Compose and the orchestrator had never made one.
+          #
+          # Written to $GITHUB_ENV rather than the job `env:` block because it needs
+          # the stamp above, and a job-level `env:` value is not shell-expanded —
+          # `${IMAGE_TAG}` there is a literal.
+          #
+          # Without it the orchestrator spams `No such image:
+          # ghcr.io/ms-one-note-exporter/runner:0.0.0` every ten seconds — the
+          # built-in default, a name nobody publishes — and every log-based assertion
+          # below reads through that noise.
+          echo "RUNNER_IMAGE=ghcr.io/ms-one-note-exporter/msout-runner:$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
 
       - name: discover the host docker group
         # Not hardcoded. The first version pinned _DOCKER_GID to a literal, which is
@@ -116,25 +142,163 @@ jobs:
         # tested, not any particular value.
         run: |
           set -euo pipefail
-          mkdir -p secrets
-          chmod 700 secrets
+          # $SECRETS_DIR, not a bare ./secrets: the variable is what compose reads,
+          # and pointing it somewhere other than where the files land is precisely
+          # the mismatch this suite exists to catch.
+          mkdir -p "$SECRETS_DIR"
+          chmod 700 "$SECRETS_DIR"
           umask 077
           for f in csrf_key orchestrator_hmac_secret runner_token; do
-            head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n' | cut -c1-43 > "secrets/$f"
-            chmod 0444 "secrets/$f"
+            head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n' | cut -c1-43 > "$SECRETS_DIR/$f"
+            chmod 0444 "$SECRETS_DIR/$f"
           done
           # 0444 inside a 0700 directory, matching the deployment: compose bind-mounts
           # secret files as-is and cannot set uid/gid outside swarm, so a 0400
           # root-owned file would be unreadable by a container running as another uid.
-          echo "generated $(ls secrets | wc -l) throwaway secret files"
+          echo "generated $(ls "$SECRETS_DIR" | wc -l) throwaway secret files in $SECRETS_DIR"
 
       - name: build
-        run: docker compose build
+        # `--profile runner`, because the runner service sits behind a profile and a
+        # plain `build` **silently skips it**. That is not a slow build, it is no
+        # build: the image the orchestrator is then told to pull does not exist, and
+        # the only symptom is
+        #
+        #     404 {"message":"No such image: .../msout-runner:8dcf96e"}
+        #
+        # every ten seconds, from a component whose create path this file is now
+        # supposed to be testing. The dev runner is started further down and would
+        # have hit the same wall; `build` was the only thing not doing it.
+        run: docker compose --profile runner build
+
+      - name: provision the runner's egress network
+        # Must run before `up`, and must run even though the network is now
+        # `external: true` in the compose file — an external network is not created
+        # by compose at all, so nothing else will create it.
+        # Compose **prunes** `msout-runner`: the only service that would join it is
+        # the `runner` service, which sits behind a profile, so a plain
+        # `docker compose up` leaves it non-existent. The orchestrator asks the
+        # Engine for it *by name* when it creates a container and gets:
+        #
+        #     404 {"message":"network msout-runner not found"}
+        #
+        # which is how the first real deployment failed. Pre-creating it here means
+        # the orchestrator's create path can actually run in CI.
+        run: |
+          set -euo pipefail
+          docker network create --driver bridge msout-runner
+          docker network inspect msout-runner --format '{{.Name}} {{.Driver}}'
+
+      - name: provision the orchestrator's storage roots
+        # A deployment step, and the reason this file needs one.
+        #
+        # `VAULT_HOST_DIR` and `ARTIFACT_HOST_DIR` are bind-mount sources, so Docker
+        # creates them on the host **owned by root** if they are missing — and the
+        # orchestrator runs as uid 1000. Its boot check then refuses to start with
+        # this exact `install -d` in the message, which is the intended behaviour:
+        # without this step the first `up` below fails with the orchestrator
+        # unhealthy, and the reason is three steps of output away.
+        #
+        # The boot check is not asserted here — it is asserted on a *real* host, and
+        # asserting it here would mean asserting that this step is missing.
+        run: |
+          set -euo pipefail
+          # sudo because a GitHub runner is not root and `/srv` is: a deploy operator
+          # is. The directory ends up owned by the orchestrator's uid either way,
+          # which is the part that matters — and which is the part the first
+          # attempt at this step got wrong by running unprivileged and failing with
+          # `install: cannot create directory '/srv/msout': Permission denied`.
+          for d in "$VAULT_HOST_DIR" "$ARTIFACT_HOST_DIR"; do
+            sudo install -d -o 1000 -g 1000 "$d"
+          done
+          ls -ldn "$VAULT_HOST_DIR" "$ARTIFACT_HOST_DIR"
 
       - name: up
         run: docker compose up -d --wait
         # --wait honours the healthchecks, so a failure here is a real startup
         # failure rather than a race.
+
+      - name: the orchestrator fills its own pool
+        # **This is the path CI could not see.** Every other assertion in this file
+        # exercises a container Compose created. This one asserts that the
+        # orchestrator — the only process with the Docker socket — can create a
+        # runner, give it the mounts and networks it should have, and get a
+        # container that reports healthy.
+        #
+        # Found on the first real deployment, where the create failed on a network
+        # name mismatch and every job in this file passed, because nothing here
+        # asked the orchestrator to make a container.
+        run: |
+          set -euo pipefail
+          # `docker compose exec orchestrator true` does not work and cannot: the
+          # orchestrator image is distroless — no shell, no `true` binary. The first
+          # version of this step used exactly that, so its preflight was asking
+          # "is there a container" by trying to run a program inside one. Same check
+          # the file's own preflight below uses.
+          ocid=$(docker compose ps -q orchestrator)
+          if [ -z "$ocid" ] || [ "$(docker inspect -f '{{.State.Status}}' "$ocid")" != "running" ]; then
+            echo "FAIL: the orchestrator is not running; every assertion below would pass vacuously"
+            docker compose ps
+            exit 1
+          fi
+
+          echo "waiting for the orchestrator to fill a slot..."
+          filled=""
+          for _ in $(seq 1 24); do
+            sleep 5
+            # Filtered on `msout.slot.id`, which only the orchestrator sets, and
+            # `head -1` because the pool holds more than one. Without it `docker ps -q`
+            # emits one id per line, the variable becomes a two-line string, and
+            # `docker inspect` reads it as one malformed argument:
+            #
+            #     orchestrator-created runner: 51510ae2b0ad
+            #     06cc06842739
+            #     Error: No such object: 51510ae2b0ad
+            #     06cc06842739
+            #
+            # Which is what happened on the first run of this step — *after* it had
+            # already done the thing it exists to check, and reported the runner id.
+            #
+            # Filtering on `msout.role=runner` instead would also match the Compose dev
+            # runner, and asserting on *that* would pass while the path under test never
+            # ran — the failure this step was added to end.
+            cid=$(docker ps -q --filter "label=msout.slot.id" | head -1 || true)
+            if [ -n "$cid" ]; then filled="$cid"; break; fi
+          done
+          if [ -z "$filled" ]; then
+            echo "FAIL: the orchestrator created no runner in 120s"
+            docker compose logs --tail 40 orchestrator
+            exit 1
+          fi
+
+          echo "orchestrator-created runner: $filled"
+          # The mounts it granted itself: the artifact root and its own token, and
+          # nothing else. This is the assertion about the create *request* reaching
+          # the Engine, which is what a top-level `Mounts` field silently failed.
+          binds=$(docker inspect -f '{{range .Mounts}}{{.Source}} {{end}}' "$filled")
+          echo "binds: $binds"
+          case "$binds" in
+            *runner_token*) ;;
+            *) echo "FAIL: the orchestrator's runner has no token bind"; exit 1 ;;
+          esac
+          case "$binds" in
+            *"$ARTIFACT_HOST_DIR"*) ;;
+            *) echo "FAIL: the orchestrator's runner does not bind the artifact root"; exit 1 ;;
+          esac
+          # And the two networks, named the way the orchestrator asked for them.
+          nets=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$filled")
+          echo "networks: $nets"
+          case "$nets" in *"msout-runner "*) ;; *) echo "FAIL: no egress network"; exit 1 ;; esac
+          case "$nets" in *"msout-runner-api "*) ;; *) echo "FAIL: no credential network"; exit 1 ;; esac
+
+          # `/data` is tmpfs on an idle runner: a waiting container must hold no
+          # credential-bearing path at all.
+          data=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Type}}{{end}}{{end}}' "$filled")
+          if [ -n "$data" ]; then
+            echo "FAIL: an idle orchestrator-created runner has /data as a $data mount; it must be tmpfs"
+            exit 1
+          fi
+          docker inspect -f '{{json .HostConfig.Tmpfs}}' "$filled"
+          echo "the orchestrator can create a runner"
 
       - name: preflight — every service is actually running
         # Added after a first run of this file on the real VPS, where the capability
@@ -268,6 +432,12 @@ jobs:
           echo "only caddy is published"
 
       - name: the edge network holds Caddy alone
+        # `!= 1` is sound here, unlike the count on the credential-path network below,
+        # which encoded an accident. This one is **structural**: `caddy` is the only
+        # service in `docker-compose.yml` that joins `msout-edge`, and none of them is
+        # profile-gated, so no pool size or profile can add a second member. Stated
+        # because "is this 1 structural or accidental?" is the question worth asking of
+        # every count, and the answer was not obvious from this file alone.
         run: |
           set -euo pipefail
           members=$(docker network inspect "${COMPOSE_PROJECT_NAME}_msout-edge" \
@@ -321,24 +491,57 @@ jobs:
           test -n "$cid" || { echo "no runner container"; docker compose ps; exit 1; }
           echo "runner is up: $(docker inspect -f '{{.State.Health.Status}}' "$cid")"
 
-      - name: the credential-path network holds the api and a runner, and nothing else
+      - name: the credential-path network holds the api and runners, and nothing else
         # Asserted *here*, after the runner exists — the runner is behind a profile,
         # so before this step the network correctly holds only the api and an
         # expectation of two containers fails against a correct configuration.
+        #
+        # **By composition, not by count.** It used to assert exactly 2 (api + one
+        # runner), which was true only while the orchestrator created nothing — i.e.
+        # while the path this file now also tests was untested. Adding the
+        # orchestrator-pool assertion above filled two slots, and this became:
+        #
+        #     msout-runner-api has 4 containers; expected 2 (api and runner)
+        #     msout-slot-1-… msout-slot-2-… msoutcap-api-1 msoutcap-runner-1
+        #
+        # Four correct members. A count cannot express "every member is allowed here",
+        # and it silently breaks the moment POOL_SIZE changes — which is the same
+        # shape as asserting a handler ran.
+        #
+        # The name is read from compose rather than rebuilt as
+        # `${COMPOSE_PROJECT_NAME}_…`: the network carries an explicit `name:`, and
+        # the prefix assumption is asserted once in assert-compose.mjs instead of
+        # restated here.
+        env:
+          CREDENTIAL_NETWORK: msout-runner-api
         run: |
           set -euo pipefail
-          members=$(docker network inspect "${COMPOSE_PROJECT_NAME}_msout-runner-api" \
+          members=$(docker network inspect "$CREDENTIAL_NETWORK" \
             --format '{{range .Containers}}{{.Name}} {{end}}' | tr ' ' '\n' | grep -c . || true)
-          # api + runner = 2. The orchestrator on here would put the credential and
-          # the Docker socket on one network; Caddy would make a runner reachable
-          # from the proxy that terminates TLS.
-          if [ "$members" != "2" ]; then
-            echo "msout-runner-api has $members containers; expected 2 (api and runner)"
-            docker network inspect "${COMPOSE_PROJECT_NAME}_msout-runner-api" \
+          echo "msout-runner-api has $members containers"
+          [ "$members" -ge 2 ] || {
+            echo "FAIL: expected at least the api and one runner, found $members"
+            docker network inspect "$CREDENTIAL_NETWORK" \
               --format '{{range .Containers}}{{.Name}} {{end}}'
             exit 1
+          }
+
+          # The property: nothing on this network may be the orchestrator or Caddy.
+          # Either would put the credential path and the Docker socket — or the TLS
+          # terminator — on one network, which is the whole reason it is separate.
+          forbidden=$(docker network inspect "$CREDENTIAL_NETWORK" \
+            --format '{{range .Containers}}{{.Name}} {{end}}' \
+            | tr ' ' '\n' | grep -E 'orchestrator|caddy' || true)
+          if [ -n "$forbidden" ]; then
+            echo "FAIL: the credential-path network holds $forbidden"
+            echo "§2.1: only api and runners. The orchestrator here would put the"
+            echo "credential and the Docker socket on one network; Caddy would make a"
+            echo "runner reachable from the proxy that terminates TLS."
+            exit 1
           fi
-          echo "msout-runner-api holds two containers"
+          echo "every member is an api or a runner"
+          docker network inspect "$CREDENTIAL_NETWORK" \
+            --format '{{range .Containers}}{{.Name}} {{end}}'
 
       # ---- the runner's egress: unrestricted, and the denies that hold -------
       #
@@ -823,4 +1026,4 @@ jobs:
         if: always()
         run: |
           docker compose --profile runner down -v
-          rm -rf secrets
+          rm -rf "$SECRETS_DIR"

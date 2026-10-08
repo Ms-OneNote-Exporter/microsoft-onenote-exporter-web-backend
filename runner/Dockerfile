@@ -48,6 +48,13 @@ ENV BUILD_ID=${BUILD_ID}
 # simply "the api's plus a browser".
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
+# Where Playwright looks for its browsers, and **not** the default
+# `~/.cache/ms-playwright` — because the orchestrator mounts a tmpfs over
+# `/home/node/.cache` in every runner it creates, which would mask whatever is
+# installed there. A location outside every tmpfs, so a browser installed in the image
+# is a browser the runner can actually launch.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       chromium \
@@ -61,13 +68,6 @@ RUN apt-get update \
 # that reads like a network problem.
 RUN test -n "$(command -v chromium)" || (echo "chromium did not install" && exit 1)
 
-# The session and artifact roots, created while this stage is still root and then
-# handed to the unprivileged user. It has to be *here*, before the first
-# `USER 1000` below: a RUN after that line executes unprivileged, which cannot chown anything.
-#
-# Load-bearing, the same way the api's volume ownership is: Docker creates a fresh
-# named volume from the image's directory *and its ownership*, so a path absent
-# from the image yields a root-owned volume that uid 1000 cannot write to.
 RUN mkdir -p /data /artifacts && chown -R node:node /data /artifacts
 
 # Numerically, and not `USER node`.
@@ -98,6 +98,87 @@ COPY package.json package-lock.json ./
 # `--omit=dev` gives a tree with no compiler and no test runner. The `@msout`
 # packages *are* kept: they are the reason this container exists.
 RUN npm ci --omit=dev && npm cache clean --force
+
+# ---- Playwright's browser registry -------------------------------------------
+#
+# Placed **here**, after `npm ci` and not next to the `chromium` install above,
+# because it reads Playwright's own revision and Playwright does not exist until
+# `npm ci` has run. The first attempt put it beside the apt step, where
+# `require("playwright")` is `MODULE_NOT_FOUND` — and `set -e` turned that into an
+# opaque build failure with no line to point at.
+#
+# And `USER 0` for the step itself, because it writes to `/opt` — which uid 1000
+# cannot. Without it the build failed with `mkdir: cannot create directory
+# '/opt/ms-playwright': Permission denied`, which is the same class as the bug being
+# fixed: a correct step, a wrong identity. `USER` is restored immediately after, so
+# nothing below runs privileged.
+USER 0
+
+# `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` plus `chromium.launch({headless})` and no
+# `executablePath` leaves Playwright with **no browser at all**. `microsoft-webauth`
+# calls it exactly that way and exposes no knob, so the image has to put the system
+# Chromium where Playwright will look for it:
+#
+#     browserType.launch: Executable doesn't exist at
+#     /home/node/.cache/ms-playwright/chromium_headless_shell-1243/…/chrome-headless-shell
+#
+# — from a container that was healthy, correctly mounted, correctly addressed, and had
+# a working `/usr/bin/chromium` the whole time.
+#
+# **Both registry paths, because Playwright 1.63's `headless: true` wants the headless
+# shell, not the full browser.** The error above names `chromium_headless_shell-1243`
+# while `chromium.executablePath()` resolves `chromium-1243`. Linking only the latter
+# produces the identical error with a different path in it.
+#
+# **The revision is read from Playwright at build time**, not written here, so a
+# Playwright bump cannot leave this pointing at a directory that no longer exists —
+# which would be the same silent failure one layer in.
+#
+# The probe then *launches and renders*, as the unprivileged user, because Chromium
+# refuses to run as root without `--no-sandbox` and that flag is a control this
+# repository asserts the absence of. A symlink that exists, or even resolves, is not
+# evidence that a browser starts.
+#
+# It is written **into /app**, not /tmp, because `require("playwright")` resolves from
+# the script's own directory. In /tmp it is `MODULE_NOT_FOUND` — which is the probe
+# failing to find the thing it is probing, and reads like Playwright being broken.
+RUN set -eux; \
+    system_chromium="$(command -v chromium)"; \
+    rev="$(node -e 'const {chromium}=require("playwright"); const m=chromium.executablePath().match(/\/([^/]+)\/chrome-linux64\/[^/]+$/); if(!m) { console.error("could not read the browser revision from", chromium.executablePath()); process.exit(1); } process.stdout.write(m[1]);')"; \
+    mkdir -p \
+      "${PLAYWRIGHT_BROWSERS_PATH}/${rev}/chrome-linux64" \
+      "${PLAYWRIGHT_BROWSERS_PATH}/chromium_headless_shell-${rev#chromium-}/chrome-headless-shell-linux64"; \
+    ln -s "$system_chromium" "${PLAYWRIGHT_BROWSERS_PATH}/${rev}/chrome-linux64/chrome"; \
+    ln -s "$system_chromium" \
+      "${PLAYWRIGHT_BROWSERS_PATH}/chromium_headless_shell-${rev#chromium-}/chrome-headless-shell-linux64/chrome-headless-shell"; \
+    printf '%s\n' "$rev" > "${PLAYWRIGHT_BROWSERS_PATH}/REVISION"; \
+    chown -R 1000:1000 "$PLAYWRIGHT_BROWSERS_PATH"; \
+    printf '%s\n' \
+      'const {chromium}=require("playwright");' \
+      '(async()=>{' \
+      '  const b=await chromium.launch({headless:true});' \
+      '  const p=await b.newPage();' \
+      '  await p.setContent("<title>msout-probe</title>");' \
+      '  const t=await p.title();' \
+      '  const v=await b.version();' \
+      '  await b.close();' \
+      '  if(t!=="msout-probe"){console.error("rendered",JSON.stringify(t));process.exit(1);}' \
+      '  console.log("chromium launched:",v,"rendered:",t);' \
+      '})().catch(e=>{console.error("LAUNCH FAILED:",e.message);process.exit(1);});' \
+      > /app/msout-chromium-probe.cjs; \
+    chown 1000:1000 /app/msout-chromium-probe.cjs; \
+    su -s /bin/sh node -c 'node /app/msout-chromium-probe.cjs'; \
+    rm -f /app/msout-chromium-probe.cjs
+
+USER 1000:1000
+
+# The session and artifact roots, created while this stage is still root and then
+# handed to the unprivileged user. It has to be *here*, before the first
+# `USER 1000` below: a RUN after that line executes unprivileged, which cannot chown anything.
+#
+# Load-bearing, the same way the api's volume ownership is: Docker creates a fresh
+# named volume from the image's directory *and its ownership*, so a path absent
+# from the image yields a root-owned volume that uid 1000 cannot write to.
 
 COPY --from=build /app/dist ./dist
 

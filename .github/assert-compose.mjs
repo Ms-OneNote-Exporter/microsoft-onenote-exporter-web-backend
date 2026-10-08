@@ -254,6 +254,41 @@ check(
     )}. This value is the *source* of a bind mount, so it must resolve on the host; ` +
     `a container path makes Docker create a directory there and every runner exits 1`,
 );
+// The orchestrator must create runners from **the image this stack runs**, not from
+// some other image that happens to share a name.
+//
+// `ORCH_RUNNER_IMAGE` comes from the operator's `RUNNER_IMAGE`, and the `runner`
+// service's `image:` comes from `${IMAGE_TAG:-local}`. Two independent names for one
+// image, and nothing compared them.
+//
+// It cost a whole afternoon of "the rebuild did nothing": the deployment's `.env` had
+//
+//     RUNNER_IMAGE=ghcr.io/ms-onenote-exporter/msout-runner:<sha>     # one "one"
+//
+// while compose builds
+//
+//     ghcr.io/ms-one-note-exporter/msout-runner:<sha>                # two
+//
+// — a hyphen short. Every rebuild succeeded and went to a *different repository*, and
+// the orchestrator went on creating runners from a 15-hour-old image under the wrong
+// name. Nothing failed. `docker images` showed a fresh build, so the only symptom was
+// that the code in the container never changed.
+//
+// The canonical name is the lowercased repository owner, which is what `publish.yml`
+// writes to `REGISTRY_PREFIX`; these lines use that spelling literally.
+const runnerImage = services.runner?.image;
+const orchRunnerImage = services.orchestrator?.environment?.ORCH_RUNNER_IMAGE;
+check(
+  runnerImage !== undefined && runnerImage === orchRunnerImage,
+  `orchestrator creates runners from the image the stack runs (${runnerImage})`,
+  `the runner service runs ${JSON.stringify(runnerImage)} but the orchestrator creates ` +
+    `runners from ${JSON.stringify(orchRunnerImage)}. The two names are set independently ` +
+    `— \`image: \${IMAGE_TAG}\` and the operator's RUNNER_IMAGE — and nothing compared them. ` +
+    `A rebuild then lands in a different repository while the orchestrator keeps using ` +
+    `a stale image, and the only symptom is that the code in the container never changes. ` +
+    `The canonical prefix is the lowercased repository owner, as publish.yml sets it`,
+);
+
 // The orchestrator and the runner must run as the **same uid**, because they share
 // `/srv/msout/data`: the orchestrator creates a session's vault directory, the runner
 // writes `auth.json` and the exported notes into it, and the orchestrator sweeps it.

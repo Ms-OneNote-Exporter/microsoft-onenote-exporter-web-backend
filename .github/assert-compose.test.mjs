@@ -487,6 +487,23 @@ const cases = [
     expectMessage: /orchestrator's secrets are \[/,
   },
   {
+    // A hyphen short. `RUNNER_IMAGE` said `ms-onenote-exporter`, compose builds
+    // `ms-one-note-exporter`, and every rebuild landed in a different repository while
+    // the orchestrator kept creating runners from a 15-hour-old image — with
+    // `docker images` showing a fresh build the whole time.
+    //
+    // This is the one assertion in this file about a value the *operator* supplies,
+    // and it is here because two independent names for one image is the same shape as
+    // every other drift in this PR: a place where nothing checks that two namings mean
+    // the same thing.
+    name: "has the orchestrator create runners from a different image than the stack runs",
+    mutate: (c) => {
+      c.services.orchestrator.environment.ORCH_RUNNER_IMAGE =
+        "ghcr.io/ms-onenote-exporter/msout-runner:0000000";
+    },
+    expectMessage: /image the stack runs|independent/,
+  },
+  {
     // The shipped bug: distroless `nonroot` is 65532 and the runner's `node` is 1000.
     // They share `/srv/msout/data`, so the orchestrator created a session directory
     // the runner could not write to, and every login failed with

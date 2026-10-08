@@ -40,6 +40,8 @@ import { AddressInfo } from "node:net";
 import { Readable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { Db } from "../src/db.js";
+import { hashSecret } from "../src/session.js";
 import { HttpRunnerAdapter, RunnerCallError, unsupportedChallenge } from "../src/runner-adapter-http.js";
 import { SseHub } from "../src/sse.js";
 
@@ -172,12 +174,19 @@ async function fakeRunner(): Promise<FakeRunner> {
  */
 function adapterFor(
   runner: FakeRunner,
-  overrides: { addressFor?: (id: string) => string | null } = {},
+  overrides: {
+    addressFor?: (id: string) => string | null;
+    /** Stand-in for `index.ts`'s `db.setNotebooks` wiring. */
+    onNotebooksListed?: (sessionId: string, names: readonly string[]) => void;
+  } = {},
 ): HttpRunnerAdapter {
   return new HttpRunnerAdapter({
     addressFor: overrides.addressFor ?? (() => runner.aliasUrl),
     token: TOKEN,
     sse: runner.sse,
+    ...(overrides.onNotebooksListed === undefined
+      ? {}
+      : { onNotebooksListed: overrides.onNotebooksListed }),
     timeoutMs: 2_000,
     fetchImpl: (input: string | URL | Request, init?: RequestInit) => {
       const url = new URL(typeof input === "string" ? input : input.toString());
@@ -864,5 +873,186 @@ describe("the notebook list, as published", () => {
     // A real list of none, which the picker can render — as against a shape it
     // cannot read at all, which is what it used to be.
     expect(data).toEqual({ state: "loaded", items: [] });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The notebook list has to survive a status refresh.
+//
+// The shape fix (#38) made the list *readable*. It did not make it **durable**: the
+// names reached the browser only on the event stream, while the client rebuilds its
+// whole state from `GET /api/session/status` — on page load, and again on
+// `login-success`, `session-status`, `auth-state` and `snapshot`. That route read
+// `session.notebook`, one notebook recorded per export, so every refresh replaced three
+// notebooks with `[]` and a reload lost them for good.
+//
+// So these assert the durable half: the names are on the session row, and the REST
+// route — the one the client actually trusts — hands them back.
+
+describe("the notebook list is persisted, not just published", () => {
+  /** The secret the test presents, and the only session it will authenticate. */
+  const SECRET = "S".repeat(43);
+
+  /** A session with no notebooks recorded yet. */
+  function seededDb(): Db {
+    const db = new Db(":memory:");
+    db.createSession({
+      guid: SESSION,
+      // The real hash, because the status route authenticates by comparing the
+      // presented secret against this column. A placeholder would answer 401 and the
+      // test would be asserting on an authorisation failure.
+      secretHash: hashSecret(SECRET),
+      csrfKey: "C".repeat(43),
+      now: Date.now(),
+      expiresAt: Date.now() + 3_600_000,
+    });
+    return db;
+  }
+
+  /** `GET /api/session/status`, read as a client would. */
+  async function statusRoute(db: Db): Promise<Record<string, unknown>> {
+    const { buildServer } = await import("../src/server.js");
+    const { SseHub } = await import("../src/sse.js");
+    const { SESSION_COOKIE } = await import("../src/csrf.js");
+    const { RateLimiter } = await import("../src/rate-limit.js");
+
+    const app = buildServer(
+      {
+        allowedOrigins: new Set(["https://one.example.com"]),
+        csrfKey: "C".repeat(43),
+        sessionTtlHours: 12,
+        minFreeDiskMb: 2048,
+        publicOrigin: "https://one-backend.example.com",
+        orchestratorUrl: "http://orchestrator:9100",
+        orchestratorSecret: "B".repeat(43),
+        orchestratorReplayWindowSeconds: 60,
+        logLevel: "silent",
+        listen: "127.0.0.1:0",
+        databasePath: ":memory:",
+        sseBufferEvents: 10,
+        sseKeepaliveMs: 60_000,
+        runnerToken: "R".repeat(43),
+      } as never,
+      {
+        db,
+        sse: new SseHub({ bufferEvents: 10, keepaliveMs: 60_000 }),
+        limiter: new RateLimiter(),
+        orchestrator: { healthz: async () => ({ ok: true, value: {} }) } as never,
+      } as never,
+    );
+    await app.ready();
+    try {
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/session/status",
+        headers: {
+          origin: "https://one.example.com",
+          cookie: `${SESSION_COOKIE}=${SESSION}:${SECRET}`,
+        },
+      });
+      expect(response.statusCode).toBe(200);
+      return response.json() as Record<string, unknown>;
+    } finally {
+      await app.close();
+    }
+  }
+
+  // **What this does not cover, stated rather than implied:** the adapter's
+  // `onNotebooksListed` option is supplied *here*, so this proves the adapter calls it
+  // and `Db.setNotebooks` stores the names. It does **not** prove `index.ts` wires the
+  // two together — a test cannot, because the adapter is built inside `boot` with a real
+  // fetch and there is no runner to publish an event in a unit test. That link is held
+  // by the type checker (the option name and signature have to match) and by a
+  // deployment. Asserting it here would be a test that cannot fail, which is worse than
+  // the gap it hides.
+  it("writes the names onto the session row when a listing arrives", async () => {
+    const db = new Db(":memory:");
+    db.createSession({
+      guid: SESSION,
+      secretHash: hashSecret("S".repeat(43)),
+      csrfKey: "C".repeat(43),
+      now: Date.now(),
+      expiresAt: Date.now() + 3_600_000,
+    });
+
+    const runner = await fakeRunner();
+    const adapter = adapterFor(runner, {
+      onNotebooksListed: (guid, names) => db.setNotebooks(guid, names),
+    });
+    runner.sseFrames = [
+      `id: 1\ndata: ${JSON.stringify({
+        type: "notebooks-listed",
+        notebooks: [{ name: "Work", url: "x" }, { name: "Personal", url: "y" }],
+      })}\n\n`,
+    ];
+
+    const sub = subscribe(runner.sse);
+    await adapter.listNotebooks(SESSION);
+    await sub.received();
+    adapter.stopAll();
+
+    expect(JSON.parse(db.get<{ notebooks: string }>(
+      `SELECT notebooks FROM sessions WHERE guid = ?`,
+      SESSION,
+    )!.notebooks)).toEqual(["Work", "Personal"]);
+  });
+
+  it("hands them back on the REST route, which is what a refresh reads", async () => {
+    // Through the route, not through a helper. The point of this bug is that the two
+    // routes disagreed; asserting on one of them directly would only re-assert the
+    // helper. The client reads `GET /api/session/status`, so that is what is asked.
+    const db = seededDb();
+    db.setNotebooks(SESSION, ["Work", "Personal", "Research"]);
+
+    const body = await statusRoute(db);
+
+    expect(body.notebooks).toEqual({
+      state: "loaded",
+      items: ["Work", "Personal", "Research"],
+    });
+  });
+
+  it("reports idle before anything has been listed", async () => {
+    const body = await statusRoute(seededDb());
+
+    // An honest empty, which is what the client can render, rather than a shape it
+    // cannot read.
+    expect(body.notebooks).toEqual({ state: "idle", items: [] });
+  });
+
+  it("degrades to the exported notebook when the stored value is unreadable", async () => {
+    const db = seededDb();
+    db.run(`UPDATE sessions SET notebook = 'Work', notebooks = 'not json' WHERE guid = ?`, SESSION);
+
+    // Better than an empty list, which reads as "this account has no notebooks".
+    const body = await statusRoute(db);
+    expect(body.notebooks).toEqual({ state: "loaded", items: ["Work"] });
+  });
+
+  it("replaces rather than accumulating across refreshes", async () => {
+    const db = seededDb();
+    db.setNotebooks(SESSION, ["Work", "Personal"]);
+    db.setNotebooks(SESSION, ["Work", "Personal"]);
+
+    // Two listings of one account are the same list. Merging would double it.
+    const body = await statusRoute(db);
+    expect((body.notebooks as { items: string[] }).items).toEqual(["Work", "Personal"]);
+  });
+
+  it("clears the list when the session is erased", async () => {
+    const db = new Db(":memory:");
+    db.createSession({
+      guid: SESSION,
+      secretHash: "S".repeat(64),
+      csrfKey: "C".repeat(43),
+      now: Date.now(),
+      expiresAt: Date.now() + 3_600_000,
+    });
+    db.setNotebooks(SESSION, ["Work"]);
+    expect(db.deleteSession(SESSION)).toBe(1);
+
+    // The row is gone, so there is nothing left that could name a notebook — which is
+    // the point of `deleteSession` destroying the row at all.
+    expect(db.getSession(SESSION)).toBeUndefined();
   });
 });

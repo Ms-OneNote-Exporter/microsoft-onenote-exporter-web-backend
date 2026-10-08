@@ -74,6 +74,8 @@ export interface SessionRow {
   idle_expires_at: number | null;
   last_activity_at: number;
   notebook: string | null;
+  /** The account's notebook names as a JSON array, or NULL when never listed. */
+  notebooks: string | null;
   /** JSON blob for the restore snapshot; see snapshot.ts for its shape. */
   export_state: string | null;
   artifact_id: string | null;
@@ -107,6 +109,17 @@ CREATE TABLE IF NOT EXISTS sessions (
   idle_expires_at  INTEGER,
   last_activity_at INTEGER NOT NULL,
   notebook         TEXT,
+  -- The account's notebook **names**, as a JSON array, or NULL when never listed.
+  --
+  -- Distinct from the notebook column above, which is one notebook recorded for an
+  -- export. The list lives here because it must survive a status refresh: the api
+  -- publishes this field on the REST route AND on the event stream, and a client that
+  -- rebuilds its state from the REST route would otherwise be handed an empty list the
+  -- moment it looked again. That is not hypothetical - it is what a page reload did.
+  --
+  -- No backticks in this comment: SCHEMA is a template literal, so one here ends the
+  -- string and the statement that follows is a syntax error rather than a comment.
+  notebooks        TEXT,
   export_state     TEXT,
   artifact_id      TEXT,
   artifact_partial INTEGER NOT NULL DEFAULT 0
@@ -172,6 +185,13 @@ export class Db {
     );
     if (columns.length > 0 && !columns.includes("runner_url")) {
       this.#db.exec(`ALTER TABLE runners ADD COLUMN runner_url TEXT`);
+    }
+
+    const sessionColumns = this.all<{ name: string }>(`PRAGMA table_info(sessions)`).map(
+      (row) => row.name,
+    );
+    if (sessionColumns.length > 0 && !sessionColumns.includes("notebooks")) {
+      this.#db.exec(`ALTER TABLE sessions ADD COLUMN notebooks TEXT`);
     }
   }
 
@@ -334,6 +354,26 @@ export class Db {
         guid,
       ) > 0
     );
+  }
+
+  /**
+   * setNotebooks records the account's notebook names on the session.
+   *
+   * Written when the runner reports a listing, so `GET /api/session/status` is the
+   * authority for this field rather than the event stream being the only copy. A
+   * client rebuilds its whole state from that route — on load, and on
+   * `login-success`, `session-status`, `auth-state` and `snapshot` — so a list that
+   * lives only in the stream is a list that disappears on the next refresh, and
+   * permanently on a reload.
+   *
+   * Names are stored, not objects: `POST /api/export` takes a notebook **name**, so a
+   * name is the whole of the identity this route needs to carry.
+   *
+   * Replaces rather than merges. Two listings of one account are the same list, and
+   * merging would accumulate duplicates across refreshes.
+   */
+  setNotebooks(guid: string, names: readonly string[]): void {
+    this.run(`UPDATE sessions SET notebooks = ? WHERE guid = ?`, JSON.stringify(names), guid);
   }
 
   /**

@@ -154,6 +154,13 @@ export async function boot(
     // nothing in the api ever wrote `auth_state = 'valid'`, the only writer was
     // `releaseForIdle` — which also nulls `runner_id` — and so
     // `/api/session/notebooks` required a state no session could be in.
+    onNotebooksListed: (sessionId, names) => {
+      // Recorded so `GET /api/session/status` carries the list too. Without it the
+      // list exists only in the event stream, and the client's status refresh - which
+      // happens on load, and on login-success, session-status, auth-state and snapshot
+      // - replaces three notebooks with an empty array.
+      db.setNotebooks(sessionId, names);
+    },
     onAuthOutcome: (sessionId, outcome) => {
       const now = Date.now();
       const changed =

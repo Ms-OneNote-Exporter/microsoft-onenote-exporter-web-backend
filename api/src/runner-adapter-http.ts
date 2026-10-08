@@ -142,6 +142,18 @@ export interface HttpRunnerAdapterOptions {
     sessionId: string,
     outcome: "authenticated" | "failed",
   ) => void;
+  /**
+   * Called with the account's notebook names when a listing completes.
+   *
+   * Present for the same reason as `onAuthOutcome`: this module is transport, and
+   * "remember it" is somebody else's job. The names go to the session row because the
+   * api publishes this field on **two** routes, and a value that exists on only one of
+   * them is a value that disappears the next time the client reads the other.
+   *
+   * Optional, for the same reason: a caller with no store to write to does not have to
+   * supply one.
+   */
+  readonly onNotebooksListed?: (sessionId: string, names: readonly string[]) => void;
   /** Per-request timeout. Logins and exports return immediately, so this is short. */
   readonly timeoutMs?: number;
   /** Injected for tests. */
@@ -190,6 +202,9 @@ export class HttpRunnerAdapter implements RunnerAdapter {
   readonly #onAuthOutcome:
     | ((sessionId: string, outcome: "authenticated" | "failed") => void)
     | undefined;
+  readonly #onNotebooksListed:
+    | ((sessionId: string, names: readonly string[]) => void)
+    | undefined;
   readonly #timeoutMs: number;
   readonly #fetch: typeof fetch;
   /** One event stream per session, so a reconnect does not double-deliver. */
@@ -202,6 +217,7 @@ export class HttpRunnerAdapter implements RunnerAdapter {
     this.#token = options.token;
     this.#sse = options.sse;
     this.#onAuthOutcome = options.onAuthOutcome;
+    this.#onNotebooksListed = options.onNotebooksListed;
     this.#timeoutMs = options.timeoutMs ?? 15_000;
     this.#fetch = options.fetchImpl ?? fetch;
   }
@@ -617,7 +633,7 @@ export class HttpRunnerAdapter implements RunnerAdapter {
       return;
     }
 
-    const published = publish(this.#sse, sessionId, raw, this.#onAuthOutcome);
+    const published = publish(this.#sse, sessionId, raw, this.#onAuthOutcome, this.#onNotebooksListed);
     if (published === "challenge-code") {
       // Reported, not silently dropped and not silently accepted. See the header:
       // there is no route to answer a typed code and pretending otherwise would
@@ -658,6 +674,7 @@ function publish(
   sessionId: string,
   raw: Record<string, unknown>,
   onAuthOutcome?: (sessionId: string, outcome: "authenticated" | "failed") => void,
+  onNotebooksListed?: (sessionId: string, names: readonly string[]) => void,
 ): "published" | "dropped" | "challenge-code" {
   const str = (key: string): string => (typeof raw[key] === "string" ? (raw[key] as string) : "");
   const num = (key: string): number =>
@@ -744,6 +761,7 @@ function publish(
         if (name !== "") items.push(name);
       }
       sse.emit(sessionId, "notebooks-listed", { state: "loaded", items });
+      onNotebooksListed?.(sessionId, items);
       return "published";
     }
 

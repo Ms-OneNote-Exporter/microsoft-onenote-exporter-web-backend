@@ -376,7 +376,7 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
     const snapshot = buildSnapshot(
       session,
       now(),
-      { state: "idle", items: notebooksFor(session) },
+      notebooksField(session),
       config.publicOrigin,
     );
 
@@ -486,7 +486,7 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
         buildSnapshot(
           session,
           now(),
-          { state: "idle", items: notebooksFor(session) },
+          notebooksField(session),
           config.publicOrigin,
         ),
         attached.hub.nextId,
@@ -1099,9 +1099,53 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
 
 /** notebooksFor reads the notebook list stored on the session, if any. */
 function notebooksFor(session: SessionRow): string[] {
+  // The account's notebook names, recorded when the runner reported a listing.
+  //
+  // This used to fall back to `session.notebook` - one notebook, recorded per export -
+  // so the snapshot advertised a list that was empty until an export had happened, and
+  // held one element afterwards. The client's whole state is rebuilt from this route,
+  // so a list that only existed on the event stream was a list that vanished on the
+  // next refresh and, on a reload, for good.
+  if (session.notebooks !== null) {
+    const parsed = parseNotebookNames(session.notebooks);
+    if (parsed !== null) return parsed;
+  }
+  // A session exported before this column existed, or one written by something that
+  // did not parse. Falling back keeps such a session showing the notebook it exported
+  // rather than nothing, which is strictly better than an empty list.
   if (session.notebook === null) return [];
-  // One notebook is recorded per export; the full list arrives over SSE and is
-  // not persisted here yet. Returning an array keeps the snapshot's shape stable
-  // so the client's `items` is never null.
   return session.notebook === "" ? [] : [session.notebook];
+}
+
+/**
+ * notebooksField is the snapshot's `notebooks` object.
+ *
+ * `loaded` once a listing has been recorded, `idle` before that, which is what the
+ * client's picker branches on. It used to say `idle` unconditionally, so a session with
+ * three notebooks in hand reported an idle list - and the client, which treats an idle
+ * list as "nothing to show", would have rendered nothing even once the shape was fixed.
+ * The two bugs hid each other: the wrong shape made the list unreadable, and this would
+ * have made it unreadable a second way.
+ */
+function notebooksField(session: SessionRow): { state: "idle" | "loaded"; items: string[] } {
+  const items = notebooksFor(session);
+  return { state: session.notebooks === null || items.length === 0 ? "idle" : "loaded", items };
+}
+
+/**
+ * parseNotebookNames reads the stored JSON array.
+ *
+ * Returns null for anything that is not an array of strings, so a corrupt or
+ * hand-edited value degrades to the fallback above instead of surfacing as an empty
+ * list that looks like "this account has no notebooks".
+ */
+function parseNotebookNames(stored: string): string[] | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stored);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed)) return null;
+  return parsed.filter((n): n is string => typeof n === "string");
 }

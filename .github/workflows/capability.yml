@@ -242,11 +242,23 @@ jobs:
           filled=""
           for _ in $(seq 1 24); do
             sleep 5
-            # Filtered on `msout.slot.id`, which only the orchestrator sets. Filtering
-            # on `msout.role=runner` would also match the Compose dev runner, and
-            # asserting on *that* would pass while the path under test never ran —
-            # which is the failure this step exists to end.
-            cid=$(docker ps -q --filter "label=msout.slot.id" || true)
+            # Filtered on `msout.slot.id`, which only the orchestrator sets, and
+            # `head -1` because the pool holds more than one. Without it `docker ps -q`
+            # emits one id per line, the variable becomes a two-line string, and
+            # `docker inspect` reads it as one malformed argument:
+            #
+            #     orchestrator-created runner: 51510ae2b0ad
+            #     06cc06842739
+            #     Error: No such object: 51510ae2b0ad
+            #     06cc06842739
+            #
+            # Which is what happened on the first run of this step — *after* it had
+            # already done the thing it exists to check, and reported the runner id.
+            #
+            # Filtering on `msout.role=runner` instead would also match the Compose dev
+            # runner, and asserting on *that* would pass while the path under test never
+            # ran — the failure this step was added to end.
+            cid=$(docker ps -q --filter "label=msout.slot.id" | head -1 || true)
             if [ -n "$cid" ]; then filled="$cid"; break; fi
           done
           if [ -z "$filled" ]; then

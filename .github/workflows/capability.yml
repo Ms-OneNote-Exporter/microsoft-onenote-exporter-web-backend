@@ -175,6 +175,35 @@ jobs:
           docker network create --driver bridge msout-runner
           docker network inspect msout-runner --format '{{.Name}} {{.Driver}}'
 
+      - name: provision the orchestrator's storage roots
+        # A deployment step, and the reason this file needs one.
+        #
+        # `VAULT_HOST_DIR` and `ARTIFACT_HOST_DIR` are bind-mount sources, so Docker
+        # creates them on the host **owned by root** if they are missing — and the
+        # orchestrator runs as uid 65532. Its boot check then refuses to start with
+        # this exact `install -d` in the message, which is the intended behaviour:
+        # without this step the first `up` below fails with the orchestrator
+        # unhealthy, and the reason is three steps of output away.
+        #
+        # The boot check is not asserted here — it is asserted on a *real* host, and
+        # asserting it here would mean asserting that this step is missing.
+        run: |
+          set -euo pipefail
+          # sudo because a GitHub runner is not root and `/srv` is: a deploy operator
+          # is. The directory ends up owned by the orchestrator's uid either way,
+          # which is the part that matters — and which is the part the first
+          # attempt at this step got wrong by running unprivileged and failing with
+          # `install: cannot create directory '/srv/msout': Permission denied`.
+          for d in "$VAULT_HOST_DIR" "$ARTIFACT_HOST_DIR"; do
+            sudo install -d -o 65532 -g 65532 "$d"
+          done
+          ls -ldn "$VAULT_HOST_DIR" "$ARTIFACT_HOST_DIR"
+
+      - name: up
+        run: docker compose up -d --wait
+        # --wait honours the healthchecks, so a failure here is a real startup
+        # failure rather than a race.
+
       - name: the orchestrator fills its own pool
         # **This is the path CI could not see.** Every other assertion in this file
         # exercises a container Compose created. This one asserts that the
@@ -187,16 +216,27 @@ jobs:
         # asked the orchestrator to make a container.
         run: |
           set -euo pipefail
-          must() { docker compose exec -T orchestrator true </dev/null || {
-            echo "FAIL: orchestrator is not running; this assertion would pass vacuously"; exit 1;
-          }; }
-          must
+          # `docker compose exec orchestrator true` does not work and cannot: the
+          # orchestrator image is distroless — no shell, no `true` binary. The first
+          # version of this step used exactly that, so its preflight was asking
+          # "is there a container" by trying to run a program inside one. Same check
+          # the file's own preflight below uses.
+          ocid=$(docker compose ps -q orchestrator)
+          if [ -z "$ocid" ] || [ "$(docker inspect -f '{{.State.Status}}' "$ocid")" != "running" ]; then
+            echo "FAIL: the orchestrator is not running; every assertion below would pass vacuously"
+            docker compose ps
+            exit 1
+          fi
 
           echo "waiting for the orchestrator to fill a slot..."
           filled=""
           for _ in $(seq 1 24); do
             sleep 5
-            cid=$(docker ps -q --filter "label=msout.role=runner" || true)
+            # Filtered on `msout.slot.id`, which only the orchestrator sets. Filtering
+            # on `msout.role=runner` would also match the Compose dev runner, and
+            # asserting on *that* would pass while the path under test never ran —
+            # which is the failure this step exists to end.
+            cid=$(docker ps -q --filter "label=msout.slot.id" || true)
             if [ -n "$cid" ]; then filled="$cid"; break; fi
           done
           if [ -z "$filled" ]; then
@@ -234,35 +274,6 @@ jobs:
           fi
           docker inspect -f '{{json .HostConfig.Tmpfs}}' "$filled"
           echo "the orchestrator can create a runner"
-
-      - name: provision the orchestrator's storage roots
-        # A deployment step, and the reason this file needs one.
-        #
-        # `VAULT_HOST_DIR` and `ARTIFACT_HOST_DIR` are bind-mount sources, so Docker
-        # creates them on the host **owned by root** if they are missing — and the
-        # orchestrator runs as uid 65532. Its boot check then refuses to start with
-        # this exact `install -d` in the message, which is the intended behaviour:
-        # without this step the first `up` below fails with the orchestrator
-        # unhealthy, and the reason is three steps of output away.
-        #
-        # The boot check is not asserted here — it is asserted on a *real* host, and
-        # asserting it here would mean asserting that this step is missing.
-        run: |
-          set -euo pipefail
-          # sudo because a GitHub runner is not root and `/srv` is: a deploy operator
-          # is. The directory ends up owned by the orchestrator's uid either way,
-          # which is the part that matters — and which is the part the first
-          # attempt at this step got wrong by running unprivileged and failing with
-          # `install: cannot create directory '/srv/msout': Permission denied`.
-          for d in "$VAULT_HOST_DIR" "$ARTIFACT_HOST_DIR"; do
-            sudo install -d -o 65532 -g 65532 "$d"
-          done
-          ls -ldn "$VAULT_HOST_DIR" "$ARTIFACT_HOST_DIR"
-
-      - name: up
-        run: docker compose up -d --wait
-        # --wait honours the healthchecks, so a failure here is a real startup
-        # failure rather than a race.
 
       - name: preflight — every service is actually running
         # Added after a first run of this file on the real VPS, where the capability

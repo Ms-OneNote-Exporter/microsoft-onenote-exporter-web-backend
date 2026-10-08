@@ -68,6 +68,10 @@ jobs:
       # match `assert-compose.test.mjs`, which asserts against the same values.
       VAULT_HOST_DIR: /srv/msout/vault-host
       ARTIFACT_HOST_DIR: /srv/msout/artifacts-host
+      # Absolute, because compose resolves a `secrets:` `file:` to an absolute path
+      # but leaves an environment value verbatim — so a relative value gives the
+      # orchestrator a relative bind source, which it refuses to start with.
+      SECRETS_DIR: ${{ github.workspace }}/secrets
     steps:
       - uses: actions/checkout@v4
 
@@ -122,17 +126,20 @@ jobs:
         # tested, not any particular value.
         run: |
           set -euo pipefail
-          mkdir -p secrets
-          chmod 700 secrets
+          # $SECRETS_DIR, not a bare ./secrets: the variable is what compose reads,
+          # and pointing it somewhere other than where the files land is precisely
+          # the mismatch this suite exists to catch.
+          mkdir -p "$SECRETS_DIR"
+          chmod 700 "$SECRETS_DIR"
           umask 077
           for f in csrf_key orchestrator_hmac_secret runner_token; do
-            head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n' | cut -c1-43 > "secrets/$f"
-            chmod 0444 "secrets/$f"
+            head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n' | cut -c1-43 > "$SECRETS_DIR/$f"
+            chmod 0444 "$SECRETS_DIR/$f"
           done
           # 0444 inside a 0700 directory, matching the deployment: compose bind-mounts
           # secret files as-is and cannot set uid/gid outside swarm, so a 0400
           # root-owned file would be unreadable by a container running as another uid.
-          echo "generated $(ls secrets | wc -l) throwaway secret files"
+          echo "generated $(ls "$SECRETS_DIR" | wc -l) throwaway secret files in $SECRETS_DIR"
 
       - name: build
         run: docker compose build
@@ -829,4 +836,4 @@ jobs:
         if: always()
         run: |
           docker compose --profile runner down -v
-          rm -rf secrets
+          rm -rf "$SECRETS_DIR"

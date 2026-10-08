@@ -252,6 +252,11 @@ jobs:
           # `assert-compose.test.mjs`.
           VAULT_HOST_DIR: /srv/msout/vault-host
           ARTIFACT_HOST_DIR: /srv/msout/artifacts-host
+          # Absolute: compose resolves a `secrets:` `file:` to an absolute path but
+          # leaves environment values verbatim, so a relative value is how
+          # `ORCH_RUNNER_TOKEN_FILE` became a relative bind source. `config` does not
+          # read the files, so the directory need not exist here.
+          SECRETS_DIR: /srv/msout/secrets
         run: docker compose --profile runner -f docker-compose.yml config --quiet
 
       - name: the required host name is genuinely required
@@ -269,6 +274,11 @@ jobs:
           # values match `capability.yml` and `assert-compose.test.mjs`.
           VAULT_HOST_DIR: /srv/msout/vault-host
           ARTIFACT_HOST_DIR: /srv/msout/artifacts-host
+          # Absolute: compose resolves a `secrets:` `file:` to an absolute path but
+          # leaves environment values verbatim, so a relative value is how
+          # `ORCH_RUNNER_TOKEN_FILE` became a relative bind source. `config` does not
+          # read the files, so the directory need not exist here.
+          SECRETS_DIR: /srv/msout/secrets
           PUBLIC_HOST: ""
         run: |
           if docker compose --profile runner -f docker-compose.yml config --quiet 2>/dev/null; then
@@ -294,6 +304,11 @@ jobs:
           # values match `capability.yml` and `assert-compose.test.mjs`.
           VAULT_HOST_DIR: /srv/msout/vault-host
           ARTIFACT_HOST_DIR: /srv/msout/artifacts-host
+          # Absolute: compose resolves a `secrets:` `file:` to an absolute path but
+          # leaves environment values verbatim, so a relative value is how
+          # `ORCH_RUNNER_TOKEN_FILE` became a relative bind source. `config` does not
+          # read the files, so the directory need not exist here.
+          SECRETS_DIR: /srv/msout/secrets
         run: |
           docker compose --profile runner -f docker-compose.yml config --format json \
             | node .github/assert-compose.mjs
@@ -339,6 +354,11 @@ jobs:
           # values match `capability.yml` and `assert-compose.test.mjs`.
           VAULT_HOST_DIR: /srv/msout/vault-host
           ARTIFACT_HOST_DIR: /srv/msout/artifacts-host
+          # Absolute: compose resolves a `secrets:` `file:` to an absolute path but
+          # leaves environment values verbatim, so a relative value is how
+          # `ORCH_RUNNER_TOKEN_FILE` became a relative bind source. `config` does not
+          # read the files, so the directory need not exist here.
+          SECRETS_DIR: /srv/msout/secrets
         run: node .github/assert-compose.test.mjs
 
       - name: nothing logs a request header

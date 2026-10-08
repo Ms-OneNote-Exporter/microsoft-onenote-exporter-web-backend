@@ -135,9 +135,9 @@ secrets:
   #
   # The files are created by the operator; see .env.example and infra/README.md.
   csrf_key:
-    file: ${SECRETS_DIR:-./secrets}/csrf_key
+    file: ${SECRETS_DIR:?set SECRETS_DIR to an absolute path; see infra/README.md}/csrf_key
   orchestrator_hmac_secret:
-    file: ${SECRETS_DIR:-./secrets}/orchestrator_hmac_secret
+    file: ${SECRETS_DIR:?set SECRETS_DIR to an absolute path; see infra/README.md}/orchestrator_hmac_secret
   # The runner's bearer token, so the orchestrator can authenticate to it.
   #
   # Not a session credential: it authorises the orchestrator to *start* work in a
@@ -145,7 +145,7 @@ secrets:
   # than an environment variable for the same reason as the other two — an env var
   # is visible in `docker inspect` to anything that can read the container config.
   runner_token:
-    file: ${SECRETS_DIR:-./secrets}/runner_token
+    file: ${SECRETS_DIR:?set SECRETS_DIR to an absolute path; see infra/README.md}/runner_token
 
 # ---- services ---------------------------------------------------------------
 
@@ -370,7 +370,7 @@ services:
       # below reads, and `RUNNER_TOKEN_HOST_FILE` overrides it for a deployment that
       # keeps them elsewhere. `assert-compose.mjs` requires the two to agree, which
       # is what makes this stick.
-      ORCH_RUNNER_TOKEN_FILE: ${RUNNER_TOKEN_HOST_FILE:-${SECRETS_DIR:-./secrets}/runner_token}
+      ORCH_RUNNER_TOKEN_FILE: ${RUNNER_TOKEN_HOST_FILE:-${SECRETS_DIR:?set SECRETS_DIR to an absolute path; see infra/README.md}/runner_token}
 
       # The two bind-mount *sources*, and the reason they are absolute host paths
       # rather than the `/srv/msout/...` defaults they used to have.

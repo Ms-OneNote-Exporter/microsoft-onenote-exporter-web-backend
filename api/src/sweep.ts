@@ -61,6 +61,15 @@ export interface SweepReport {
   loginExpired: number;
   /** Sessions left for the erase machine because they were mid-erase. */
   skippedErasing: number;
+  /**
+   * Exports whose runner was **kept** despite the session's idle deadline having passed.
+   *
+   * Counted rather than merely skipped, because "a session went idle" and "an export is
+   * still running" look identical from the outside and were being conflated. A non-zero
+   * value here is the sweeper declining to do something destructive, and it is the number
+   * to look at when an export is slow.
+   */
+  exportsHeld: number;
 }
 
 /** Options for the sweeper. */
@@ -542,6 +551,7 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
     unclaimedExpired: 0,
     loginExpired: 0,
     skippedErasing: 0,
+    exportsHeld: 0,
   };
 
   // Learn the pool's current membership, not just its size.
@@ -620,8 +630,41 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
       continue;
     }
 
-    // Idle. 30 minutes, and only when the idle deadline has been set — an export
-    // in flight has none.
+    // **A running export is not an idle session.**
+    //
+    // This guard is what stands between a long export and having its runner taken away
+    // underneath it, and it is checked explicitly because the field it used to rely on
+    // cannot do the job. That version was:
+    //
+    //     // …only when the idle deadline has been set — an export in flight has none.
+    //     if (session.idle_expires_at !== null && session.idle_expires_at <= now) { … }
+    //
+    // It assumed an exporting session has no `idle_expires_at`. It does, and always has:
+    // `touchSession` writes `idle_expires_at = COALESCE(?, idle_expires_at)`, so passing
+    // null **cannot clear it** — a deadline set once survives for the session's whole
+    // life. So a session that had been idle before starting an export carried a deadline
+    // straight through it, and 30 minutes later the sweeper released the runner mid-run.
+    //
+    // Observed on the deployed host: an export accepted at 13:20 was still `running` at
+    // 13:39, its container had been replaced, and the slot had been claimed by another
+    // session. The export was not slow; it was dispossessed.
+    //
+    // An export produces no HTTP traffic for minutes — that is what it is — so idleness
+    // is the *expected* state of one, and cannot be evidence that nobody wants it.
+    //
+    // The backstop is not lost: `TTL.absolute` still erases the session, and the runner's
+    // own export timeout ends the work. This only stops the pool reclaiming a slot that
+    // is in use.
+    if (session.state === "exporting") {
+      report.exportsHeld++;
+      log.info("export in flight; holding its runner", {
+        session: session.guid,
+        idleExpiredAgo: now - (session.idle_expires_at ?? now),
+      });
+      continue;
+    }
+
+    // Idle, and only when a deadline was set at all.
     if (session.idle_expires_at !== null && session.idle_expires_at <= now) {
       if (await binder.releaseForIdle(session)) {
         report.idleReleased++;

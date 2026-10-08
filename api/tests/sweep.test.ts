@@ -630,6 +630,16 @@ describe("sweep", () => {
   });
 
   // §2.1: an export gets no idle kill.
+  //
+  // **This test could not fail.** It called `run()` with no release stub, and
+  // `orchestratorStub`'s `/release` only answers when it is asked to — so
+  // `idleReleased`, the only thing it asserted, could not increment whether or not the
+  // sweeper released the runner. A release was attempted and failed to reach anything;
+  // the test read that as "no release happened". In production the release *succeeds*,
+  // and the runner goes.
+  //
+  // It is now given a working release, which is the state it was always describing, and
+  // it asserts the row as well as the counter.
   it("leaves an exporting session alone however long it runs", async () => {
     seedRunners(1);
     seedSession(GUID, {
@@ -637,9 +647,64 @@ describe("sweep", () => {
       runner_id: "slot-1",
       idle_expires_at: now - TTL.authenticatedIdle - 1,
     });
-    const report = await run();
+
+    // `release: "ok"` — so a release, if attempted, would actually happen.
+    const report = await run({ release: "ok" });
+
     expect(report.idleReleased).toBe(0);
-    expect(db.getSession(GUID)).toBeDefined();
+    // The row is not merely kept; it keeps its **runner**. That is the whole claim, and
+    // the counter alone could not distinguish "declined" from "tried and failed".
+    // Two discriminators, both on the row `releaseForIdle` would have rewritten. The
+    // counter alone cannot tell "declined to release" from "tried and failed".
+    //
+    // (`runners.status` is not one of them: this fixture seeds the row idle while the
+    // session points at it, so asserting on it would be asserting the fixture.)
+    expect(db.getSession(GUID)?.runner_id).toBe("slot-1");
+    // `releaseForIdle` sets `state = 'authenticated'`; an export must not be demoted.
+    expect(db.getSession(GUID)?.state).toBe("exporting");
+  });
+
+  it("counts the export it held, so a slow export is visible", async () => {
+    seedRunners(1);
+    seedSession(GUID, {
+      state: "exporting",
+      runner_id: "slot-1",
+      idle_expires_at: now - TTL.authenticatedIdle - 1,
+    });
+
+    const report = await run({ release: "ok" });
+
+    // "A session went idle" and "an export is still running" are indistinguishable from
+    // outside, and were being conflated. A non-zero count is the sweeper declining to
+    // do something destructive, and is the number to read when an export is slow.
+    expect(report.exportsHeld).toBe(1);
+  });
+
+  // The reason the guard cannot be left to `idle_expires_at` alone.
+  //
+  // `idleExpiresAt()` returns null for an exporting session — §2.1 says an export gets
+  // no idle deadline — and the intent is that the sweeper then has nothing to act on. But
+  // `touchSession` writes `idle_expires_at = COALESCE(?, idle_expires_at)`, so that null
+  // is **discarded** and a deadline set while the session was merely authenticated
+  // survives the whole export. A session that idled, then started an export, carried its
+  // old deadline straight through it and lost its runner 30 minutes in.
+  it("cannot clear an idle deadline, which is why the guard is on state", async () => {
+    const db2 = new Db(":memory:");
+    db2.createSession({
+      guid: OTHER,
+      secretHash: "x",
+      csrfKey: "y",
+      now: now - 60_000,
+      expiresAt: now + 3_600_000,
+    });
+    db2.run(`UPDATE sessions SET idle_expires_at = ? WHERE guid = ?`, now + 1000, OTHER);
+
+    // What the export route does: touch with the null that `idleExpiresAt` returns for
+    // an exporting session.
+    db2.touchSession(OTHER, now, null);
+
+    const after = db2.getSession(OTHER);
+    expect(after?.idle_expires_at).toBe(now + 1000);
   });
 
   it("deletes a session past the absolute cap regardless of state", async () => {

@@ -187,7 +187,18 @@ func (d *fakeDaemon) InspectContainer(_ context.Context, id string) (*dockerapi.
 		Names: []string{
 			c.name,
 		},
-		State:  dockerapi.ContainerState{Status: statusOf(c.running), Running: c.running},
+		State: dockerapi.ContainerState{
+			Status:  statusOf(c.running),
+			Running: c.running,
+			// Healthy as soon as it is running, so a create does not have to be
+			// told to become ready. `EnsurePool` waits for this before returning a
+			// claim, and the fakes were written before that wait existed — so they
+			// report it here rather than each test having to.
+			//
+			// The wait's own behaviour is covered directly in readiness_test.go,
+			// where a fake that reports `starting` first is the point.
+			Health: dockerapi.ContainerHealth{Status: "healthy"},
+		},
 		Config: dockerapi.ContainerConfig{Image: c.image, Labels: copyLabels(c.labels)},
 		Labels: copyLabels(c.labels),
 		Mounts: toEngineMounts(c.mounts),

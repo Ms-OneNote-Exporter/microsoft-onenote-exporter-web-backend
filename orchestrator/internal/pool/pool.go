@@ -877,6 +877,30 @@ func (p *Pool) start(ctx context.Context, slot *Slot, sessionGUID string, sessio
 		return fmt.Errorf("start container: %w", err)
 	}
 
+	// Do not hand back a runner that is not yet listening.
+	//
+	// `StartContainer` returns as soon as the Engine accepts the start; the
+	// process inside still has to start and bind its port. Found by attempting a
+	// real login, where the api's credential POST arrived 579ms *before* the
+	// runner's server began listening — so every login failed with a connection
+	// refused that neither side could explain:
+	//
+	//     api      15:53:43.166  502 credential handoff failed
+	//     runner   15:53:43.745  Server listening at http://172.30.0.2:3100
+	//
+	// Waiting here rather than in the api, because the api cannot tell "not ready
+	// yet" from "wrong address": both are a connection failure, and retrying a
+	// credential POST on that basis risks writing half a credential twice. The
+	// orchestrator *can* tell, from the Engine's health state, and it is the
+	// component that owns the container.
+	//
+	// The container is removed on failure so it is not adopted by the next
+	// reconcile as a live runner that never became ready.
+	if err := p.waitReady(ctx, created.ID); err != nil {
+		_ = p.docker.RemoveContainer(ctx, created.ID)
+		return err
+	}
+
 	p.mu.Lock()
 	slot.ContainerID = created.ID
 	slot.CreatedAt = p.now()
@@ -888,6 +912,74 @@ func (p *Pool) start(ctx context.Context, slot *Slot, sessionGUID string, sessio
 	}
 	p.mu.Unlock()
 	return nil
+}
+
+// waitReady blocks until a container's healthcheck reports healthy, or gives up.
+//
+// Bounded, and it gives up for a *reason*:
+//
+//   - a container that stops running is not going to become ready, so it returns
+//     at once with the exit code rather than burning the whole budget
+//   - a container that is unhealthy and **not** improving is returned at once too,
+//     rather than waiting out the retries the healthcheck itself is configured to
+//     allow for
+//
+// The signal is the Engine's own health state rather than a port probe: the
+// orchestrator is deliberately **not** on the runner network (§2.1 — it has no
+// egress and no runner reachability, which is why the api holds the credential
+// path), so it cannot connect to a runner to ask. It can read the healthcheck,
+// because the Engine runs it.
+//
+// `Health.Status` empty means the container declares no healthcheck. That is
+// treated as ready, because the create request always declares one and a container
+// that somehow did not is not this function's to second-guess — but it is not
+// treated as *healthy*, so the two cannot be confused in a log line.
+func (p *Pool) waitReady(ctx context.Context, containerID string) error {
+	deadline := time.Now().Add(p.cfg.RunnerReadyTimeout)
+	// Short interval: the runner is usually ready in well under a second, and the
+	// point of waiting is to shave the login's latency, not to add a fixed cost.
+	const tick = 100 * time.Millisecond
+
+	for {
+		ctr, err := p.docker.InspectContainer(ctx, containerID)
+		if err != nil {
+			return fmt.Errorf("inspect runner: %w", err)
+		}
+
+		if !ctr.State.Running {
+			return fmt.Errorf(
+				"runner exited before it was ready: status=%q exit=%d",
+				ctr.State.Status, ctr.State.ExitCode)
+		}
+
+		switch ctr.State.Health.Status {
+		case "healthy":
+			return nil
+		case "":
+			// No healthcheck declared. See the comment: ready, but not "healthy".
+			return nil
+		case "unhealthy":
+			// The healthcheck's own `Retries` decides what "still starting" means,
+			// so exceeding them means the runner is not coming.
+			if ctr.State.Health.FailingStreak >= p.cfg.RunnerUnhealthyRetries {
+				return fmt.Errorf(
+					"runner never became healthy: %d consecutive failed healthchecks",
+					ctr.State.Health.FailingStreak)
+			}
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf(
+				"runner did not become ready within %s (health %q)",
+				p.cfg.RunnerReadyTimeout, ctr.State.Health.Status)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(tick):
+		}
+	}
 }
 
 // replace removes an old container and puts a fresh one in the slot.

@@ -91,6 +91,23 @@ type ContainerState struct {
 	ExitCode   int    `json:"ExitCode"`
 	StartedAt  string `json:"StartedAt"`
 	FinishedAt string `json:"FinishedAt"`
+	// Health is the healthcheck's verdict. Absent entirely when the container
+	// declares no healthcheck, which is why the caller reads it as a string and
+	// treats "" as "no opinion" rather than as a failure.
+	//
+	// It is what makes "the runner is up" distinguishable from "the runner is
+	// *listening*", which is the difference the claim path needs and could not
+	// previously observe at all.
+	Health ContainerHealth `json:"Health"`
+}
+
+// ContainerHealth is the Engine's record of a container's healthcheck.
+type ContainerHealth struct {
+	Status string `json:"Status"`
+	// FailingStreak is how many consecutive checks failed. It is what turns
+	// "unhealthy" into a bounded wait rather than an immediate give-up: a runner
+	// inside its retries is not yet known to be broken.
+	FailingStreak int `json:"FailingStreak"`
 }
 
 // ContainerConfig carries the image and the labels we reconcile against.

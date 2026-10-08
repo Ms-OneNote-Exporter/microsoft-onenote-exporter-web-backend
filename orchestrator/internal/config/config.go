@@ -120,6 +120,30 @@ type Config struct {
 	// RequestTimeout bounds a single Docker Engine API call.
 	RequestTimeout time.Duration
 
+	// RunnerReadyTimeout bounds how long `claim` waits for a newly started runner
+	// to report healthy before giving up on it.
+	//
+	// It exists because the Engine returns from `start` as soon as it accepts the
+	// start, and the process inside still has to bind its port — measured at ~600ms
+	// on a real host, which was long enough for every credential POST to arrive
+	// first. The claim waits here instead of the api retrying, because the api
+	// cannot distinguish "not ready yet" from "wrong address".
+	//
+	// Must exceed the runner's healthcheck `StartPeriod` plus one `Interval`,
+	// which is what makes `healthy` arrive at all. 45s against 2s + 3s leaves room
+	// for a slow image pull's worth of start-up jitter while still failing inside
+	// the login's patience.
+	RunnerReadyTimeout time.Duration
+
+	// RunnerUnhealthyRetries is how many consecutive failed healthchecks are
+	// treated as "this runner is not coming" rather than "it is still starting".
+	//
+	// It is checked against the create request's own `Retries`, so the two cannot
+	// disagree: the Engine will not mark a container unhealthy before that many
+	// failures anyway, and waiting past it would only be waiting for a verdict the
+	// Engine is not going to give.
+	RunnerUnhealthyRetries int
+
 	// ShutdownGrace is how long in-flight requests get on SIGTERM.
 	ShutdownGrace time.Duration
 }
@@ -179,9 +203,15 @@ func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (*C
 		RunnerTokenFile: envOr(getenv, "ORCH_RUNNER_TOKEN_FILE", "/run/secrets/runner_token"),
 		PoolSize:        4,
 		RunnerTTL:       5 * time.Minute,
-		SlotIdleTimeout: 30 * time.Minute,
-		RequestTimeout:  15 * time.Second,
-		ShutdownGrace:   20 * time.Second,
+		// Not configurable: these are two halves of one agreement with the create
+		// request, and a value an operator could set to something smaller than the
+		// healthcheck's own cadence would turn "did not become ready" into "was not
+		// given time to become ready". See the fields.
+		RunnerReadyTimeout:     45 * time.Second,
+		RunnerUnhealthyRetries: 3,
+		SlotIdleTimeout:        30 * time.Minute,
+		RequestTimeout:         15 * time.Second,
+		ShutdownGrace:          20 * time.Second,
 	}
 
 	secretFile := strings.TrimSpace(getenv("ORCH_HMAC_SECRET_FILE"))

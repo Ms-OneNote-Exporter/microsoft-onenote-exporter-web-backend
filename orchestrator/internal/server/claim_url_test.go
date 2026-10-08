@@ -174,8 +174,26 @@ func (d *claimDaemon) StopContainer(_ context.Context, _ string, _ int) error { 
 
 func (d *claimDaemon) RemoveContainer(_ context.Context, _ string) error { return nil }
 
-func (d *claimDaemon) InspectContainer(_ context.Context, _ string) (*dockerapi.Container, error) {
-	return nil, &dockerapi.EngineError{Status: 404, Message: "no such container"}
+// InspectContainer reports the container as running and healthy.
+//
+// It has to, because `claim` waits for a newly started runner to report healthy
+// before it returns an address — the wait that stopped a credential POST from
+// arriving before the runner was listening. This fake returned 404 for every
+// inspect, which is a faithful answer about a container that does not exist and a
+// useless one about the one the fake just "created"; the claim-path tests started
+// failing with `inspect runner: 404 no such container` the moment the wait existed.
+func (d *claimDaemon) InspectContainer(_ context.Context, id string) (*dockerapi.Container, error) {
+	if id == "" {
+		return nil, &dockerapi.EngineError{Status: 404, Message: "no such container"}
+	}
+	return &dockerapi.Container{
+		ID: id,
+		State: dockerapi.ContainerState{
+			Status:  "running",
+			Running: true,
+			Health:  dockerapi.ContainerHealth{Status: "healthy"},
+		},
+	}, nil
 }
 
 func (d *claimDaemon) ListContainersByLabel(_ context.Context, _ string) ([]string, error) {

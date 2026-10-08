@@ -144,6 +144,25 @@ jobs:
       - name: build
         run: docker compose build
 
+      - name: provision the orchestrator's storage roots
+        # A deployment step, and the reason this file needs one.
+        #
+        # `VAULT_HOST_DIR` and `ARTIFACT_HOST_DIR` are bind-mount sources, so Docker
+        # creates them on the host **owned by root** if they are missing — and the
+        # orchestrator runs as uid 65532. Its boot check then refuses to start with
+        # this exact `install -d` in the message, which is the intended behaviour:
+        # without this step the first `up` below fails with the orchestrator
+        # unhealthy, and the reason is three steps of output away.
+        #
+        # The boot check is not asserted here — it is asserted on a *real* host, and
+        # asserting it here would mean asserting that this step is missing.
+        run: |
+          set -euo pipefail
+          for d in "$VAULT_HOST_DIR" "$ARTIFACT_HOST_DIR"; do
+            install -d -o 65532 -g 65532 "$d"
+          done
+          ls -ldn "$VAULT_HOST_DIR" "$ARTIFACT_HOST_DIR"
+
       - name: up
         run: docker compose up -d --wait
         # --wait honours the healthchecks, so a failure here is a real startup

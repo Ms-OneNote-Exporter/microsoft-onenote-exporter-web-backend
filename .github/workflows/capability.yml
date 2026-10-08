@@ -158,8 +158,13 @@ jobs:
         # asserting it here would mean asserting that this step is missing.
         run: |
           set -euo pipefail
+          # sudo because a GitHub runner is not root and `/srv` is: a deploy operator
+          # is. The directory ends up owned by the orchestrator's uid either way,
+          # which is the part that matters — and which is the part the first
+          # attempt at this step got wrong by running unprivileged and failing with
+          # `install: cannot create directory '/srv/msout': Permission denied`.
           for d in "$VAULT_HOST_DIR" "$ARTIFACT_HOST_DIR"; do
-            install -d -o 65532 -g 65532 "$d"
+            sudo install -d -o 65532 -g 65532 "$d"
           done
           ls -ldn "$VAULT_HOST_DIR" "$ARTIFACT_HOST_DIR"
 

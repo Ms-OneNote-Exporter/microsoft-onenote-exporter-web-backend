@@ -32,6 +32,17 @@ export interface ApiConfig {
   readonly sessionTtlHours: number;
   /** Refuse to start an export below this much free disk. */
   readonly minFreeDiskMb: number;
+  /**
+   * Proxies whose `X-Forwarded-For` may be believed.
+   *
+   * Empty means "believe none", and behind a reverse proxy that silently turns a
+   * per-user rate limit into a **global** one: every caller is counted against the
+   * proxy's address. This was the deployed state on a live host — 3 sessions an hour
+   * for everyone on the internet, because `knownProxies` had no way to be set at all.
+   *
+   * So a deployment behind a proxy must name it. See `parseTrustedProxies`.
+   */
+  readonly trustedProxies: ProxyMatcher;
   /** Base URL of the orchestrator. Internal only. */
   readonly orchestratorUrl: string;
   /** HMAC secret for signed internal calls. */
@@ -396,6 +407,10 @@ function positiveInt(
 
 /** loadConfig validates the whole environment and returns the result. */
 import { readFileSync } from "node:fs";
+
+import { parseTrustedProxies } from "./client-ip.js";
+import type { ProxyMatcher } from "./client-ip.js";
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
   const level = (env.LOG_LEVEL?.trim() || "info") as ApiConfig["logLevel"];
   if (!["debug", "info", "warn", "error"].includes(level)) {
@@ -407,6 +422,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
     csrfKey: validateSecret(readSecret(env, "CSRF_KEY")),
     sessionTtlHours: positiveInt(env, "SESSION_TTL_HOURS", 12),
     minFreeDiskMb: positiveInt(env, "MIN_FREE_DISK_MB", 2048),
+    trustedProxies: parseTrustedProxies(env.API_TRUSTED_PROXIES),
     orchestratorUrl: validateInternalOrigin(env.ORCHESTRATOR_URL),
     orchestratorSecret: validateSecret(
       readSecret(env, "ORCHESTRATOR_HMAC_SECRET"),

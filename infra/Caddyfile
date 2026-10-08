@@ -150,8 +150,16 @@
 			flush_interval -1
 
 			# The client's address, so the rate limiter counts per user rather than
-			# per proxy hop. Trusted by the api only because it is set here and the
-			# api's port is on an internal network; PLAN-v3 §3.5.
+			# per proxy hop. PLAN-v3 §3.5.
+			#
+			# Setting it here is **necessary and not sufficient**: the api believes a
+			# forwarded header only from a peer named in `API_TRUSTED_PROXIES`, and
+			# that variable is required in compose. This comment used to say the api
+			# trusted the header "because it is set here and the api's port is on an
+			# internal network", which described a trust relationship no code had —
+			# so every caller was counted as Caddy, at three sessions an hour for the
+			# whole internet, until the variable existed. A comment asserting a
+			# control is not a control.
 			header_up X-Forwarded-For {remote_host}
 			header_up X-Forwarded-Proto {scheme}
 			header_up X-Forwarded-Host {host}

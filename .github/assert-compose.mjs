@@ -622,7 +622,45 @@ for (const key of [
   );
 }
 
-// 6. Secrets arrive as file paths, never as values.
+// 6. The api is told which proxies it may believe.
+//
+// This exists because the value could not be set at all before, and the empty
+// default behind a reverse proxy is not a safe default - it is a **global** rate
+// limit. Observed on the live host: Caddy at 172.24.0.4 was the only address the
+// limiter ever saw, so three sessions an hour were shared by every caller on the
+// internet, and every request logged `"remoteAddress":"172.24.0.4"`.
+//
+// These assertions read the **rendered** config, so they see the substituted value
+// and not the `${API_TRUSTED_PROXIES:?...}` expression. That the expression *refuses*
+// when unset is checked separately by running `config --quiet` without it - see
+// `assert-compose.test.mjs`, because a rendered value cannot show whether a default
+// exists behind it.
+const trustedProxies = String(services.api?.environment?.API_TRUSTED_PROXIES ?? "");
+check(
+  trustedProxies !== "",
+  "api declares API_TRUSTED_PROXIES",
+  "api does not set API_TRUSTED_PROXIES; every caller will be rate-limited as the proxy",
+);
+check(
+  trustedProxies.includes("/"),
+  `api's API_TRUSTED_PROXIES is a network (${trustedProxies})`,
+  `api's API_TRUSTED_PROXIES is "${trustedProxies}", a single address; it expires on ` +
+    `the next recreate and then silently becomes a global limit again`,
+);
+
+// There is deliberately **no** assertion here that the trusted network is one Caddy is
+// actually on. It cannot be made from the file: Docker assigns subnets at `network
+// create`, so `msout_msout-control` is `172.24.0.0/16` on one host and something else on
+// the next. A check written against a literal subnet would pass here and be wrong
+// elsewhere, which is the same failure as the `RUNNER_IMAGE` repository-name one.
+//
+// So it is checked where it can honestly be: `API_TRUSTED_PROXIES` uses `${VAR:?}` and
+// therefore refuses to render unset (asserted by running `config --quiet` without it, in
+// `assert-compose.test.mjs`), and `.env.example` gives the `docker network inspect`
+// command that finds the right value. What the api then does with it is visible in the
+// api log, which records the address and source whenever a limit is charged.
+
+// 7. Secrets arrive as file paths, never as values.
 //
 // An env var is visible in `docker inspect`, in `/proc/<pid>/environ`, and to
 // anything that can read the container's config. The value must never appear in
@@ -672,7 +710,7 @@ for (const svc of Object.keys(services)) {
   }
 }
 
-// 7. Each service names the secret variable its own code actually reads.
+// 8. Each service names the secret variable its own code actually reads.
 //
 // Both components read the same file under different variable names: the api uses
 // ORCHESTRATOR_HMAC_SECRET_FILE, the orchestrator uses ORCH_HMAC_SECRET_FILE. The
@@ -702,7 +740,7 @@ for (const [svc, expected] of Object.entries(SECRET_VAR_BY_SERVICE)) {
   );
 }
 
-// 8. Every variable given to the orchestrator is one it actually reads.
+// 9. Every variable given to the orchestrator is one it actually reads.
 //
 // Found on the first deploy: compose passed POOL_SIZE and RUNNER_TTL_SECONDS, and
 // the orchestrator reads ORCH_POOL_SIZE and has no runner-TTL variable at all. Both
@@ -745,7 +783,7 @@ for (const key of Object.keys(orchEnv)) {
   );
 }
 
-// 9. The api image is stamped with the commit it was built from.
+// 10. The api image is stamped with the commit it was built from.
 //
 // mac's point: `build` on /api/public/version read "dev" on a live deployment with
 // a real certificate. It was harmless only because nothing consumed it, which is

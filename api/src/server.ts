@@ -30,6 +30,7 @@ import Fastify, {
   type FastifyInstance,
   type FastifyReply,
   type FastifyRequest,
+  type FastifyServerOptions,
 } from "fastify";
 import type { Readable } from "node:stream";
 
@@ -59,7 +60,8 @@ import {
   checkFraming,
   contentTypeIsAcceptable,
 } from "./credential.js";
-import { resolveClientAddress } from "./client-ip.js";
+import { NO_PROXIES, resolveClientAddress } from "./client-ip.js";
+import type { ProxyMatcher } from "./client-ip.js";
 
 /**
  * installRawBodyParser removes every body parser and installs one that
@@ -238,8 +240,16 @@ export interface BuildServerOptions {
    * Addresses permitted to supply X-Forwarded-For. Empty means "no proxy", which
    * is the fail-closed default: every request resolves to its socket peer.
    */
-  readonly knownProxies?: ReadonlySet<string>;
-  readonly logger?: boolean;
+  readonly knownProxies?: ProxyMatcher;
+  /**
+   * Fastify's logger. `false` is the default, and `true` is what the entrypoint uses.
+   *
+   * A full logger configuration is accepted as well, because a test that wants to
+   * assert on what was logged has no other way to capture it — and "the limit is
+   * charged to the proxy, and the log says so" is exactly the kind of claim that
+   * needs a test rather than a code read.
+   */
+  readonly logger?: FastifyServerOptions["logger"];
 }
 
 /** buildServer constructs the api. */
@@ -264,8 +274,15 @@ export function buildServer(
     orchestrator: deps.orchestrator,
     sse: deps.sse,
     limiter: deps.limiter,
+    // **Always** resolved, never only when the option is present.
+    //
+    // This was `if (options.knownProxies !== undefined)`, which meant a config
+    // carrying the trust list and no option built a server whose routes fell back to
+    // `NO_PROXIES` — the deployed bug, reproduced in a test, in the same file that
+    // resolves it correctly for its own inline routes. Two wires for one value is how
+    // that happened; this is the single one.
+    knownProxies: options.knownProxies ?? config.trustedProxies ?? NO_PROXIES,
   };
-  if (options.knownProxies !== undefined) routeDeps.knownProxies = options.knownProxies;
   if (deps.eraseRunner !== undefined) routeDeps.eraseRunner = deps.eraseRunner;
   if (deps.runner !== undefined) routeDeps.runner = deps.runner;
   if (deps.poolBinder !== undefined) routeDeps.poolBinder = deps.poolBinder;
@@ -287,7 +304,15 @@ export function baseServer(
   deps: ServerDeps,
   options: BuildServerOptions = {},
 ): FastifyInstance {
-  const knownProxies = options.knownProxies ?? new Set<string>();
+  // Config first, then the option.
+  //
+  // `config.trustedProxies` comes from the environment and is what a deployment sets.
+  // The option exists for tests and for a caller that needs to override. Reading the
+  // config here rather than relying on `index.ts` to pass it down removes the failure
+  // where the two disagree — which is not hypothetical: a server built with a config
+  // carrying the trust list and no option silently ran with `NO_PROXIES`, which is the
+  // exact bug this exists to fix, reproduced in a test.
+  const knownProxies = options.knownProxies ?? config.trustedProxies ?? NO_PROXIES;
 
   const app = Fastify({
     logger: options.logger ?? false,

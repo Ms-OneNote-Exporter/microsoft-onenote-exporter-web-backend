@@ -3,6 +3,8 @@ import {
   hashForLog,
   ipv6Prefix48,
   normalise,
+  NO_PROXIES,
+  parseTrustedProxies,
   rateLimitKeys,
   resolveClientAddress,
 } from "../src/client-ip.js";
@@ -14,7 +16,11 @@ import {
 
 const CADDY = "172.20.0.3";
 const CADDY2 = "172.20.0.4";
-const ONE_PROXY = new Set([CADDY]);
+// A matcher rather than a bare Set, because `knownProxies` is now configuration: it
+// comes from `API_TRUSTED_PROXIES` and may be a CIDR block. A Set could express
+// neither, and reading these as "the shape production uses" is what let a value that
+// had no path from the environment go unnoticed.
+const ONE_PROXY = parseTrustedProxies(CADDY);
 
 describe("resolveClientAddress", () => {
   // T-P1: a forged XFF from an unlisted peer is limited as its real peer.
@@ -46,7 +52,7 @@ describe("resolveClientAddress", () => {
     const result = resolveClientAddress({
       peerAddress: CADDY,
       forwardedFor: "203.0.113.9, 198.51.100.5",
-      knownProxies: new Set([CADDY, CADDY2]),
+      knownProxies: parseTrustedProxies(`${CADDY},${CADDY2}`),
     });
     expect(result.address).toBe("198.51.100.5");
     expect(result.source).toBe("rightmost-forwarded");
@@ -56,7 +62,7 @@ describe("resolveClientAddress", () => {
     const result = resolveClientAddress({
       peerAddress: CADDY,
       forwardedFor: "1.1.1.1, 2.2.2.2, 3.3.3.3",
-      knownProxies: new Set([CADDY, CADDY2, "172.20.0.5"]),
+      knownProxies: parseTrustedProxies(`${CADDY},${CADDY2},172.20.0.5`),
     });
     expect(result.address).not.toBe("1.1.1.1");
     expect(result.address).toBe("3.3.3.3");
@@ -102,7 +108,7 @@ describe("resolveClientAddress", () => {
     const result = resolveClientAddress({
       peerAddress: CADDY,
       forwardedFor: "198.51.100.5",
-      knownProxies: new Set([CADDY, CADDY2]),
+      knownProxies: parseTrustedProxies(`${CADDY},${CADDY2}`),
     });
     expect(result.suspiciousChain).toBe(false);
     expect(result.address).toBe("198.51.100.5");
@@ -115,7 +121,7 @@ describe("resolveClientAddress", () => {
         // Two hops against two known proxies, so the chain length is legitimate
         // and the rightmost entry is what is being judged.
         forwardedFor: `198.51.100.5, ${hostile}`,
-        knownProxies: new Set([CADDY, CADDY2]),
+        knownProxies: parseTrustedProxies(`${CADDY},${CADDY2}`),
       });
       expect(result.suspiciousChain).toBe(true);
       expect(result.address).toBe(CADDY);
@@ -129,7 +135,7 @@ describe("resolveClientAddress", () => {
     const result = resolveClientAddress({
       peerAddress: CADDY,
       forwardedFor: "198.51.100.5, ",
-      knownProxies: new Set([CADDY, CADDY2]),
+      knownProxies: parseTrustedProxies(`${CADDY},${CADDY2}`),
     });
     expect(result.suspiciousChain).toBe(false);
     expect(result.address).toBe("198.51.100.5");
@@ -156,7 +162,7 @@ describe("resolveClientAddress", () => {
     const result = resolveClientAddress({
       peerAddress: "198.51.100.7",
       forwardedFor: "1.2.3.4",
-      knownProxies: new Set(),
+      knownProxies: parseTrustedProxies(undefined),
     });
     expect(result.address).toBe("198.51.100.7");
   });
@@ -166,13 +172,13 @@ describe("resolveClientAddress", () => {
     // boundary nobody should be limited within.
     const result = resolveClientAddress({
       peerAddress: "2001:db8:abcd:1234::1",
-      knownProxies: new Set(),
+      knownProxies: parseTrustedProxies(undefined),
     });
     expect(result.address).toBe("2001:db8:abcd::/48");
   });
 
   it("does not case-fold an IPv4 address into something else", () => {
-    const result = resolveClientAddress({ peerAddress: "198.51.100.7", knownProxies: new Set() });
+    const result = resolveClientAddress({ peerAddress: "198.51.100.7", knownProxies: NO_PROXIES });
     expect(result.address).toBe("198.51.100.7");
   });
 });
@@ -218,12 +224,12 @@ describe("normalise", () => {
 
 describe("rateLimitKeys", () => {
   it("keys on the client address", () => {
-    const client = resolveClientAddress({ peerAddress: "198.51.100.7", knownProxies: new Set() });
+    const client = resolveClientAddress({ peerAddress: "198.51.100.7", knownProxies: NO_PROXIES });
     expect(rateLimitKeys({ client })).toEqual(["ip:198.51.100.7"]);
   });
 
   it("adds a session key, so one address cannot burn many sessions", () => {
-    const client = resolveClientAddress({ peerAddress: "198.51.100.7", knownProxies: new Set() });
+    const client = resolveClientAddress({ peerAddress: "198.51.100.7", knownProxies: NO_PROXIES });
     const keys = rateLimitKeys({ client, sessionId: "session-1" });
     expect(keys).toContain("ip:198.51.100.7");
     expect(keys).toContain("session:session-1");
@@ -239,7 +245,7 @@ describe("rateLimitKeys", () => {
   });
 
   it("adds no session key when there is no session", () => {
-    const client = resolveClientAddress({ peerAddress: "198.51.100.7", knownProxies: new Set() });
+    const client = resolveClientAddress({ peerAddress: "198.51.100.7", knownProxies: NO_PROXIES });
     for (const key of rateLimitKeys({ client })) {
       expect(key.startsWith("session:")).toBe(false);
     }

@@ -276,7 +276,16 @@ export async function boot(
         shredDirectory: (sessionId: string) => runner.removeSessionDir(sessionId),
       },
     },
-    { logger: true },
+    {
+      logger: true,
+      // Which `X-Forwarded-For` may be believed.
+      //
+      // **This was never passed before**, and the empty default behind a reverse proxy
+      // meant every caller on the internet was rate-limited as the proxy — 3 sessions
+      // an hour, shared. Caddy sets the header correctly (see `infra/Caddyfile`);
+      // nothing ever told the api to believe it, so it refused to.
+      knownProxies: config.trustedProxies,
+    },
   );
 
   return { app, config, db, sse, binder, orchestrator, log };

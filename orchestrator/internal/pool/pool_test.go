@@ -690,6 +690,16 @@ func TestReleaseFreesTheSlotWithoutDeletingIt(t *testing.T) {
 
 // EnsurePool refills a slot that release emptied, so pool capacity returns
 // without an operator restarting anything.
+//
+// **This test asserted the opposite of its name.** It checked `d.count() == 1` — one
+// live container in a pool of two, after the refill tick. That is the *absence* of a
+// refill, and it passed because `EnsurePool` counted slots rather than containers: the
+// released slot was still in the map, so `need` came out 0. The claim at the end then
+// succeeded on the *other* slot, which is why it looked healthy.
+//
+// So every release shrank the pool by one, permanently, and after `PoolSize` logins
+// the pool was empty while `/stats` reported `size: 2`. Found on a real host, four
+// minutes of `byState: {starting: 1}` with no top-up activity. See `StateVacant`.
 func TestEnsurePoolRefillsAfterRelease(t *testing.T) {
 	cfg := testConfig(t, 2)
 	d := newFakeDaemon()
@@ -707,11 +717,22 @@ func TestEnsurePoolRefillsAfterRelease(t *testing.T) {
 		t.Fatalf("release: %v", err)
 	}
 
+	// Release destroyed the container, so the pool is genuinely one short — and
+	// reports itself that way, which is what distinguishes this from a full pool.
+	if got := d.count(); got != 1 {
+		t.Fatalf("after release there are %d containers, want 1; the pool should be "+
+			"one short until the refill", got)
+	}
+
 	if err := p.EnsurePool(t.Context()); err != nil {
 		t.Fatalf("refill: %v", err)
 	}
-	if d.count() != 1 {
-		t.Errorf("after refill there are %d containers, want 1 idle runner", d.count())
+	if d.count() != 2 {
+		t.Errorf("after refill there are %d containers, want 2 — the slot release "+
+			"emptied was never refilled, so capacity does not return", d.count())
+	}
+	if idle := p.Stats().ByState[string(StateIdle)]; idle != 2 {
+		t.Errorf("idle = %d after refill, want 2: %+v", idle, p.Stats().ByState)
 	}
 	// And the refilled runner is claimable again.
 	if _, err := p.Claim(t.Context(), guid, time.Now().Add(time.Hour)); err != nil {

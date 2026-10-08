@@ -59,6 +59,21 @@ const (
 	StateDraining State = "draining"
 	// StateDead is a container that failed to start or exited unexpectedly.
 	StateDead State = "dead"
+
+	// StateVacant is a slot that holds **no container** and needs one.
+	//
+	// It was not a distinct state: a released slot was set to `StateStarting`, and
+	// `EnsurePool` decided what to fill by counting *slots*. Since the released slot
+	// was still in the map, `need` came out 0 and nothing refilled it. So every
+	// release shrank the pool by one, permanently, and after `PoolSize` logins the
+	// pool was empty with `/stats` reporting `size: 1` — a slot nothing could use.
+	//
+	// It has to be distinguishable from `StateStarting` because that state is also
+	// "no container yet", and it means a create is **in flight** for it: a slot
+	// registered by `EnsurePool` has no container id until `create` finishes.
+	// Refilling those too would let a second tick create a duplicate container for a
+	// slot that is already being filled.
+	StateVacant State = "vacant"
 )
 
 // Slot is one pool position and the container currently occupying it.
@@ -397,13 +412,16 @@ func (p *Pool) Release(ctx context.Context, slotID string) error {
 	// its next tick instead, which also keeps this verb's latency independent of
 	// image pull time.
 	//
-	// The slot stays in the pool as StateStarting with no container, so its id
-	// remains reserved: a claim that arrives before the refill waits for the
+	// The slot stays in the pool as **StateVacant** — no container, one wanted — so
+	// its id remains reserved: a claim that arrives before the refill waits for the
 	// slot rather than creating a second runner for the same position.
+	//
+	// It was `StateStarting`, and `EnsurePool` counts slots rather than containers,
+	// so the slot it stayed in meant the refill never came. See `StateVacant`.
 	p.mu.Lock()
 	slot.ContainerID = ""
 	slot.CreatedAt = time.Time{}
-	slot.State = StateStarting
+	slot.State = StateVacant
 	p.mu.Unlock()
 
 	p.log.Info("released slot", "slot", slot.ID, "container", containerID, "session", sessionGUID)
@@ -489,13 +507,48 @@ func (p *Pool) Remove(ctx context.Context, slotID string) error {
 
 // EnsurePool tops the pool up to cfg.PoolSize, creating idle runners.
 //
-// Idempotent and safe to call on a timer. A slot that is starting and has not
-// come up yet is left alone, so a slow image pull does not spawn duplicates on
-// every tick.
+// Idempotent and safe to call on a timer. Two things need filling, and counting
+// only one of them is how the pool used to shrink without limit:
+//
+//   - a **vacant** slot: one that was released or lost its container. It is already
+//     in the map, so counting slots found the pool full and did nothing. This is the
+//     bug `StateVacant` exists for.
+//   - a slot that does not exist yet.
+//
+// A slot whose create is **in flight** is `StateStarting` with no container id, and
+// is deliberately not in either group: refilling it would let a second tick create a
+// duplicate container for a slot already being filled. The vacant slots are moved to
+// `StateStarting` under this same lock, which is what claims them.
 func (p *Pool) EnsurePool(ctx context.Context) error {
 	p.mu.Lock()
-	need := p.cfg.PoolSize - len(p.slots)
+
+	var vacant []*Slot
+	filled := 0
+	for _, slot := range p.slots {
+		if slot.State == StateVacant {
+			vacant = append(vacant, slot)
+			continue
+		}
+		filled++
+	}
+	for _, slot := range vacant {
+		slot.State = StateStarting
+	}
+
+	// The vacant slots are about to be filled by this same call, so they count
+	// towards capacity. Leaving them out of `filled` and then adding `need` on top
+	// would give the pool one slot more than it asked for — a pool of 2 with one
+	// empty slot would create *two* containers and report three idle runners.
+	need := p.cfg.PoolSize - filled - len(vacant)
+	if need < 0 {
+		need = 0
+	}
 	var created []*Slot
+	// Which slots this call invented, so a failure can distinguish "remove the slot
+	// I just made up" from "put the reserved slot back to vacant". Read from a
+	// recorded set rather than inferred from the slot's own state, because a vacant
+	// slot being refilled and a freshly created one look identical mid-flight.
+	newlyRegistered := make(map[string]bool, need)
 	for i := 0; i < need; i++ {
 		slot := &Slot{
 			ID:    fmt.Sprintf("slot-%d", nextSlotSeq),
@@ -504,18 +557,28 @@ func (p *Pool) EnsurePool(ctx context.Context) error {
 		nextSlotSeq++
 		p.slots[slot.ID] = slot
 		created = append(created, slot)
+		newlyRegistered[slot.ID] = true
 	}
 	p.mu.Unlock()
 
-	if need <= 0 {
+	if len(vacant) == 0 && need <= 0 {
 		return nil
 	}
 
 	var firstErr error
-	for _, slot := range created {
+	// A vacant slot is refilled **in place**, keeping its id, because `api` may still
+	// hold that id in `sessions.runner_id`. Removing it on failure — as a newly
+	// created slot is — would strand that row against a slot that no longer exists.
+	for _, slot := range append(vacant, created...) {
 		if err := p.create(ctx, slot); err != nil {
 			p.mu.Lock()
-			delete(p.slots, slot.ID)
+			if newlyRegistered[slot.ID] {
+				// A slot this call invented, which never became a container.
+				delete(p.slots, slot.ID)
+			} else {
+				// Back to vacant: the id stays reserved and the next tick retries.
+				slot.State = StateVacant
+			}
 			p.mu.Unlock()
 			p.log.Error("ensure pool: create failed", "slot", slot.ID, "error", err)
 			if firstErr == nil {

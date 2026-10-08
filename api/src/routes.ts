@@ -553,16 +553,35 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
         // will not move. "Every session is busy" and "the control plane cannot
         // start runners" are different advice, and the user cannot tell them apart.
         //
-        // Three outcomes now, and `retryable` is the honest answer for each:
+        // Four outcomes now, and `retryable` is the honest answer for each:
         //
         //   busy             -> wait; a slot frees up
         //   pool cannot fill -> wait does NOT help; something is misconfigured
         //   control plane unreachable -> transient, retry
+        //   slot conflict    -> this process and the orchestrator disagree about the
+        //                       pool, which is an operator problem, not a user's
         request.log.info(
           { reason: bound.reason, fillError: bound.fillError ?? null },
           "runner claim failed",
         );
         const cannotFill = bound.reason === "pool-exhausted" && bound.fillError !== undefined;
+        // A conflict means every slot this process offered was refused, after the
+        // retries. It is **not** unreachability: the orchestrator answered, clearly, and
+        // the answer was "no". Reporting it as an unreachable control plane told the
+        // user to retry a login that could not succeed, and told whoever read the log
+        // that a component was down while it was answering a 409 in milliseconds.
+        //
+        // Reported as 409 rather than 5xx because nothing about a retry fixes it. The
+        // pool has to be reconciled, and that is the api's problem to resolve — see
+        // `claimForLogin`'s retry, which handles the drift case, and the boot fix in
+        // the orchestrator that removes the cause.
+        if (bound.reason === "slot-conflict") {
+          return reply.code(409).send({
+            error: "the service's view of its runner pool is out of date",
+            retryable: false,
+            cause: "pool-diverged",
+          });
+        }
         return reply
           .code(bound.reason === "pool-exhausted" ? 503 : 502)
           .send({

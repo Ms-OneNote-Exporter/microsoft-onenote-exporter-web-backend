@@ -395,7 +395,12 @@ describe("PoolBinder.claimForLogin", () => {
     expect(db.getSession(GUID)?.state).toBe("created");
   });
 
-  it("releases the slot on a conflict too", async () => {
+  // A conflict used to leave the row `idle`. That is the behaviour that made a login
+  // impossible: the row stayed claimable, `ORDER BY RANDOM()` kept offering it, and the
+  // orchestrator kept refusing it — so every attempt from every user burned against the
+  // same bad row. A slot the orchestrator will not give is not capacity this process
+  // has, so the row is dropped and the pool re-learned. See `pool-divergence.test.ts`.
+  it("drops the row on a conflict, rather than leaving it claimable", async () => {
     seedRunners(1);
     seedSession(GUID);
     const { client } = orchestratorStub({ claim: "conflict" });
@@ -403,9 +408,14 @@ describe("PoolBinder.claimForLogin", () => {
 
     await binder.claimForLogin(db.getSession(GUID)!);
 
-    expect(db.get<{ status: string }>(`SELECT status FROM runners WHERE id = 'slot-1'`)?.status).toBe(
-      "idle",
-    );
+    expect(
+      db.get<{ status: string }>(`SELECT status FROM runners WHERE id = 'slot-1'`),
+    ).toBeUndefined();
+    // The orchestrator names the slots it has; those come back. Here it knows none, so
+    // the table ends up empty rather than holding a slot nothing can use.
+    expect(
+      db.all<{ id: string }>(`SELECT id FROM runners WHERE status = 'idle'`),
+    ).toHaveLength(0);
   });
 
   it("does not bind the same slot to two sessions", async () => {

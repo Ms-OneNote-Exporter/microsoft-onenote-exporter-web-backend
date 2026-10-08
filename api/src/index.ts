@@ -149,6 +149,31 @@ export async function boot(
     // milliseconds; the work happens afterwards and arrives on the event stream.
     // A long timeout here would mean a wedged runner holds a request open.
     timeoutMs: 10_000,
+    // The runner reporting a login outcome is the **only** evidence the api gets that
+    // an auth.json exists, so it is recorded here rather than inferred. Before this,
+    // nothing in the api ever wrote `auth_state = 'valid'`, the only writer was
+    // `releaseForIdle` — which also nulls `runner_id` — and so
+    // `/api/session/notebooks` required a state no session could be in.
+    onAuthOutcome: (sessionId, outcome) => {
+      const now = Date.now();
+      const changed =
+        outcome === "authenticated"
+          ? db.markAuthenticated(sessionId, now)
+          : db.markAuthFailed(sessionId, now);
+      if (changed) {
+        log.info("runner reported a login outcome", { session: sessionId, outcome });
+      } else {
+        // Not an error: a late event for a session already released or erased is
+        // expected, and the guard inside `markAuthenticated` is what makes it
+        // harmless. Logged at `warn` because it is *also* what a genuine bug looks
+        // like — an outcome arriving for a session the api does not think is logging
+        // in — and the two are indistinguishable from here.
+        log.warn("login outcome for a session no longer authenticating", {
+          session: sessionId,
+          outcome,
+        });
+      }
+    },
   });
 
   // ---- boot reconciliation -------------------------------------------------

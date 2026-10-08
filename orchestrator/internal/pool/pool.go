@@ -722,12 +722,32 @@ func (p *Pool) EnsurePool(ctx context.Context) error {
 //   - idle runners are removed after SlotIdleTimeout, releasing their memory
 //     without touching a session row, because an idle container holds a
 //     Chromium tree and no session.
-//   - bound runners are recycled after RunnerTTL, which bounds how long one
-//     browser process tree serves one session.
+//   - bound runners are recycled when their **session** expires, not when their
+//     container reaches an age.
 //
-// The absolute session cap is not enforced here. `api` owns session expiry and
-// calls Remove; the orchestrator not knowing when a session expires is why it
-// cannot decide to erase one.
+// A bound slot used to be recycled on `now - slot.CreatedAt > RunnerTTL`, which
+// measures how long the *container* has existed. That has nothing to do with how
+// long the session has been working, and it destroyed work in progress: observed on
+// the deployed host, bound runners being replaced every ~90 seconds
+//
+//	13:03:59  recycled slot-1  007eadd2 → bbae8aac
+//	13:05:29  recycled slot-2  8b9d7f3d → 04bca98d     ← an export, killed mid-run
+//	13:09:29  recycled slot-1  bbae8aac → cba1386d
+//
+// A slot binds to whatever container happens to be idle, so its `CreatedAt` is
+// whatever age that container already was. A session that drew a four-minute-old
+// container got one minute of usable life — and a login takes ~35s while an export
+// takes minutes, so the longer operations could not survive to finish. An export that
+// had already written real notes was destroyed before it could be finalised.
+//
+// The session's own expiry is the honest bound: that is the unit of work's lifetime.
+// `slot.SessionExpiresAt` is recorded at claim time, and `api` remains the authority
+// on when a session ends — it releases idle sessions and calls Remove.
+//
+// Container age still decides two things, because both are about containers rather
+// than sessions: an **idle** slot is removed after `SlotIdleTimeout`, and `Reconcile`
+// replaces rather than adopts a container already past `RunnerTTL`, since adopting
+// one would attach a fresh budget to a browser tree of unknown vintage.
 func (p *Pool) Sweep(ctx context.Context) error {
 	now := p.now()
 
@@ -745,11 +765,18 @@ func (p *Pool) Sweep(ctx context.Context) error {
 				}
 			}
 		case StateBound:
-			if slot.CreatedAt.IsZero() {
+			// Recycle on the **session's** expiry.
+			//
+			// A zero expiry means this slot never recorded one. Recycle on container age
+			// is what that fallback used to do, and it is what killed exports; leaving it
+			// to `api` — which releases idle sessions and calls Remove — is the safer
+			// direction, because being slow to reclaim a slot costs memory while being
+			// quick to reclaim one costs the user their export.
+			if slot.SessionExpiresAt.IsZero() {
 				continue
 			}
-			if now.Sub(slot.CreatedAt) > p.cfg.RunnerTTL {
-				if err := p.Recycle(ctx, slot.ID, "runner ttl"); err != nil && !errors.Is(err, ErrUnknownSlot) {
+			if now.After(slot.SessionExpiresAt) {
+				if err := p.Recycle(ctx, slot.ID, "session expired"); err != nil && !errors.Is(err, ErrUnknownSlot) {
 					p.log.Error("sweep: recycle bound slot", "slot", slot.ID, "error", err)
 				}
 			}

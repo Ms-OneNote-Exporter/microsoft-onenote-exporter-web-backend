@@ -892,7 +892,18 @@ func TestSweepLeavesBoundSlotsAloneOnIdleTTL(t *testing.T) {
 // A bound slot past the runner TTL is recycled, keeping its session. This is the
 // 5-minute budget that bounds how long one browser process tree serves one
 // session.
-func TestSweepRecyclesBoundSlotsPastRunnerTTL(t *testing.T) {
+// A bound runner is recycled when its **session** expires, never because its
+// container reached an age.
+//
+// The old rule was `now - slot.CreatedAt > RunnerTTL`, and it destroyed work in
+// progress: bound runners were being replaced every ~90 seconds on the deployed host,
+// killing an export that had already written real notes. A slot binds to whatever
+// container happens to be idle, so `CreatedAt` is whatever age that container already
+// was - which says nothing about the session using it.
+//
+// This test is the old one inverted: the container is very old and the session is
+// very much alive, and the runner must be left alone.
+func TestSweepLeavesABoundRunnerAloneWhileItsSessionIsAlive(t *testing.T) {
 	cfg := testConfig(t, 1)
 	cfg.RunnerTTL = time.Minute
 	guid := "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
@@ -909,7 +920,8 @@ func TestSweepRecyclesBoundSlotsPastRunnerTTL(t *testing.T) {
 	})
 	p.slots["slot-1"] = &Slot{
 		ID: "slot-1", State: StateBound, ContainerID: old.id,
-		CreatedAt: now.Add(-2 * time.Minute), SessionGUID: guid,
+		// Far past the TTL, and far older than any browser tree should live.
+		CreatedAt: now.Add(-2 * time.Hour), SessionGUID: guid,
 		SessionExpiresAt: now.Add(time.Hour),
 	}
 
@@ -917,9 +929,40 @@ func TestSweepRecyclesBoundSlotsPastRunnerTTL(t *testing.T) {
 		t.Fatalf("sweep: %v", err)
 	}
 
-	// The slot survives, still bound to the same session, with a new container.
-	// This is the 5-minute budget: the browser process tree is replaced, the
-	// login is not.
+	if got := p.Slots()[0].ContainerID; got != old.id {
+		t.Errorf("container = %q, want %q unchanged: a bound runner whose session is "+
+			"alive must not be recycled on the container's age", got, old.id)
+	}
+}
+
+// The session's expiry is still a bound: that is what ends a bound runner's life.
+func TestSweepRecyclesBoundSlotsWhenTheSessionExpires(t *testing.T) {
+	cfg := testConfig(t, 1)
+	guid := "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+
+	d := newFakeDaemon()
+	p := New(cfg, d, discardLog())
+	now := time.Now()
+	p.now = func() time.Time { return now }
+
+	old := d.add("old", true, map[string]string{
+		"msout.role":         "runner",
+		"msout.slot.id":      "slot-1",
+		"msout.session.guid": guid,
+	})
+	p.slots["slot-1"] = &Slot{
+		ID: "slot-1", State: StateBound, ContainerID: old.id,
+		CreatedAt: now.Add(-time.Minute), SessionGUID: guid,
+		// Expired a minute ago, on a container created a minute ago.
+		SessionExpiresAt: now.Add(-time.Minute),
+	}
+
+	if err := p.Sweep(t.Context()); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	// The slot survives, still bound to the same session, with a new container:
+	// recycle replaces the browser tree, it does not erase the login.
 	if _, ok := p.slots["slot-1"]; !ok {
 		t.Fatal("recycled slot was removed; recycle must keep the slot")
 	}
@@ -933,17 +976,39 @@ func TestSweepRecyclesBoundSlotsPastRunnerTTL(t *testing.T) {
 	if s.ContainerID == old.id {
 		t.Error("recycle did not replace the container")
 	}
-	if _, err := d.InspectContainer(t.Context(), old.id); err == nil {
-		t.Error("the old container still exists after recycle")
+}
+
+// A bound slot with no recorded expiry is left to `api`, which owns session
+// lifetime. Recycling it on container age is what destroyed exports; the error to
+// make here is in the unsafe direction.
+func TestSweepLeavesABoundSlotWithNoExpiryAlone(t *testing.T) {
+	cfg := testConfig(t, 1)
+	cfg.RunnerTTL = time.Minute
+
+	d := newFakeDaemon()
+	p := New(cfg, d, discardLog())
+	now := time.Now()
+	p.now = func() time.Time { return now }
+
+	old := d.add("old", true, map[string]string{
+		"msout.role":    "runner",
+		"msout.slot.id": "slot-1",
+	})
+	p.slots["slot-1"] = &Slot{
+		ID: "slot-1", State: StateBound, ContainerID: old.id,
+		CreatedAt: now.Add(-time.Hour),
+		// No SessionExpiresAt.
 	}
-	if lbls := d.labels(s.ContainerID); lbls["msout.session.guid"] != guid {
-		t.Errorf("replacement container lost its session bind: %v", lbls)
+
+	if err := p.Sweep(t.Context()); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	if got := p.Slots()[0].ContainerID; got != old.id {
+		t.Errorf("container = %q, want it unchanged", got)
 	}
 }
 
-// EnsurePool is idempotent. A slot that is starting must not be duplicated on
-// the next tick, which matters because the pool ticks every ten seconds and an
-// image pull can take longer than that.
 func TestEnsurePoolIsIdempotent(t *testing.T) {
 	cfg := testConfig(t, 2)
 	p := New(cfg, nil, discardLog())

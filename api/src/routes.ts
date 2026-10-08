@@ -47,6 +47,7 @@ import {
   MAX_CREDENTIAL_BYTES,
 } from "./credential.js";
 import { NO_PROXIES, resolveClientAddress } from "./client-ip.js";
+import { RunnerCallError } from "./runner-adapter-http.js";
 import type { ProxyMatcher } from "./client-ip.js";
 import { readJsonObject } from "./server.js";
 import { expireCookieHeaders, runErase, type EraseDeps } from "./erase.js";
@@ -770,9 +771,34 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
       // arrives as a `notebooks-listed` event rather than in this response.
       await deps.runner.listNotebooks(session.guid);
     } catch (error) {
-      request.log.error({ session: session.guid }, "notebook listing failed");
-      deps.sse.emit(session.guid, "error", { message: "notebook listing failed" });
-      return reply.code(502).send({ error: "notebook listing failed" });
+      // **Every failure became a 502 here, and the cause was discarded.**
+      //
+      // The adapter already distinguishes them — `busy`, `not-ready`/`no_auth`,
+      // `rejected`, `no-address` — and this catch threw all of that away and logged
+      // the same line for each. Observed on a live host: the runner answered **409 in
+      // 2.1 ms** because it was still scraping from the previous click, and this route
+      // reported `502 notebook listing failed`. A gateway failure says a component is
+      // broken; nothing was. It also told the caller to retry, which is right for `busy`
+      // and wrong for `no_auth` — where the runner has lost its cookie jar and retrying
+      // cannot help until the user signs in again.
+      //
+      // And because the log line carried no cause, none of this was diagnosable from
+      // the log: it took reading the runner's log, then the orchestrator's, then the
+      // database, to find a 409 and a 2 ms response time that said all of it.
+      const failure = runnerFailure(error);
+      request.log.error(
+        { session: session.guid, failure: failure.kind, status: failure.status },
+        "notebook listing did not start",
+      );
+      deps.sse.emit(session.guid, "error", {
+        message: "notebook listing failed",
+        reason: failure.kind,
+      });
+      return reply.code(failure.status).send({
+        error: failure.message,
+        reason: failure.kind,
+        retryable: failure.retryable,
+      });
     }
 
     deps.sse.emit(session.guid, "session-status", { state: "authenticated" });
@@ -1095,6 +1121,92 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
   app.get("/healthz", async (_request, reply) =>
     reply.send({ ok: true, protocol: PROTOCOL_VERSION, build: API_BUILD }),
   );
+}
+
+/**
+ * What a call to a runner failed with, translated into an answer the client can act on.
+ *
+ * The adapter's `RunnerCallFailure` union is the authority; this only chooses the status
+ * and the words, and it refuses to call anything a gateway failure unless it is one.
+ */
+function runnerFailure(error: unknown): {
+  kind: string;
+  status: number;
+  message: string;
+  retryable: boolean;
+} {
+  if (error instanceof RunnerCallError) {
+    const f = error.failure;
+    if (f === "busy") {
+      // The runner is mid-listing. Retrying is exactly right, and the wait is short:
+      // a listing is tens of seconds.
+      return {
+        kind: "busy",
+        status: 503,
+        message: "a notebook listing is already running; try again shortly",
+        retryable: true,
+      };
+    }
+    if (typeof f === "object" && f !== null && "kind" in f) {
+      if (f.kind === "not-ready") {
+        // `no_auth` means the container lost its auth.json - a recycle, most often.
+        // No retry helps; only signing in again does, so it is not retryable and the
+        // client is told which action would work.
+        return f.reason === "no_auth"
+          ? {
+              kind: "no_auth",
+              status: 409,
+              message: "sign in again before listing notebooks",
+              retryable: false,
+            }
+          : {
+              kind: `not-ready:${f.reason}`,
+              status: 409,
+              message: "the runner is not ready yet; try again shortly",
+              retryable: true,
+            };
+      }
+      if (f.kind === "unreachable") {
+        // The runner did not answer at all. That *is* a transport failure, and the
+        // only kind here that is.
+        return {
+          kind: "unreachable",
+          status: 502,
+          message: "the runner could not be reached",
+          retryable: true,
+        };
+      }
+      return {
+        kind: f.kind,
+        status: f.status >= 400 && f.status < 600 ? f.status : 502,
+        message: f.error === "" ? "the runner refused the request" : f.error,
+        retryable: false,
+      };
+    }
+    if (f === "no-address" || f === "bad-address") {
+      // Nothing was dialled. That is a wiring fault, and it is not the user's to retry.
+      return {
+        kind: f,
+        status: 502,
+        message: "no runner is reachable for this session",
+        retryable: false,
+      };
+    }
+    if (f === "unauthorised") {
+      return {
+        kind: "unauthorised",
+        status: 502,
+        message: "the service cannot authorise itself to the runner",
+        retryable: false,
+      };
+    }
+  }
+  return {
+    kind: "unexpected",
+    status: 502,
+    message: "notebook listing failed",
+    retryable: true,
+  };
 }
 
 /** notebooksFor reads the notebook list stored on the session, if any. */

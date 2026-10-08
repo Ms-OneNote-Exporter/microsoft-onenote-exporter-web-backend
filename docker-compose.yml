@@ -125,6 +125,29 @@ networks:
     # names this network when it creates a container, so it must exist under that
     # name and not under `<project>_msout-runner`.
     name: msout-runner
+    # **`external: true`, and it is the only way this network can exist.**
+    #
+    # Compose **prunes** a network no non-profile service joins, and the only service
+    # that joins this one is the `runner` service, which sits behind a profile. So a
+    # plain `docker compose up` creates it and then deletes it, and the orchestrator —
+    # which asks the Engine for it *by name* — gets:
+    #
+    #     404 {"message":"network msout-runner not found"}
+    #
+    # There is no compose expression for "keep a network nothing joins", so the
+    # network is declared **operator-provided** instead. That is also the honest
+    # description: it is a property of the deployment (its subnet is what the
+    # `iptables` deny rules in `infra/README.md` are written against), not of the file.
+    #
+    # It must be created before the first `up`, which is a deploy step:
+    #
+    #     docker network create --driver bridge \
+    #       --subnet 172.30.0.0/16 --gateway 172.30.0.1 msout-runner
+    #
+    # `capability.yml` does exactly that, and `assert-compose.mjs` requires this flag,
+    # because dropping it makes Compose delete the network it just created and the
+    # failure surfaces at the first runner create rather than here.
+    external: true
 
 # ---- secrets ----------------------------------------------------------------
 

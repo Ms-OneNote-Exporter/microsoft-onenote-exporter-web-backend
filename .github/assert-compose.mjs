@@ -479,12 +479,40 @@ for (const [network, envVar] of [
   check(
     cfg.networks?.[network]?.name === network,
     `${network} exists under its own name`,
-    `FAIL: ${network} would be created as "<project>_${network}" by Compose, but the ` +
+    `${network} would be created as "<project>_${network}" by Compose, but the ` +
       `orchestrator asks for "${network}" by name (${envVar}). Add \`name: ${network}\` ` +
       `under it, or every runner create fails with "network not found" — and CI cannot ` +
       `see it, because the capability suite creates the runner through Compose`,
   );
 }
+
+// `msout-runner` must be `external`, and it is the only network that can be.
+//
+// Compose prunes a network no **non-profile** service joins, and the only service that
+// joins this one is the `runner` service, which sits behind a profile. So a plain
+// `docker compose up` creates it and then removes it, and the orchestrator — which asks
+// the Engine for it by name — gets:
+//
+//     404 {"message":"network msout-runner not found"}
+//
+// There is no compose expression for "keep a network nothing joins", so it is declared
+// operator-provided. Without `external: true` this check cannot be made at all,
+// because Compose's own error when the network already exists is:
+//
+//     network msout-runner was found but has incorrect label
+//     com.docker.compose.network set to "" (expected: "msout-runner")
+//
+// — which is a deploy step failing, not an assertion.
+check(
+  cfg.networks?.["msout-runner"]?.external === true,
+  "msout-runner is external, so Compose cannot prune the network nothing joins",
+  `msout-runner is not external. Compose prunes any network no non-profile service ` +
+    `joins, and the only service that joins this one is behind the runner profile — so ` +
+    `a plain \`docker compose up\` creates it and deletes it, and the orchestrator's ` +
+    `first runner create fails with "network msout-runner not found". Create it first ` +
+    `(docker network create --driver bridge msout-runner) and mark it external. ` +
+    `\`capability.yml\` does this`,
+);
 
 // The api must not be on the egress network. This is the error the whole
 // three-network arrangement is built to make impossible, and it would deploy

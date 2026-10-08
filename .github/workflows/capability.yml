@@ -171,6 +171,9 @@ jobs:
         run: docker compose --profile runner build
 
       - name: provision the runner's egress network
+        # Must run before `up`, and must run even though the network is now
+        # `external: true` in the compose file — an external network is not created
+        # by compose at all, so nothing else will create it.
         # Compose **prunes** `msout-runner`: the only service that would join it is
         # the `runner` service, which sits behind a profile, so a plain
         # `docker compose up` leaves it non-existent. The orchestrator asks the

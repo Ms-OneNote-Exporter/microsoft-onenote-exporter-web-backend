@@ -504,6 +504,21 @@ const cases = [
     expectMessage: /image the stack runs|independent/,
   },
   {
+    // Dropping `external` makes Compose prune the network it just created, because
+    // the only service that joins it is behind a profile. The failure appears as
+    // `404 network msout-runner not found` at the first runner create — on a real
+    // host, and in CI only because the orchestrator-create step was added.
+    //
+    // Without the flag, compose itself refuses to start: `network msout-runner was
+    // found but has incorrect label com.docker.compose.network`. Which is a deploy
+    // step failing loudly, not an assertion.
+    name: "lets Compose prune the runner's egress network",
+    mutate: (c) => {
+      c.networks["msout-runner"].external = false;
+    },
+    expectMessage: /external/,
+  },
+  {
     // The shipped bug: distroless `nonroot` is 65532 and the runner's `node` is 1000.
     // They share `/srv/msout/data`, so the orchestrator created a session directory
     // the runner could not write to, and every login failed with

@@ -232,29 +232,42 @@ export class MockRunner implements RunnerAdapter, RunnerEraseControl {
 
     if (controller.signal.aborted) return;
 
-    // A real run writes an artifact under an id and records it in SQLite; the
-    // snapshot's `artifact.available` is what a client uses to show a download
-    // link, so it is populated here rather than left permanently false.
-    const artifactId = "mock".padEnd(43, "0");
-    this.#db.run(
-      `UPDATE sessions SET artifact_id = ?, artifact_partial = 0 WHERE guid = ?`,
-      artifactId,
-      sessionId,
-    );
-    this.#db.run(
-      `UPDATE sessions SET export_state = ? WHERE guid = ?`,
-      JSON.stringify({
-        state: "done",
-        partialReason: null,
-        id: exportId,
-        notebook,
-        progress: { pages, sections, assets },
-        startedAt: Date.now(),
-        finishedAt: Date.now(),
-      }),
-      sessionId,
-    );
+    // **Recorded through `db.completeExport`, which is the code that now exists.**
+    //
+    // This block used to hand-write two `UPDATE` statements of its own — its own
+    // `artifact_id`, its own `export_state`, its own `finishedAt` — and the mock
+    // therefore exercised a flow **no production path contained**. That is why the
+    // mock's download worked while the real one could not: the mock had its own
+    // private implementation of the step the real adapter was missing, so a green
+    // mock run said nothing at all about the deployed path.
+    //
+    // Writing through the same method the real adapter calls is what makes the
+    // mock worth running: if `completeExport` stops setting `artifact_id`, the
+    // mock's download link disappears too.
+    this.#db.completeExport({
+      guid: sessionId,
+      artifactId: exportId,
+      partial: false,
+      partialReason: null,
+      notebook,
+      progress: { pages, sections, assets },
+      startedAt: Date.now(),
+      finishedAt: Date.now(),
+    });
     this.#sse.emit(sessionId, "export-done", { id: exportId, notebook, pages, sections, assets });
+  }
+
+  /**
+   * publishArtifact is a no-op: there is no vault to zip.
+   *
+   * Present so the interface is satisfied, and deliberately does **not** write an
+   * artifact id — `startExport` has already recorded the export through
+   * `db.completeExport`, which is where a real run's id is recorded too. A mock
+   * that invented an id here would reintroduce exactly the second implementation
+   * the note above removes.
+   */
+  async publishArtifact(input: { sessionId: string; artifactId: string }): Promise<void> {
+    void input;
   }
 
   async abortExport(input: { sessionId: string; exportId: string }): Promise<void> {

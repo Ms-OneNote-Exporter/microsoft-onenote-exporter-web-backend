@@ -22,6 +22,8 @@ import {
 
 const SECRET = "shared-test-secret-0123456789abcdef";
 const TS = "1700000000000";
+/** 43 base64url characters — the artifact id shape both sides validate. */
+const ARTIFACT_ID = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const BODY = JSON.stringify({
   sessionGuid: "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
 });
@@ -124,6 +126,69 @@ describe("OrchestratorClient", () => {
     expect(seen.headers?.["x-msout-sig"]).toBe(expected);
     // And content-length agrees, so the signature covers the whole body.
     expect(seen.headers?.["content-length"]).toBe(String(sent.length));
+  });
+
+  it("carries the partial bit to /finalize verbatim", async () => {
+    // The orchestrator selects the `.partial.zip` name and writes the marker from
+    // this field, and by design it **cannot verify it** — it never saw the walk.
+    // A client that quietly sent `partial: false` for a truncated vault would
+    // publish it unmarked and indistinguishable from a complete one, which is the
+    // one thing PLAN-v3 §5 exists to prevent. So the assertion is on the bytes.
+    const seen: Seen = {};
+    const c = client(
+      stubFetch(
+        200,
+        JSON.stringify({
+          artifactId: ARTIFACT_ID,
+          archiveName: "vault.partial.zip",
+          bytes: 512,
+          partial: true,
+        }),
+        seen,
+      ),
+    );
+
+    const result = await c.finalize({
+      artifactId: ARTIFACT_ID,
+      sessionGuid: "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+      partial: true,
+    });
+
+    expect(JSON.parse(seen.body ?? "{}")).toEqual({
+      artifactId: ARTIFACT_ID,
+      sessionGuid: "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+      partial: true,
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  it("sends /finalize to the verb the orchestrator registered", async () => {
+    const seen: Seen = {};
+    const c = client(stubFetch(200, "{}", seen));
+
+    await c.finalize({
+      artifactId: ARTIFACT_ID,
+      sessionGuid: "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+      partial: false,
+    });
+
+    expect(seen.url).toBe("http://orchestrator:9100/finalize");
+  });
+
+  it("maps a 409 from /finalize to a conflict, not a transport failure", async () => {
+    // 409 here means "nothing staged" — the runner wrote no archive. That is a
+    // different fact from "could not reach the orchestrator", and the caller treats
+    // it by recording an unpublishable export rather than by retrying.
+    const c = client(stubFetch(409, JSON.stringify({ error: "nothing staged to finalise" })));
+
+    const result = await c.finalize({
+      artifactId: ARTIFACT_ID,
+      sessionGuid: "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+      partial: false,
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.kind).toBe("conflict");
   });
 
   it("maps pool exhaustion to a typed error, not a throw", async () => {

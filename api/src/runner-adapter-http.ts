@@ -69,6 +69,7 @@ import type {
   StartExportInput,
   AbortExportInput,
   SubmitCredentialInput,
+  PublishArtifactInput,
 } from "./runner-adapter.js";
 import type { SseHub } from "./sse.js";
 
@@ -108,6 +109,32 @@ export class RunnerCallError extends Error {
     this.name = "RunnerCallError";
     this.failure = failure;
   }
+}
+
+/**
+ * What a terminal export event tells the rest of the api.
+ *
+ * Carries the counts because they are the only record of what the export produced,
+ * and `finishedAt` is set from the moment of completion rather than reconstructed.
+ */
+export interface ExportFinishedInput {
+  readonly sessionId: string;
+  /** The api's opaque artifact id, echoed back from `startExport`. */
+  readonly artifactId: string;
+  /**
+   * Whether the export stopped short.
+   *
+   * True for `export-partial` and for an `export-done` that followed an abort. This
+   * is the bit `/finalize` trusts for labelling and cannot check, so it is derived
+   * here from what the runner actually reported.
+   */
+  readonly partial: boolean;
+  /** Why, when partial. `null` for a clean finish. */
+  readonly partialReason: "aborted" | "quota" | "disk" | null;
+  readonly notebook: string;
+  readonly progress: { readonly pages: number; readonly sections: number; readonly assets: number } | null;
+  /** When the export finished, in epoch milliseconds. */
+  readonly finishedAt: number;
 }
 
 /** Options for the adapter. */
@@ -154,8 +181,47 @@ export interface HttpRunnerAdapterOptions {
    * supply one.
    */
   readonly onNotebooksListed?: (sessionId: string, names: readonly string[]) => void;
+  /**
+   * Called when an export reaches a terminal outcome, with the truth about it.
+   *
+   * ## This is the callback that was missing, and it is why the export never arrived
+   *
+   * `login-success` and `notebooks-listed` each had one, and each wrote a column the
+   * api reads back. `export-done` had neither: the frame was published to the SSE hub
+   * and **discarded**. So a runner could export a vault to completion — bytes on
+   * disk, `export-done` on the wire, the right numbers in the payload — and the
+   * database would keep saying `state: "running"`, `finishedAt: null`,
+   * `artifact.available: false` until the session expired.
+   *
+   * The test that let this ship asserted the **event** arrived. Nothing asserted the
+   * row changed. Same shape as the two credential bugs this repository's tests were
+   * explicitly rewritten to catch: the handler ran, the transport was fine, and the
+   * thing a user depends on was never written.
+   *
+   * ## `partial` is the api's claim, not the orchestrator's
+   *
+   * The orchestrator's `/finalize` selects the `.partial.zip` name and writes the
+   * marker, and it **cannot verify** this bit — it never saw the walk. So it is
+   * forwarded as whatever the side that watched the export believes, and that is
+   * why the field exists here rather than being re-derived downstream.
+   *
+   * May be async: publishing an artifact is slow (it zips the vault), and the
+   * adapter must not block the event pump waiting for it. Failures are caught and
+   * logged rather than thrown — a failed publish must not kill the stream and lose
+   * every subsequent event. Await `drain()` to observe them.
+   */
+  readonly onExportFinished?: (input: ExportFinishedInput) => Promise<void> | void;
   /** Per-request timeout. Logins and exports return immediately, so this is short. */
   readonly timeoutMs?: number;
+  /**
+   * Clock, injected so `finishedAt` is deterministic in tests.
+   *
+   * Set once per terminal event, from the moment the api observes it — not from
+   * the runner, which does not send a timestamp, and not reconstructed from the
+   * stored `startedAt`. An export that ran for four minutes must say it finished
+   * now, not four minutes ago.
+   */
+  readonly now?: () => number;
   /** Injected for tests. */
   readonly fetchImpl?: typeof fetch;
 }
@@ -182,6 +248,7 @@ interface RunnerWireEvent {
   [key: string]: unknown;
 }
 
+
 /** Options for one call. */
 interface CallOptions {
   readonly method: "GET" | "POST" | "DELETE";
@@ -193,6 +260,15 @@ interface CallOptions {
   readonly stream?: ReadableType;
   /** Raw body headers, for the credential. */
   readonly headers?: Readonly<Record<string, string>>;
+  /**
+   * Overrides the adapter's default timeout for this one call.
+   *
+   * Exists for exactly one caller — `publishArtifact` — and the reason it is a
+   * per-call field rather than a second adapter is that the default is correct for
+   * every control verb in this file. Raising the default to accommodate archiving
+   * would mean a wedged runner could hold a *login* open for thirty minutes.
+   */
+  readonly timeoutMs?: number;
 }
 
 export class HttpRunnerAdapter implements RunnerAdapter {
@@ -205,6 +281,28 @@ export class HttpRunnerAdapter implements RunnerAdapter {
   readonly #onNotebooksListed:
     | ((sessionId: string, names: readonly string[]) => void)
     | undefined;
+  readonly #onExportFinished: ((input: ExportFinishedInput) => Promise<void> | void) | undefined;
+  readonly #now: () => number;
+  /**
+   * Artifact publishes still in flight, so `drain()` can wait for them.
+   *
+   * Tracked rather than fired and forgotten because a publish is the only step of
+   * an export that outlives the request that started it: the export runs for
+   * minutes, then zipping it runs for minutes more, and nothing is holding a
+   * promise. Without this, shutting the api down mid-publish loses an archive the
+   * runner has already written and the orchestrator has already been told about.
+   */
+  readonly #publishing = new Set<Promise<void>>();
+  /**
+   * Artifact ids whose publish has been started, so a second terminal event for the
+   * same export is a duplicate rather than new work.
+   *
+   * Bounded by session lifetime rather than pruned, and that is deliberate: it
+   * holds at most a handful of ids for a session whose absolute TTL is twelve
+   * hours, and a prune policy would be a way to lose the protection without
+   * gaining anything. Cleared with the pumps, in `stopAll`.
+   */
+  readonly #published = new Set<string>();
   readonly #timeoutMs: number;
   readonly #fetch: typeof fetch;
   /** One event stream per session, so a reconnect does not double-deliver. */
@@ -218,8 +316,23 @@ export class HttpRunnerAdapter implements RunnerAdapter {
     this.#sse = options.sse;
     this.#onAuthOutcome = options.onAuthOutcome;
     this.#onNotebooksListed = options.onNotebooksListed;
+    this.#onExportFinished = options.onExportFinished;
+    this.#now = options.now ?? Date.now;
     this.#timeoutMs = options.timeoutMs ?? 15_000;
     this.#fetch = options.fetchImpl ?? fetch;
+  }
+
+  /**
+   * drain waits for every artifact publish in flight to settle.
+   *
+   * Never rejects: a publish that failed has already logged the reason, and a
+   * shutdown path that threw on it would replace a clear log line with an
+   * unhandled rejection.
+   */
+  async drain(): Promise<void> {
+    while (this.#publishing.size > 0) {
+      await Promise.allSettled([...this.#publishing]);
+    }
   }
 
   /**
@@ -251,7 +364,12 @@ export class HttpRunnerAdapter implements RunnerAdapter {
     }
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.#timeoutMs);
+    // Read once, so the timeout in force is the one the error message names. The
+    // message quotes `this.#timeoutMs` today and would quote the wrong number for
+    // an archiving call — an operator reading "timed out after 10000ms" on a
+    // thirty-minute zip has been told something false.
+    const budgetMs = options.timeoutMs ?? this.#timeoutMs;
+    const timer = setTimeout(() => controller.abort(), budgetMs);
 
     // Spelled as the type of the field rather than `BodyInit`, which is a DOM
     // type this project does not include: it compiles only with `lib: DOM`, and
@@ -304,7 +422,7 @@ export class HttpRunnerAdapter implements RunnerAdapter {
       if (cause instanceof RunnerCallError) throw cause;
       if (controller.signal.aborted) {
         throw new RunnerCallError(
-          { kind: "unreachable", cause: `timed out after ${this.#timeoutMs}ms` },
+          { kind: "unreachable", cause: `timed out after ${budgetMs}ms` },
           "the runner did not answer in time",
         );
       }
@@ -401,6 +519,102 @@ export class HttpRunnerAdapter implements RunnerAdapter {
   }
 
   /**
+   * publishArtifact asks the runner to stream the finished vault into staging.
+   *
+   * The artifact id travels in the **body**, never in the path: it is the api's
+   * own opaque id, and the runner validates it against the 43-base64url rule before
+   * it becomes a directory name. That is a shape check, not sanitisation — "reject
+   * anything that is not exactly 43 base64url characters" is a smaller and more
+   * obviously complete rule than stripping the wrong characters out.
+   *
+   * ## The long timeout is not a guess
+   *
+   * This call zips a vault that may be several gigabytes on a 2-CPU VPS, while
+   * every other call in this adapter is a fast control verb that returns 202
+   * immediately. Sharing the 10-second default would abort almost every real
+   * export *at the archiving step* — after the work succeeded — and the user would
+   * be told their export failed when it is sitting complete in staging. So it gets
+   * its own budget, and it is deliberately generous rather than tight: the cost of
+   * this call exceeding it is a timeout, and the cost of setting it too low is a
+   * completed export reported as a failure.
+   */
+  async publishArtifact(input: PublishArtifactInput): Promise<void> {
+    await this.#call({
+      method: "POST",
+      path: `/sessions/${encodeURIComponent(input.sessionId)}/artifacts`,
+      sessionId: input.sessionId,
+      json: { artifactId: input.artifactId },
+      // 30 minutes. An export itself is already bounded by the runner's own export
+      // timeout, so this only has to outlast the *archiving* of what it produced.
+      timeoutMs: 30 * 60 * 1000,
+    });
+  }
+
+  /**
+   * finishExport hands a terminal export to the injected completion callback.
+   *
+   * Fire-and-forget by design, and the reason is a timing constraint rather than a
+   * convenience: `readEvents` awaits `#handleFrame` on the reader loop, so anything
+   * awaited here would stop the pump consuming frames until the publish finished.
+   * Zipping a multi-gigabyte vault takes minutes, and every event after it — the
+   * abort a user clicks, the `export-partial` that explains what happened — would
+   * sit unread behind it.
+   *
+   * So it is started, tracked in `#publishing`, and its failure is reported rather
+   * than thrown. Throwing here would be worse than dropping it: `#handleFrame` runs
+   * inside `#pump`'s try, so a rejection would tear down the event stream and lose
+   * every subsequent event for this session too.
+   *
+   * Duplicate suppression lives here rather than in the callback, because this is
+   * the only place that knows both events arrived: the runner publishes
+   * `export-aborted` **and** `export-partial` for one cancellation, and a naive
+   * handler would zip and finalise the same vault twice.
+   */
+  #finishExport(input: ExportFinishedInput): void {
+    const callback = this.#onExportFinished;
+    if (callback === undefined) return;
+
+    // One publish per artifact id. The second terminal event for the same export is
+    // a duplicate of the first, not new work.
+    if (this.#published.has(input.artifactId)) return;
+    this.#published.add(input.artifactId);
+
+    const task = (async () => {
+      await callback(input);
+    })();
+    this.#publishing.add(task);
+    void task
+      .catch((cause: unknown) => {
+        this.#reportPublishFailure(cause, input);
+      })
+      .finally(() => {
+        this.#publishing.delete(task);
+      });
+  }
+
+  /**
+   * reportPublishFailure surfaces a publish that did not complete.
+   *
+   * On the session's own event stream, because that is the one channel that needs
+   * no new plumbing and that the client is already listening to: a user whose
+   * export finished but could not be downloaded is otherwise told nothing, and the
+   * session sits at `done` with no artifact and no explanation.
+   *
+   * The message names what failed and why. "Export failed" here would be a lie —
+   * the walk succeeded — and it would send the user to re-run hours of work over a
+   * problem that is about archiving, not exporting.
+   */
+  #reportPublishFailure(cause: unknown, input: ExportFinishedInput): void {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    this.#sse.emit(input.sessionId, "error", {
+      id: input.artifactId,
+      message:
+        "The export finished, but the file could not be published for download. " +
+        `Nothing was lost and you do not need to export again: ${detail}`,
+    });
+  }
+
+  /**
    * abort stops whatever the runner is doing for a session.
    *
    * The erase machine calls this with no export id, because it is running when an
@@ -468,6 +682,7 @@ export class HttpRunnerAdapter implements RunnerAdapter {
   /** stopAll closes every stream. For shutdown and for tests. */
   stopAll(): void {
     for (const sessionId of [...this.#pumps.keys()]) this.stopPump(sessionId);
+    this.#published.clear();
   }
 
   #ensurePump(sessionId: string): void {
@@ -633,7 +848,15 @@ export class HttpRunnerAdapter implements RunnerAdapter {
       return;
     }
 
-    const published = publish(this.#sse, sessionId, raw, this.#onAuthOutcome, this.#onNotebooksListed);
+    const published = publish(
+      this.#sse,
+      sessionId,
+      raw,
+      this.#onAuthOutcome,
+      this.#onNotebooksListed,
+      (input) => this.#finishExport(input),
+      this.#now,
+    );
     if (published === "challenge-code") {
       // Reported, not silently dropped and not silently accepted. See the header:
       // there is no route to answer a typed code and pretending otherwise would
@@ -675,12 +898,47 @@ function publish(
   raw: Record<string, unknown>,
   onAuthOutcome?: (sessionId: string, outcome: "authenticated" | "failed") => void,
   onNotebooksListed?: (sessionId: string, names: readonly string[]) => void,
+  onExportFinished?: (input: ExportFinishedInput) => void,
+  now: () => number = Date.now,
 ): "published" | "dropped" | "challenge-code" {
   const str = (key: string): string => (typeof raw[key] === "string" ? (raw[key] as string) : "");
   const num = (key: string): number =>
     typeof raw[key] === "number" && Number.isFinite(raw[key] as number) ? (raw[key] as number) : 0;
   const nullableStr = (key: string): string | null =>
     typeof raw[key] === "string" ? (raw[key] as string) : null;
+
+  /**
+   * progress reads the runner's counts-so-far, which is all an in-flight export has.
+   *
+   * Null when the payload carried nothing usable, so the stored `progress` reads
+   * "unknown" rather than a confident `{pages: 0, sections: 0, assets: 0}` — a
+   * zero that was never measured is a different fact from a measured zero.
+   */
+  const progress = (): ExportFinishedInput["progress"] => {
+    const p = (typeof raw.progress === "object" && raw.progress !== null ? raw.progress : {}) as Record<
+      string,
+      unknown
+    >;
+    const has = ["pages", "sections", "assets"].some((k) => typeof p[k] === "number");
+    if (!has) return null;
+    return {
+      pages: typeof p.pages === "number" ? p.pages : 0,
+      sections: typeof p.sections === "number" ? p.sections : 0,
+      assets: typeof p.assets === "number" ? p.assets : 0,
+    };
+  };
+
+  /**
+   * partialReason validates the runner's reason against the three the api stores.
+   *
+   * Same reasoning as `parseExportState`: a stored value outside the union would
+   * leave the client with a state it has no rendering for, and `partial` with an
+   * unknown reason is the one case where guessing a message would be wrong.
+   */
+  const partialReason = (): "aborted" | "quota" | "disk" | null => {
+    const r = str("reason");
+    return r === "aborted" || r === "quota" || r === "disk" ? r : null;
+  };
 
   switch (raw.type) {
     case "login-started":
@@ -798,10 +1056,40 @@ function publish(
           sections: num("sections"),
           assets: num("assets"),
         });
+        // **This call is the fix.** Before it, `export-done` was published to the
+        // hub and nothing else happened: no zip, no finalise, no row written. The
+        // session therefore reported `running` with `finishedAt: null` forever,
+        // and `artifact.available` stayed false, because both are read from the
+        // database and this event never reached it.
+        //
+        // The counts are forwarded rather than re-derived, so what the user is
+        // shown is what the exporter actually walked.
+        onExportFinished?.({
+          sessionId,
+          artifactId: id,
+          partial: false,
+          partialReason: null,
+          notebook: str("notebook"),
+          progress: progress(),
+          finishedAt: now(),
+        });
       } else if (type === "export-log") {
         sse.emit(sessionId, "export-log", { id, line: str("line") });
       } else if (type === "export-partial") {
         sse.emit(sessionId, "export-partial", { id, reason: str("reason") || "aborted" });
+        // A partial vault is still a vault the user may want — §8.2 preserves what
+        // is on disk — so it is **published, labelled partial**, rather than skipped.
+        // The label is the orchestrator's to write and it cannot verify this bit,
+        // which is exactly why it is forwarded from the side that watched the walk.
+        onExportFinished?.({
+          sessionId,
+          artifactId: id,
+          partial: true,
+          partialReason: partialReason(),
+          notebook: str("notebook"),
+          progress: progress(),
+          finishedAt: now(),
+        });
       } else if (type === "export-aborted") {
         sse.emit(sessionId, "export-aborted", { id });
       } else {

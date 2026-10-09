@@ -42,6 +42,7 @@ import { SseHub } from "./sse.js";
 import { RateLimiter } from "./rate-limit.js";
 import { OrchestratorClient, type OrchestratorApi } from "./orchestrator-client.js";
 import { HttpRunnerAdapter } from "./runner-adapter-http.js";
+import { completeExport } from "./export-completion.js";
 import {
   PoolBinder,
   reconcile,
@@ -141,7 +142,14 @@ export async function boot(
   // Before this, all four runner-facing routes answered 501: a real session was
   // created, a real cookie set, the live-update stream attached, and the sign-in
   // could not get past the password field.
-  const runner = new HttpRunnerAdapter({
+  // Declared, then assigned, rather than `const runner = new HttpRunnerAdapter(…)`.
+// The completion callback below needs the adapter in order to stage the artifact,
+// so the adapter's own options mention the adapter — a genuine cycle, and one
+// TypeScript cannot infer through. The explicit type is what breaks it. There is
+// no runtime hazard: the callback is not invoked until an export finishes, minutes
+// after this assignment.
+let runner: HttpRunnerAdapter;
+runner = new HttpRunnerAdapter({
     addressFor: (sessionId: string) => db.runnerUrlFor(sessionId),
     token: config.runnerToken,
     sse,
@@ -181,6 +189,20 @@ export async function boot(
         });
       }
     },
+    // **The step that made an export observable.**
+    //
+    // `login-success` and `notebooks-listed` each got a callback that wrote the
+    // column the api reads back. `export-done` did not, so a finished export
+    // changed nothing: no zip, no finalise, no row. The session reported `running`
+    // with `finishedAt: null` for ever, and — because #44's sweeper guard skips
+    // `exporting` while nothing ever left that state — held its slot for the rest
+    // of the day.
+    //
+    // Referencing `runner` inside the arrow rather than in the options object is
+    // safe and deliberate: the callback fires minutes later, from the event pump,
+    // long after this binding is initialised.
+    onExportFinished: (input): Promise<void> =>
+      completeExport({ runner, orchestrator, db, log }, input),
   });
 
   // ---- boot reconciliation -------------------------------------------------

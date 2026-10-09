@@ -56,7 +56,7 @@ export type RunnerEvent =
   | { type: "export-started"; id: string }
   | { type: "export-progress"; id: string; progress: ExportProgress }
   | { type: "export-log"; id: string; line: string }
-  | { type: "export-done"; id: string; notebook: string; pages: number; sections: number; assets: number }
+  | { type: "export-done"; id: string; notebook: string; pages: number; sections: number; assets: number; failedSections: number; failedPages: number; failedGroups: number; notebookNotFound?: boolean; walkFailed?: boolean }
   | { type: "export-partial"; id: string; reason: string }
   | { type: "export-aborted"; id: string }
   | { type: "error"; message: string };

@@ -43,3 +43,8 @@ reviews/
 # the code, so a reader needs them.
 PLAN*.md
 !PLANNING/PLAN*.md
+
+# `tsc -b` in runner/ leaves this behind. Nothing else in the repo tracks a
+# build artifact, and it is per-machine, so it is noise that `git add -A` would
+# otherwise sweep into a commit.
+runner/tsconfig.tsbuildinfo

@@ -135,6 +135,16 @@ export interface ExportFinishedInput {
   readonly progress: { readonly pages: number; readonly sections: number; readonly assets: number } | null;
   /** When the export finished, in epoch milliseconds. */
   readonly finishedAt: number;
+  /** How many sections failed. */
+  readonly failedSections: number;
+  /** How many pages failed. */
+  readonly failedPages: number;
+  /** How many section groups failed. */
+  readonly failedGroups: number;
+  /** The walk reported no notebook at all. */
+  readonly notebookNotFound?: boolean;
+  /** The export threw an error. */
+  readonly walkFailed?: boolean;
 }
 
 /** Options for the adapter. */
@@ -1146,12 +1156,29 @@ function publish(
           },
         });
       } else if (type === "export-done") {
+        const failedSections = num("failedSections");
+        const failedPages = num("failedPages");
+        const failedGroups = num("failedGroups");
+        const notebookNotFound = raw.notebookNotFound === true;
+        const walkFailed = raw.walkFailed === true;
+
+        // `partial` is true only when there was a partial success: some pages
+        // exported, but some items failed. If all pages failed, this is a full
+        // failure. The runner emits `export-partial` for aborts, but the package
+        // emits `export-done` unconditionally; the counts tell us the truth.
+        // A walkFailed (throw) is also full failure (no artifact at all).
+        const lost = failedSections + failedPages + failedGroups;
+        const pages = num("pages");
+        const sectionTotal = num("sections");
+        const assets = num("assets");
+        const partial = !walkFailed && pages > 0 && lost > 0;
+
         sse.emit(sessionId, "export-done", {
           id,
           notebook: str("notebook"),
-          pages: num("pages"),
-          sections: num("sections"),
-          assets: num("assets"),
+          pages,
+          sections: sectionTotal,
+          assets,
         });
         // **This call is the fix.** Before it, `export-done` was published to the
         // hub and nothing else happened: no zip, no finalise, no row written. The
@@ -1164,15 +1191,24 @@ function publish(
         onExportFinished?.({
           sessionId,
           artifactId: id,
-          partial: false,
+          partial,
           partialReason: null,
           notebook: str("notebook"),
-          progress: progress(),
+          progress: pages > 0 || sectionTotal > 0 || assets > 0 ? { pages, sections: sectionTotal, assets } : null,
           finishedAt: now(),
+          failedSections,
+          failedPages,
+          failedGroups,
+          notebookNotFound,
+          walkFailed,
         });
       } else if (type === "export-log") {
         sse.emit(sessionId, "export-log", { id, line: str("line") });
       } else if (type === "export-partial") {
+        const failedSections = num("failedSections");
+        const failedPages = num("failedPages");
+        const failedGroups = num("failedGroups");
+
         sse.emit(sessionId, "export-partial", { id, reason: str("reason") || "aborted" });
         // A partial vault is still a vault the user may want — §8.2 preserves what
         // is on disk — so it is **published, labelled partial**, rather than skipped.
@@ -1186,6 +1222,11 @@ function publish(
           notebook: str("notebook"),
           progress: progress(),
           finishedAt: now(),
+          failedSections,
+          failedPages,
+          failedGroups,
+          notebookNotFound: raw.notebookNotFound === true,
+          walkFailed: raw.walkFailed === true,
         });
       } else if (type === "export-aborted") {
         sse.emit(sessionId, "export-aborted", { id });

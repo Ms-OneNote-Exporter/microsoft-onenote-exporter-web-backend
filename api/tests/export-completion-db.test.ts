@@ -27,6 +27,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { Db, type SessionRow } from "../src/db.js";
+import { NOTEBOOK_NOT_FOUND } from "../src/export-completion.js";
 import { generateCsrfKey, hashSecret } from "../src/session.js";
 
 let db: Db;
@@ -230,5 +231,25 @@ describe("markExportUnpublishable", () => {
     expect(parsed.state).toBe("failed");
     expect(parsed.finishedAt).toBe(NOW + 5_000);
     expect(parsed.error).toBe("could not prepare");
+  });
+});
+
+describe("markExportUnpublishable for notebook not found", () => {
+  it("records the failure with the notebook not found message", () => {
+    seed(GUID, { state: "exporting" });
+
+    db.markExportUnpublishable({
+      guid: GUID,
+      error: NOTEBOOK_NOT_FOUND,
+      artifactId: ARTIFACT,
+      notebook: "Notebook",
+      partialReason: null,
+      finishedAt: NOW + 5_000,
+    });
+
+    const parsed = JSON.parse(row().export_state!) as Record<string, unknown>;
+    expect(parsed.state).toBe("failed");
+    expect(parsed.error).toBe(NOTEBOOK_NOT_FOUND);
+    expect(parsed.finishedAt).toBe(NOW + 5_000);
   });
 });

@@ -93,10 +93,22 @@ export interface Notebook {
   readonly url?: string;
 }
 
+/** What `runExport` returns — the counts and the notebook name. */
+export interface RunExportStats {
+  readonly totalPages: number;
+  readonly totalSections: number;
+  readonly totalAssets: number;
+  readonly failedSections: number;
+  readonly failedPages: number;
+  readonly failedGroups: number;
+  readonly failedAssets: number;
+  readonly notebookNotFound?: boolean;
+}
+
 async function packages(): Promise<{
   login: (options: Record<string, unknown>) => Promise<boolean>;
   listNotebooks: (options: Record<string, unknown>) => Promise<Notebook[]>;
-  runExport: (options: Record<string, unknown>) => Promise<unknown>;
+  runExport: (options: Record<string, unknown>) => Promise<RunExportStats>;
   LOGIN_REASONS: readonly string[];
 }> {
   const webauth = (await import("@msout/microsoft-webauth")) as unknown as {
@@ -110,7 +122,7 @@ async function packages(): Promise<{
     listNotebooks: (o: Record<string, unknown>) => Promise<Notebook[]>;
   };
   const exporter = (await import("@msout/microsoft-onenote-export-notebook")) as unknown as {
-    runExport: (o: Record<string, unknown>) => Promise<unknown>;
+    runExport: (o: Record<string, unknown>) => Promise<RunExportStats>;
   };
   return {
     login: webauth.login,
@@ -427,10 +439,12 @@ export function buildApp(
     const claimed = slot.claim(guid, "export", controller);
     makeSessionDirs(paths);
     const { runExport } = await packages();
+    let packageTerminalEmitted = false;
+    let exportDoneNotebook: string | undefined;
 
     void (async () => {
       try {
-        await runExport({
+        const stats = await runExport({
           authFile: paths.authFile,
           exportDir: paths.outDir,
           id,
@@ -469,30 +483,68 @@ export function buildApp(
                 hub.publish(guid, { type: "export-log", id, line: String(e.line ?? "") });
                 break;
               case "export-done":
-                hub.publish(guid, {
-                  type: "export-done",
-                  id,
-                  notebook: String(e.notebook ?? ""),
-                  pages: Number(e.pages ?? 0),
-                  sections: Number(e.sections ?? 0),
-                  assets: Number(e.assets ?? 0),
-                });
+                // The package emits `export-done` on every normal completion.
+                // Suppress it because we will publish a terminal after `await`
+                // with the counts from `stats` (which use different field names).
+                // Capture the notebook name from the event (stats.notebook is
+                // undefined).
+                exportDoneNotebook = String(e.notebook ?? "");
+                // Do NOT set packageTerminalEmitted: export-done must be
+                // replaced with our own terminal carrying counts.
                 break;
               case "export-partial":
                 hub.publish(guid, { type: "export-partial", id, reason: String(e.reason ?? "aborted") });
+                packageTerminalEmitted = true;
                 break;
               case "export-aborted":
                 hub.publish(guid, { type: "export-aborted", id });
+                packageTerminalEmitted = true;
                 break;
               default:
                 break;
             }
           },
         });
+
+        // The package may have emitted a terminal event.
+        // - export-partial / export-aborted: already relayed, do not add another
+        // - export-done: suppressed, but we must publish our own with counts
+        if (!packageTerminalEmitted) {
+          hub.publish(guid, {
+            type: "export-done",
+            id,
+            notebook: exportDoneNotebook ?? "",
+            pages: stats.totalPages,
+            sections: stats.totalSections,
+            assets: stats.totalAssets,
+            failedSections: stats.failedSections,
+            failedPages: stats.failedPages,
+            failedGroups: stats.failedGroups,
+            notebookNotFound: stats.notebookNotFound ?? false,
+            walkFailed: false,
+          });
+        }
       } catch (cause) {
+        // An error thrown *around* `runExport` rather than by it — Chromium missing,
+        // the module failing to import, or any other runtime exception.
+        //
+        // A terminal is published here because without one the session sits at
+        // `exporting` with a live runner and no outcome until the absolute cap. The
+        // notebook name comes from the request rather than from `stats`: the
+        // package's `export-done` is the only carrier of it, and on this path it was
+        // never emitted — so `""` would record an unnamed export into `export_state`.
         hub.publish(guid, {
-          type: "error",
-          message: cause instanceof Error ? cause.message : "export failed",
+          type: "export-done",
+          id,
+          notebook: name ?? "",
+          pages: 0,
+          sections: 0,
+          assets: 0,
+          failedSections: 0,
+          failedPages: 0,
+          failedGroups: 0,
+          notebookNotFound: false,
+          walkFailed: true,
         });
       } finally {
         claimed.release();

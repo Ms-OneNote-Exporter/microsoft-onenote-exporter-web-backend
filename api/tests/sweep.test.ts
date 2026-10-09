@@ -809,6 +809,144 @@ describe("sweep", () => {
   });
 });
 
+/**
+ * tests for the auth-failed release branch in sweep()
+ *
+ * The bug: a login that failed with `auth_state = 'failed'` held its slot for the
+ * full 15-minute TTL.loginInProgress, even though no export was running and the
+ * session was not usable. The login-expiry branch guarded on `state` (not changed
+ * by markAuthFailed) would eventually release it, but only after the full window.
+ *
+ * The fix: the new branch detects `auth_state === 'failed' && runner_id !== null`,
+ * releases the slot immediately, and increments authFailedReleased to distinguish
+ * it from a routine idle release.
+ */
+describe("sweep authFailedReleased", () => {
+  it("releases a failed login and increments authFailedReleased", async () => {
+    // Core case: a session at auth_state: "failed", state: "authenticating",
+    // with a bound runner and last_activity_at set to now (i.e. NOT advanced
+    // toward TTL.loginInProgress). After one sweep(): assert the orchestrator
+    // recorded a /release, runner_id is null, report.authFailedReleased === 1,
+    // and the runners row is idle. The "no clock advance" is the assertion that
+    // distinguishes this fix from the status quo — a stale login-expiry branch
+    // would not release because the deadline has not passed, but this branch
+    // should release immediately.
+    seedRunners(1);
+    seedSession(GUID, {
+      state: "authenticating",
+      auth_state: "failed",
+      runner_id: "slot-1",
+      last_activity_at: now, // not advanced — deadline has NOT passed
+    });
+    const { client } = orchestratorStub({ release: "ok" });
+    const binder = new PoolBinder(options(client));
+    const report = await sweep(options(client), binder);
+
+    expect(report.authFailedReleased).toBe(1);
+    expect(db.getSession(GUID)?.runner_id).toBeNull();
+    expect(db.get<{ status: string }>(`SELECT status FROM runners WHERE id = 'slot-1'`)?.status).toBe("idle");
+    // Row is retained with auth_state still failed, state still authenticating.
+    expect(db.getSession(GUID)?.auth_state).toBe("failed");
+    expect(db.getSession(GUID)?.state).toBe("authenticating");
+  });
+
+  it("still lets the user retry, which is the regression this branch could cause", async () => {
+    // **This replaces a test that asserted nothing.**
+    //
+    // The version here first read "retains the row and leaves auth_state and state
+    // untouched", and it passed with the release branch deleted — because it only
+    // asserted that nothing bad happened, which is trivially true when nothing
+    // happens at all. A vacuous test is worse than no test, because it looks like
+    // coverage in a review and in a diff.
+    //
+    // What actually needs pinning is the *risk*: releasing the runner leaves the
+    // session at `state: "authenticating"` with no container, and a release that
+    // left the session unusable would turn a mistyped password into a session that
+    // can never log in. That is the thing both reviewers asked about, and the
+    // thing nothing was asserting.
+    seedRunners(1);
+    seedSession(GUID, {
+      state: "authenticating",
+      auth_state: "failed",
+      runner_id: "slot-1",
+      last_activity_at: now,
+    });
+    const { client } = orchestratorStub({ release: "ok", claim: "ok" });
+    const binder = new PoolBinder(options(client));
+
+    await sweep(options(client), binder);
+
+    // The release really happened — otherwise this test proves nothing again,
+    // which is the mistake it exists to correct.
+    expect(db.getSession(GUID)?.runner_id).toBeNull();
+
+    // And the session is immediately reusable: a retry claims a runner and
+    // `claimBindingWrite` clears the failed state, which is why the ~15-minute
+    // window this branch leaves behind is a delay and not a lockout.
+    const retry = await binder.claimForLogin(db.getSession(GUID)!);
+    expect(retry.ok).toBe(true);
+    expect(db.getSession(GUID)?.auth_state).toBe("authenticating");
+    expect(db.getSession(GUID)?.state).toBe("authenticating");
+  });
+
+  it("does not release a valid session with a future idle_expires_at", async () => {
+    // A valid session with a bound runner and an idle_expires_at in the future
+    // should NOT be released by this branch. This test ensures the branch only
+    // fires for auth_state === 'failed', not for any session with a runner.
+    seedRunners(1);
+    seedSession(GUID, {
+      state: "authenticated",
+      auth_state: "valid",
+      runner_id: "slot-1",
+      idle_expires_at: now + TTL.authenticatedIdle, // in the future
+      last_activity_at: now,
+    });
+    const { client, calls } = orchestratorStub({ release: "ok" });
+    const binder = new PoolBinder(options(client));
+    const report = await sweep(options(client), binder);
+
+    // No release attempted, runner_id unchanged.
+    expect(report.authFailedReleased).toBe(0);
+    expect(db.getSession(GUID)?.runner_id).toBe("slot-1");
+    expect(calls).not.toContain("/release");
+  });
+
+  it("does nothing when runner_id is null", async () => {
+    // A failed session with no runner should not attempt a release.
+    seedSession(GUID, {
+      state: "authenticating",
+      auth_state: "failed",
+      runner_id: null,
+      last_activity_at: now,
+    });
+    const { client, calls } = orchestratorStub({ release: "ok" });
+    const binder = new PoolBinder(options(client));
+    const report = await sweep(options(client), binder);
+
+    expect(report.authFailedReleased).toBe(0);
+    expect(calls).not.toContain("/release");
+  });
+
+  it("leaves the slot bound when orchestrator release fails", async () => {
+    // An orchestrator release error should leave the slot bound and not increment
+    // the counter.
+    seedRunners(1);
+    seedSession(GUID, {
+      state: "authenticating",
+      auth_state: "failed",
+      runner_id: "slot-1",
+      last_activity_at: now,
+    });
+    const { client } = orchestratorStub({ release: "unreachable" });
+    const binder = new PoolBinder(options(client));
+    const report = await sweep(options(client), binder);
+
+    // Release was attempted but failed; slot remains bound.
+    expect(report.authFailedReleased).toBe(0);
+    expect(db.getSession(GUID)?.runner_id).toBe("slot-1");
+  });
+});
+
 // ---- reconcile ------------------------------------------------------------
 
 describe("reconcile", () => {

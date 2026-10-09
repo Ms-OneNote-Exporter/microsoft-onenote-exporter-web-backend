@@ -194,6 +194,19 @@ services:
       ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
     volumes:
       - ./infra/Caddyfile:/etc/caddy/Caddyfile:ro
+      # §2.2: Caddy gets the artifact tree **read-only**, and nothing else.
+      #
+      # This was missing entirely, and nothing said so. The Caddyfile below named
+      # `/srv/msout/artifacts` as its root, the deployment ran, every container came
+      # up healthy and `/healthz` answered green — while the directory the file
+      # server was pointed at did not exist inside the container. A download could
+      # only ever have been a 404, and no amount of correct api-side bookkeeping
+      # would have changed that.
+      #
+      # `:ro` is load-bearing and not decorative: a Caddy that can write the
+      # artifact tree can replace an archive a user is part-way through
+      # downloading. The orchestrator publishes; Caddy only ever reads.
+      - ${ARTIFACT_HOST_DIR:?set ARTIFACT_HOST_DIR; see infra/README.md}/:/srv/msout/artifacts:ro
       # TLS material. Named volume rather than a bind so the host path is not a
       # thing an operator has to create with the right ownership.
       - caddy-data:/data

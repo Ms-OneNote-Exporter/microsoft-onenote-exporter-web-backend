@@ -123,20 +123,73 @@
 			# else.
 		}
 
-		file_server {
-			root /srv/msout/artifacts
+		# `/files/<artifactId>` names a **directory**, not a file: the archive is
+		# inside it, under a name that depends on whether the export finished
+		# (§5 — `vault.zip` or `vault.partial.zip`).
+		#
+		# Two mistakes lived here, and both were silent. This block is reached only
+		# after `forward_auth` succeeds, so by the time either showed up the api had
+		# already published an artifact, recorded its id and told a browser the
+		# download was ready — and the answer was still a 404.
+		#
+		#  1. **No mount.** The compose service gave Caddy the Caddyfile and two TLS
+		#     volumes and nothing else, so `/srv/msout/artifacts` did not exist in the
+		#     container at all.
+		#  2. **`root` prepends the whole request path.** `/files/<id>` resolves to
+		#     `<root>/files/<id>` — a `files` directory that does not exist — so even
+		#     mounted, the correct artifact directory would not have been found.
+		#
+		# The prefix is therefore stripped and the archive located by glob.
+		#
+		# The matcher is anchored and the character class is exactly the artifact-id
+		# shape, so `/files/../../etc/passwd` does not match and is refused below
+		# rather than handed to the file server as a directory-shaped lookup. `..`
+		# cannot appear inside a 43-character base64url run.
+		@artifact path_regexp artifact ^/files/(?<artifact_id>[A-Za-z0-9_-]{43})$
+
+		handle @artifact {
+			# `/files/<id>` -> `/<id>`, so `root` resolves to the published directory.
+			rewrite * /{artifact_id}
+
+			# The archive, by name rather than by glob. §5 makes the name carry the
+			# outcome — `vault.zip` for a complete export, `vault.partial.zip` for a
+			# partial one — and `try_files` tries in order, so a clean artifact matches
+			# the first and a partial one the second. A `*.zip` glob would also work, but
+			# naming both states explicitly says so here rather than leaving it to
+			# whichever file happens to be in the directory.
+			#
+			# `try_files` is a **directive**, not a `file_server` subdirective: written
+			# inside the block it was rejected by the adapter with
+			# "unknown subdirective 'try_files'" — the same shape of mistake as the
+			# `copy_response_headers` noted above, and caught only by running
+			# `caddy validate`, which is the check that exists for exactly this.
+			try_files {path}/vault.zip {path}/vault.partial.zip
+
+			file_server {
+				root /srv/msout/artifacts
+			}
 
 			# `attachment` so a browser saves the archive rather than trying to render
-			# it. The notebook name is deliberately NOT placed here by Caddy: Caddy
-			# only knows the artifact id, and §5 requires the name to travel in
-			# Content-Disposition rather than in the path or the access log. The name
-			# reaches the client through `artifact.fileName` in the snapshot, which
-			# the browser uses as the `download` attribute.
+			# it.
 			#
-			# So the `.partial.zip` suffix is a client-side nicety and only
-			# `X-Artifact-Partial` is the server-enforced half. That split is stated
-			# in api/README.md rather than papered over with a placeholder trick that
-			# would produce a worse filename.
+			# Written as a header, because **`attachment` is not a Caddy directive at
+			# all** in v2 — not on its own and not inside `file_server`. Both were tried
+			# and rejected by the adapter: "unrecognized directive: attachment". This is
+			# the third instance in this file of a directive that reads correctly and
+			# does not exist, after `copy_response_headers` and `protocols`.
+			#
+			# **No filename is set**, deliberately. A `Content-Disposition` that names a
+			# file overrides the browser's `download` attribute, and §5 requires the
+			# notebook name to reach the client through the snapshot's `artifact.fileName`
+			# so it never appears in a path or an access log. Naming it here would
+			# either leak the artifact id as the saved name or defeat that.
+			header Content-Disposition "attachment"
+		}
+
+		# Anything under /files that is not exactly an artifact id is not an artifact.
+		# 404 rather than a file-server error page.
+		handle {
+			respond 404
 		}
 	}
 

@@ -766,16 +766,63 @@ export async function reconcile(options: SweeperOptions): Promise<{
     });
   }
 
+  // **Which ids count as live.** This was the api's own rows, which made the
+  // reconciler a no-op that could never delete anything: every row it was asked to
+  // check was, by construction, in the set it was given.
+  //
+  // The consequence accumulated silently. `syncPool` upserts and never removes, and
+  // the orchestrator renumbers its slots across restarts, so the api's `runners`
+  // table grew a phantom row for every slot the orchestrator had ever used. On the
+  // live host it held **39 rows against 4 real slots**.
+  //
+  // `claimRunner` picks an idle row by `ORDER BY RANDOM()`, so roughly nine times
+  // in ten it offered a slot the orchestrator had never heard of, got a 409, and
+  // the user saw:
+  //
+  //     409 the service's view of its runner pool is out of date
+  //
+  // Which is correct — that process's view genuinely was out of date — and
+  // unfixable from the user's side. The recovery was a restart, which is the one
+  // thing the bug report had already told them not to do.
+  //
+  // `slotIds` is optional on `OrchestratorStats` because an api can briefly talk
+  // to an orchestrator predating the field. In that case there is nothing to
+  // reconcile against, and **deleting on a count alone is not the answer** — that
+  // is what the comment above refuses to do, and it is right: a wrong count would
+  // destroy every session binding. So the fallback keeps the old, safe behaviour.
+  const liveSlotIds = stats.value.slotIds;
+  if (liveSlotIds === undefined) {
+    log.warn("orchestrator reported no slot ids; runner rows left unreconciled", {
+      runnerCount: rows.length,
+    });
+    db.reconcileRunners(new Set(rows.map((r) => r.id)), now);
+    return {
+      reconciled: false,
+      runnerCount: rows.length,
+      note: "orchestrator reported no slot ids; only expired sessions removed",
+    };
+  }
+
+  // Slots the orchestrator has are learned into the table first, so the reconciler
+  // below compares like with like rather than deleting a slot it has not yet seen.
+  const learned = syncPool(db, liveSlotIds);
+
   // Expired session rows go; expired *containers* are the orchestrator's business.
-  db.reconcileRunners(
-    new Set(rows.map((r) => r.id)),
-    now,
-  );
+  db.reconcileRunners(new Set(liveSlotIds), now);
+
+  const remaining = db.all<{ id: string }>(`SELECT id FROM runners`).length;
+  if (learned.added > 0 || remaining !== rows.length) {
+    log.info("runner rows reconciled against the orchestrator's slots", {
+      before: rows.length,
+      after: remaining,
+      learned: learned.added,
+    });
+  }
 
   return {
     reconciled: true,
-    runnerCount: rows.length,
-    note: "reconciled against the orchestrator's pool size",
+    runnerCount: remaining,
+    note: "reconciled against the orchestrator's slot ids",
   };
 }
 

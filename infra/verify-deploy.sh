@@ -157,20 +157,41 @@ if [ -n "$ORCH_CONTAINER" ]; then
 fi
 
 # ---- 4. the runner image new containers will be created from --------------------
+#
+# **`ORCH_RUNNER_IMAGE`, not the compose `image:` line.** Those are two different
+# things and reading the wrong one makes this check vacuous.
+#
+# The compose `image:` line interpolates `${IMAGE_TAG}` and therefore always agrees
+# with the expected commit by construction — comparing it proves nothing. What the
+# orchestrator actually creates containers from is `ORCH_RUNNER_IMAGE`, fed from
+# `RUNNER_IMAGE` in `.env`, and that is a **separate variable an operator can leave
+# behind**. On the host it was still naming a commit nine releases old while
+# IMAGE_TAG had moved, which would have handed every new runner an older build than
+# the api talking to it.
+#
+# So: the running orchestrator's own environment is the source of truth, because it
+# is what it will really use. `docker exec printenv` is unavailable (no shell in
+# that image), hence `docker inspect`.
 
-RUNNER_IMAGE="$(docker compose --profile runner config 2>/dev/null \
-  | grep -E '^\s+image:\s+.*msout-runner:' \
-  | head -1 | sed -E 's#.*msout-runner:##' | tr -d ' ' || true)"
+RUNNER_IMAGE=""
+for C in "$ORCH_CONTAINER"; do
+  [ -n "$C" ] || continue
+  RUNNER_IMAGE="$(docker inspect "$C" --format \
+    '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+    | grep '^ORCH_RUNNER_IMAGE=' | head -1 | cut -d= -f2- || true)"
+done
 
 if [ -z "$RUNNER_IMAGE" ]; then
-  echo "  runner        (no image resolved; skipped)"
+  echo "  runner image  (could not read ORCH_RUNNER_IMAGE; skipped)"
 else
   case "$RUNNER_IMAGE" in
-    "$EXPECTED"*) echo "  runner image  ${RUNNER_IMAGE}" ;;
+    *"$EXPECTED"*) echo "  runner image  ${RUNNER_IMAGE}" ;;
     *)
-      echo "FAIL: runners will be created from '${RUNNER_IMAGE}', not ${EXPECTED}." >&2
-      echo "      RUNNER_IMAGE in .env disagrees with IMAGE_TAG, so a fresh runner" >&2
-      echo "      would be an older build than the api that is talking to it." >&2
+      echo "FAIL: new runners would be created from '${RUNNER_IMAGE}', not ${EXPECTED}." >&2
+      echo "      RUNNER_IMAGE in .env disagrees with IMAGE_TAG. Every runner created" >&2
+      echo "      from here on would be an older build than the api talking to it," >&2
+      echo "      and the difference is invisible until a contract changes." >&2
+      echo "      Set RUNNER_IMAGE to ghcr.io/ms-one-note-exporter/msout-runner:${EXPECTED}" >&2
       exit 1
       ;;
   esac

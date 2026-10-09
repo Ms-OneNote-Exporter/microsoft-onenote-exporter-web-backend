@@ -786,21 +786,51 @@ describe("sweep", () => {
 // ---- reconcile ------------------------------------------------------------
 
 describe("reconcile", () => {
-  it("reports success and logs a size disagreement", async () => {
+  it("reports success and removes the runner rows the orchestrator does not have", async () => {
+    // Two rows seeded; the stub names exactly one slot, `slot-1`.
+    //
+    // This test used to expect `runnerCount` to stay at 2 — i.e. it asserted that a
+    // reconciler **deleted nothing** while reporting `reconciled: true`. Its name
+    // said "logs a size disagreement" and its body pinned the disagreement as
+    // permanent, which is how `reconcile` ended up handing
+    // `reconcileRunners` the api's own rows as the set of live ids: the code
+    // satisfied the only test that described it.
+    //
+    // The disagreement is now resolved, which is what a reconciler is for.
+    seedRunners(2);
+    // `stats: "filled"` is the stub that reports `slotIds`, which the real
+    // orchestrator always does (verified against the live host). `"ok"` deliberately
+    // does not, so that it can stand for an orchestrator predating the field.
+    const { client } = orchestratorStub({ stats: "filled", slotIds: ["slot-1"] });
+
+    const result = await reconcile(options(client));
+
+    expect(result.reconciled).toBe(true);
+    expect(result.runnerCount).toBe(1);
+    expect(db.listRunners().map((r) => r.id)).toEqual(["slot-1"]);
+  });
+
+  it("reports a partial reconcile when the orchestrator names no slots", async () => {
+    // `slotIds` is optional on `OrchestratorStats` for an api briefly talking to an
+    // orchestrator that predates it. With nothing to reconcile against, nothing may
+    // be deleted — and `reconciled` must say so rather than claim a pass.
     seedRunners(2);
     const { client } = orchestratorStub({ stats: "ok" });
 
     const result = await reconcile(options(client));
 
-    expect(result.reconciled).toBe(true);
-    expect(result.runnerCount).toBe(2);
+    expect(result.reconciled).toBe(false);
+    expect(db.listRunners()).toHaveLength(2);
   });
 
   it("reconciles when the counts agree", async () => {
     seedRunners(2);
-    const { client } = orchestratorStub({ stats: "ok" });
-    await reconcile(options(client));
-    // Nothing was destroyed on the orchestrator's say-so alone.
+    const { client } = orchestratorStub({ stats: "filled", slotIds: ["slot-1", "slot-2"] });
+    const result = await reconcile(options(client));
+
+    // Both slots the orchestrator names survive. Nothing was destroyed on the
+    // orchestrator's say-so alone, and nothing was invented either.
+    expect(result.reconciled).toBe(true);
     expect(db.listRunners()).toHaveLength(2);
   });
 

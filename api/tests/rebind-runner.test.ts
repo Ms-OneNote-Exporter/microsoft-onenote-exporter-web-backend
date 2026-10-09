@@ -486,3 +486,45 @@ describe("an export that fails to start", () => {
     expect(response.json().retryable).toBe(false);
   });
 });
+
+describe("an export the user aborts", () => {
+  it("leaves 'exporting', or the slot is pinned after a button the user pressed", async () => {
+    // The §8.2 abort path is the **most reachable** of the three that set
+    // `state = 'exporting'`: a person presses Abort. It recorded `export_state` as
+    // `partial` correctly and left `state` alone, so #44's sweeper skipped the
+    // session and its slot was held for twelve hours. Observed on the deployed host.
+    seedSignedInWithoutRunner();
+    db.run(`UPDATE sessions SET runner_id = 'slot-1' WHERE guid = ?`, GUID);
+    db.run(`UPDATE runners SET status = 'active', session_guid = ? WHERE id = 'slot-1'`, GUID);
+    db.run(
+      `UPDATE sessions SET state = 'exporting', notebook = 'N', export_state = ? WHERE guid = ?`,
+      JSON.stringify({ state: "running", id: "A".repeat(43), finishedAt: null }),
+      GUID,
+    );
+
+    const runner = {
+      listNotebooks: async () => {},
+      submitCredential: async () => {},
+      startExport: async () => {},
+      abortExport: async () => {},
+    };
+    const app = buildServer(config, { ...deps(binder()), runner: runner as never });
+    await app.ready();
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/export/${"A".repeat(43)}/abort`,
+      headers: authHeaders(),
+    });
+    await app.close();
+
+    expect([202, 502]).toContain(response.statusCode);
+    // The field that decides whether this session's runner is ever released.
+    expect(row().state).not.toBe("exporting");
+    // And the partial is still recorded — §8.2 preserves what is on disk, and the
+    // state change is what a refresh reads.
+    const parsed = JSON.parse(row().export_state!) as Record<string, unknown>;
+    expect(parsed.state).toBe("partial");
+    expect(parsed.finishedAt).toBeTypeOf("number");
+  });
+});

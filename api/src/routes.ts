@@ -1137,7 +1137,16 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
     // state change is recorded here so a client that refreshes sees "partial"
     // rather than a running export that will never finish.
     deps.db.run(
-      `UPDATE sessions SET export_state = ? WHERE guid = ?`,
+      // **`state` is reset here too**, for the same reason as on the start-failure
+      // path (#51) and in `completeExport` (#45): #44's sweeper guard is
+      // `if (session.state === "exporting") continue;`, so a session left in that
+      // state is never released for idle, and nothing else writes it back.
+      //
+      // This is the **documented** path — §8.2, a user pressing Abort — so it is the
+      // most reachable of the three, and it was pinning a slot for twelve hours:
+      // observed on the deployed host, where an abort left `session.state =
+      // exporting` with the export correctly recorded as `partial`.
+      `UPDATE sessions SET state = 'authenticated', export_state = ? WHERE guid = ?`,
       JSON.stringify({
         state: "partial",
         // mac's pushback: "you stopped this" is false for a quota or disk abort.

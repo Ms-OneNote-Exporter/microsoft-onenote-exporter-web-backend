@@ -145,6 +145,17 @@ export interface SweepReport {
    */
   exportsHeld: number;
   /**
+   * Exports whose runner was released before they finished, and whose state was reset.
+   *
+   * A session in `state: 'exporting'` with `runner_id IS NULL` is stranded: the runner
+   * that would have completed the export is gone, and the sweeper skips `exporting`
+   * sessions to protect them from idle timeouts. This leaves them refusing every future
+   * export until the 12-hour absolute cap. The fix resets their state to `'authenticated'`
+   * and marks `export_state` as `'failed'` with the error string
+   * `"the runner was released before this export finished"`.
+   */
+  exportsStranded: number;
+  /**
    * Runners released because the session's login was refused.
    *
    * Counted because 'a session went idle' and 'a login was rejected' look identical from
@@ -692,6 +703,7 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
     loginExpired: 0,
     skippedErasing: 0,
     exportsHeld: 0,
+    exportsStranded: 0,
     authFailedReleased: 0,
   };
 
@@ -801,6 +813,65 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
       sse.emit(session.guid, "auth-state", { state: "expired" });
       report.loginExpired++;
       log.info("login expired", { session: session.guid });
+      continue;
+    }
+
+    // **An export whose runner is already gone is stranded, not in flight.**
+    //
+    // The branch below holds a running export's runner. This one is the opposite case,
+    // and it is checked first because the branch below `continue`s past everything.
+    //
+    // `state: 'exporting'` with `runner_id IS NULL` means the container that was to
+    // finish this export is gone, and nothing else will ever finish it: the runner is
+    // the only writer of `export-done`/`export-partial`, and there is no runner. The
+    // row then sits wrong in two places at once, and both are load-bearing:
+    //
+    //   - `export_state` still says `queued`/`running`, so `POST /api/export` refuses
+    //     every future export with `an export is already running` (routes.ts:860) —
+    //     including for a notebook the user never started an export on.
+    //   - `state` is still `exporting`, so *this* sweeper skips the session, and its
+    //     idle deadline never applies.
+    //
+    // Observed on the deployed host: two sessions in exactly this shape, refusing all
+    // exports, no log line and no event to explain why, until `TTL.absolute` erased
+    // them up to 12 hours later.
+    //
+    // Proven rather than inferred: `tests/stranded-export.test.ts` drives the real
+    // route handler seeded with a real stranded row's `export_state` and asserts the
+    // 409, then runs a sweep tick and asserts it is gone. Removing this branch turns
+    // it red.
+    //
+    // Only the runner-less case is repaired. A runner row that still exists while its
+    // container is gone is deliberately **not** handled here: `runner_id` is only ever
+    // nulled by `reconcileRunners`, which runs at boot, so this branch covers the
+    // post-boot subclass and nothing wider. Widening it to "not in the live slot set"
+    // was rejected — see the comment at the prune above, on a claimed slot being
+    // legitimately absent from `/stats` mid-re-provision.
+    if (session.state === "exporting" && session.runner_id === null) {
+      // `markExportStranded` carries the guard in SQL, not only here, so it cannot be
+      // raced by `completeExport` or pointed at a live export by a future caller. Its
+      // `ELSE` branch is the data-loss guard: a stranded session whose export already
+      // *finished* — `80837b89` on the deployed host is `partial` with a real
+      // `artifact_id`, i.e. a working download — keeps its `export_state` and
+      // `artifact_id` byte-for-byte, and only its `state` is repaired.
+      const changed = db.markExportStranded({
+        guid: session.guid,
+        now,
+        idleExpiresAt: now + TTL.authenticatedIdle,
+      });
+      if (changed) {
+        report.exportsStranded++;
+        log.warn("stranded export reset; its runner was already gone", {
+          session: session.guid,
+        });
+        // An event, because the frontend is SSE-only and the one writer that would
+        // have ended the progress card is exactly what is missing. `session-status` is
+        // the right name: the client treats it as "re-read the snapshot"
+        // (App.tsx:293). Not `export-aborted`, which renders as "Export stopped
+        // early" — a user-action framing that is false here, and the same pushback
+        // routes.ts:1152 records for a quota or disk abort.
+        sse.emit(session.guid, "session-status", { state: "authenticated" });
+      }
       continue;
     }
 

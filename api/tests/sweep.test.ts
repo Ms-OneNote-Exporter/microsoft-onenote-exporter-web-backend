@@ -133,6 +133,49 @@ function decodeBody(body: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * A subscriber that records the frames written to it, like a browser's EventSource.
+ *
+ * **Bytes, not internals.** The question this file asks — "what does a browser get
+ * told about the session?" — is answered by the wire, so it is asserted on the
+ * wire. Reaching into the hub's buffer instead would pass even if `emit` wrote a
+ * frame a browser could not parse.
+ */
+function watch(sse: SseHub, guid: string) {
+  const written: string[] = [];
+  const res = {
+    written,
+    write: (chunk: string) => {
+      written.push(String(chunk));
+      return true;
+    },
+    end: () => undefined,
+  };
+  sse.attach(guid, res as never, null);
+  return () => framesFrom(res);
+}
+
+function framesFrom(res: { written: string[] }): readonly { type: string; data: unknown }[] {
+  return res.written
+    .join("")
+    .split("\n\n")
+    .filter((frame) => frame.trim() !== "" && !frame.startsWith(":"))
+    .map((frame) => {
+      const out: { type: string; data: unknown } = { type: "", data: null };
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event: ")) out.type = line.slice("event: ".length);
+        else if (line.startsWith("data: ")) {
+          try {
+            out.data = JSON.parse(line.slice("data: ".length)) as unknown;
+          } catch {
+            out.data = line.slice("data: ".length);
+          }
+        }
+      }
+      return out;
+    });
+}
+
 function seedSession(guid: string, overrides: Partial<SessionRow> = {}): SessionRow {
   db.createSession({
     guid,
@@ -1018,5 +1061,192 @@ describe("reconcile", () => {
     await reconcile(options(client));
 
     expect(db.getSession(GUID)).toBeUndefined();
+  });
+});
+
+/**
+ * Tests for the stranded export fix: sessions in state='exporting' with runner_id=NULL
+ * are reset to state='authenticated' and have their export_state marked as 'failed'.
+ */
+describe("sweep exportsStranded", () => {
+  it("resets a stranded running export", async () => {
+    seedRunners(1);
+    seedSession(GUID, {
+      state: "exporting",
+      runner_id: null,
+      export_state: '{"state":"running","id":"art1","notebook":"NB","progress":null,"startedAt":1,"finishedAt":null}',
+      last_activity_at: now - TTL.authenticatedIdle - 1,
+    });
+
+    const { client } = orchestratorStub({ stats: "ok" });
+    const binder = new PoolBinder(options(client));
+    const report = await sweep(options(client), binder);
+
+    expect(report.exportsStranded).toBe(1);
+    expect(db.getSession(GUID)?.state).toBe("authenticated");
+    expect(db.getSession(GUID)?.runner_id).toBeNull();
+    expect(db.getSession(GUID)?.last_activity_at).toBe(now);
+    expect(db.getSession(GUID)?.idle_expires_at).toBe(now + TTL.authenticatedIdle);
+
+    const parsed = JSON.parse(db.getSession(GUID)!.export_state!);
+    expect(parsed.state).toBe("failed");
+    expect(parsed.error).toBe("the runner was released before this export finished");
+    expect(parsed.id).toBe("art1");
+    expect(parsed.notebook).toBe("NB");
+    expect(parsed.finishedAt).toBe(now);
+  });
+
+  it("leaves a session with a live runner untouched", async () => {
+    seedRunners(1);
+    seedSession(GUID, {
+      state: "exporting",
+      runner_id: "slot-1",
+      export_state: '{"state":"running","id":"art1","notebook":"NB","progress":null,"startedAt":1,"finishedAt":null}',
+    });
+
+    const { client } = orchestratorStub({ stats: "ok" });
+    const binder = new PoolBinder(options(client));
+    const report = await sweep(options(client), binder);
+
+    // Should be exportsHeld, not exportsStranded
+    expect(report.exportsHeld).toBe(1);
+    expect(report.exportsStranded).toBe(0);
+
+    expect(db.getSession(GUID)?.state).toBe("exporting");
+    expect(db.getSession(GUID)?.runner_id).toBe("slot-1");
+  });
+
+  it("keeps a stranded partial export_state byte-for-byte (data-loss guard)", async () => {
+    const partialState = JSON.stringify({
+      state: "partial",
+      partialReason: "quota",
+      id: "artifact123",
+      notebook: "NB",
+      progress: null,
+      startedAt: 1234567890,
+      finishedAt: 1234567900,
+    });
+
+    db.createSession({
+      guid: GUID,
+      secretHash: hashSecret(SECRET),
+      csrfKey: generateCsrfKey(),
+      now: now,
+      expiresAt: now + TTL.absolute,
+    });
+    db.run(
+      `UPDATE sessions SET state = 'exporting', runner_id = NULL,
+                       export_state = ?, artifact_id = 'artifact123'
+                     WHERE guid = ?`,
+      partialState,
+      GUID,
+    );
+
+    const { client } = orchestratorStub({ stats: "ok" });
+    const binder = new PoolBinder(options(client));
+    const report = await sweep(options(client), binder);
+
+    expect(report.exportsStranded).toBe(1);
+    expect(db.getSession(GUID)?.state).toBe("authenticated");
+    expect(db.getSession(GUID)?.export_state).toBe(partialState);
+    expect(db.getSession(GUID)?.artifact_id).toBe("artifact123");
+  });
+
+  it("leaves malformed export_state unchanged", async () => {
+    db.createSession({
+      guid: GUID,
+      secretHash: hashSecret(SECRET),
+      csrfKey: generateCsrfKey(),
+      now: now,
+      expiresAt: now + TTL.absolute,
+    });
+    db.run(
+      `UPDATE sessions SET state = 'exporting', runner_id = NULL, export_state = ?
+      WHERE guid = ?`,
+      "not valid json {",
+      GUID,
+    );
+
+    const { client } = orchestratorStub({ stats: "ok" });
+    const binder = new PoolBinder(options(client));
+
+    // Should not throw
+    await sweep(options(client), binder);
+
+    expect(db.getSession(GUID)?.state).toBe("authenticated");
+    expect(db.getSession(GUID)?.export_state).toBe("not valid json {");
+  });
+
+  it("leaves NULL export_state unchanged", async () => {
+    db.createSession({
+      guid: GUID,
+      secretHash: hashSecret(SECRET),
+      csrfKey: generateCsrfKey(),
+      now: now,
+      expiresAt: now + TTL.absolute,
+    });
+    db.run(
+      `UPDATE sessions SET state = 'exporting', runner_id = NULL, export_state = NULL
+      WHERE guid = ?`,
+      GUID,
+    );
+
+    const { client } = orchestratorStub({ stats: "ok" });
+    const binder = new PoolBinder(options(client));
+
+    await sweep(options(client), binder);
+
+    expect(db.getSession(GUID)?.state).toBe("authenticated");
+    expect(db.getSession(GUID)?.export_state).toBeNull();
+  });
+
+  it("emits session-status event for stranded export", async () => {
+    seedSession(GUID, {
+      state: "exporting",
+      runner_id: null,
+      export_state: '{"state":"running","id":"art1","notebook":"NB","progress":null,"startedAt":1,"finishedAt":null}',
+    });
+
+    // Attach a fake subscriber to capture SSE frames
+    const frames = watch(sse, GUID);
+
+    const { client } = orchestratorStub({ stats: "ok" });
+    const binder = new PoolBinder(options(client));
+    await sweep(options(client), binder);
+
+    // Check the SSE frames contain session-status with state authenticated
+    const events = frames();
+    expect(events.length).toBe(1);
+    expect(events[0].type).toBe("session-status");
+    expect(events[0].data).toEqual({ state: "authenticated" });
+  });
+
+  it("does not emit event for sessions not reset (live runner)", async () => {
+    seedSession(GUID, {
+      state: "exporting",
+      runner_id: "slot-1",
+      export_state: '{"state":"running","id":"art1","notebook":"NB","progress":null,"startedAt":1,"finishedAt":null}',
+    });
+
+    const { client } = orchestratorStub({ stats: "ok" });
+    const binder = new PoolBinder(options(client));
+    await sweep(options(client), binder);
+
+    expect(sse.stats()).toEqual({});
+  });
+
+  it("ignores sessions not in exporting state", async () => {
+    seedSession(GUID, {
+      state: "authenticated",
+      runner_id: null,
+      export_state: '{"state":"running","id":"art1","notebook":"NB","progress":null,"startedAt":1,"finishedAt":null}',
+    });
+
+    const { client } = orchestratorStub({ stats: "ok" });
+    const binder = new PoolBinder(options(client));
+    const report = await sweep(options(client), binder);
+
+    expect(report.exportsStranded).toBe(0);
+    expect(db.getSession(GUID)?.state).toBe("authenticated");
   });
 });

@@ -309,6 +309,15 @@ export class HttpRunnerAdapter implements RunnerAdapter {
   readonly #pumps = new Map<string, AbortController>();
   /** The runner's last sequence number seen per session, for gap-free resume. */
   readonly #seq = new Map<string, number>();
+  /**
+   * The address each live pump is currently attached to.
+   *
+   * Not derivable from `#pumps` alone, and not derivable by re-reading
+   * `addressFor`: that reads the session's *current* runner, which is the whole
+   * point — it cannot report where the open stream is actually pointed. See
+   * `ensurePump`.
+   */
+  readonly #pumpAddress = new Map<string, string>();
 
   constructor(options: HttpRunnerAdapterOptions) {
     this.#addressFor = options.addressFor;
@@ -670,12 +679,38 @@ export class HttpRunnerAdapter implements RunnerAdapter {
     });
   }
 
-  /** stopPump closes a session's event stream. Called on release and on erase. */
+  /**
+   * stopPump closes a session's event stream and forgets where it was pointing.
+   *
+   * ## Why the sequence cursor goes with it
+   *
+   * `since` is a cursor into **one runner's** event log, and the runner numbers
+   * that log per process — `runner/src/events.ts` holds a `private seq = 0` on the
+   * hub, not a global counter. A freshly created runner therefore starts its own
+   * log at 1, and `history()` answers with `ring.filter((e) => e.seq > since)`.
+   *
+   * Carry a cursor of, say, 47 from the previous runner and that filter returns
+   * **nothing** — while `gap` evaluates **false**, because 47 is greater than the
+   * new ring's oldest. The api would be handed a clean, complete-looking, empty
+   * stream and would wait for an `export-done` that can never arrive. That is bug
+   * #54 again with the stream in the right place.
+   *
+   * So the cursor is per runner, not per session, and does not outlive the address
+   * it was read from.
+   *
+   * ## Callers
+   *
+   * Erase (`removeSessionDir`), a credential handoff that failed before the
+   * session ever logged in, shutdown and the tests. **Not** the sweeper's release
+   * paths, which null `runner_id` and leave the stream in place — see the note on
+   * `ensurePump`, which is what makes that survivable.
+   */
   stopPump(sessionId: string): void {
     const controller = this.#pumps.get(sessionId);
     if (controller === undefined) return;
     this.#pumps.delete(sessionId);
     this.#seq.delete(sessionId);
+    this.#pumpAddress.delete(sessionId);
     controller.abort();
   }
 
@@ -685,11 +720,49 @@ export class HttpRunnerAdapter implements RunnerAdapter {
     this.#published.clear();
   }
 
+  /**
+   * ensurePump guarantees this session has a stream attached to **its current
+   * runner**, opening one if there is none and re-pointing one that has gone
+   * stale.
+   *
+   * The re-point is the load-bearing half. Every caller — the credential,
+   * notebook and export routes alike — reaches the runner through here, so
+   * putting the check in this one function means a session that has been
+   * released and rebound is healed by whichever route it next touches, rather
+   * than by a call at each site remembering to say so. Four callers, one
+   * invariant, and a fifth added later inherits it.
+   *
+   * This is deliberately the *general* form of the fix rather than a wiring at
+   * the rebind call site: the failure was never that one route forgot, it was
+   * that no component knew which runner a live pump was pointed at. Only this
+   * function can compare that against the session's current runner.
+   */
   #ensurePump(sessionId: string): void {
-    if (this.#pumps.has(sessionId)) return;
+    const current = this.#addressFor(sessionId);
+
+    // No runner known: leave any live pump alone. `null` is the sweeper's release
+    // saying "this session has no runner *right now*", and the sweeper does not
+    // stop the pump when it releases. Treating that as licence to tear the stream
+    // down would destroy a stream that may be one frame away from delivering
+    // `export-done` — a second instance of the bug this exists to fix. `#call`
+    // throws `no-address` a moment later and the route answers it.
+    if (current === null || current === "") return;
+
+    if (this.#pumps.has(sessionId)) {
+      // Still on the runner this stream was opened against. Returning here is what
+      // stops a reconnect from double-delivering.
+      if (this.#pumpAddress.get(sessionId) === current) return;
+
+      // The session has moved. The open stream is pointed at a runner that no
+      // longer holds it and will never deliver the events that matter; aborting
+      // is what stops it leaking a connection, and its own cleanup cannot run
+      // unguarded because it would delete the entry created below (see `#pump`).
+      this.stopPump(sessionId);
+    }
+
     const controller = new AbortController();
     this.#pumps.set(sessionId, controller);
-    void this.#pump(sessionId, controller.signal);
+    void this.#pump(sessionId, controller);
   }
 
   /**
@@ -708,12 +781,17 @@ export class HttpRunnerAdapter implements RunnerAdapter {
    * worse than one that admits a hole, because the user has no way to tell which
    * one they are looking at.
    */
-  async #pump(sessionId: string, signal: AbortSignal): Promise<void> {
+  async #pump(sessionId: string, controller: AbortController): Promise<void> {
+    const signal = controller.signal;
     const address = this.#addressFor(sessionId);
     if (address === null || address === "") {
-      this.#pumps.delete(sessionId);
+      this.#clearPump(sessionId, controller);
       return;
     }
+
+    // Recorded so `ensurePump` can tell "still on the runner this stream was
+    // opened against" from "the session has moved and this stream is stale".
+    this.#pumpAddress.set(sessionId, address);
 
     let attempt = 0;
     while (!signal.aborted) {
@@ -722,7 +800,7 @@ export class HttpRunnerAdapter implements RunnerAdapter {
       try {
         url = new URL(`/events?guid=${encodeURIComponent(sessionId)}&since=${since}`, address);
       } catch {
-        this.#pumps.delete(sessionId);
+        this.#clearPump(sessionId, controller);
         return;
       }
 
@@ -748,7 +826,26 @@ export class HttpRunnerAdapter implements RunnerAdapter {
         await sleep(delay, signal).catch(() => {});
       }
     }
-    if (signal.aborted) this.#pumps.delete(sessionId);
+    if (signal.aborted) this.#clearPump(sessionId, controller);
+  }
+
+  /**
+   * clearPump removes this pump's bookkeeping, but **only if it is still the owner**.
+   *
+   * `ensurePump` aborts a stale pump and immediately creates a replacement for
+   * the same session. The aborted pump's retry loop then wakes, sees
+   * `signal.aborted`, and runs its own exit path — which used to delete the map
+   * entry by session id alone. It would delete the *new* pump's entry, and the
+   * next call would open a third stream, delivering every event twice. That is
+   * precisely what `#pumps` exists to prevent, and it is the same shape as §0.9.8:
+   * two deleters of one piece of state and nothing to tell them apart.
+   *
+   * Comparing controllers is what tells them apart.
+   */
+  #clearPump(sessionId: string, controller: AbortController): void {
+    if (this.#pumps.get(sessionId) !== controller) return;
+    this.#pumps.delete(sessionId);
+    this.#pumpAddress.delete(sessionId);
   }
 
   /**

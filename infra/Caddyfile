@@ -149,40 +149,61 @@
 
 		handle @artifact {
 			# `/files/<id>` -> `/<id>`, so `root` resolves to the published directory.
-			rewrite * /{artifact_id}
+			uri strip_prefix /files
 
-			# The archive, by name rather than by glob. §5 makes the name carry the
-			# outcome — `vault.zip` for a complete export, `vault.partial.zip` for a
-			# partial one — and `try_files` tries in order, so a clean artifact matches
-			# the first and a partial one the second. A `*.zip` glob would also work, but
-			# naming both states explicitly says so here rather than leaving it to
-			# whichever file happens to be in the directory.
+			# **The site root, and it is load-bearing for `try_files` below** — which
+			# resolves its candidates against the *site root*, not against
+			# `file_server`'s own root. Without it, `try_files` matched nothing, no
+			# rewrite happened, and `file_server` was handed the bare artifact
+			# directory and answered 404:
 			#
-			# `try_files` is a **directive**, not a `file_server` subdirective: written
-			# inside the block it was rejected by the adapter with
-			# "unknown subdirective 'try_files'" — the same shape of mistake as the
-			# `copy_response_headers` noted above, and caught only by running
-			# `caddy validate`, which is the check that exists for exactly this.
-			try_files {path}/vault.zip {path}/vault.partial.zip
+			#     "sanitized path join","request_path":"/ms4y5B…",
+			#     "result":"/srv/msout/artifacts/ms4y5B…"
+			#
+			# A path that exists. The two `root`s look redundant and are not: one is
+			# the document root for the request, the other is where the file server
+			# looks. Setting both is what keeps them from drifting apart.
+			root * /srv/msout/artifacts
+
+			# The archive, by name rather than by glob, and in order: §5 makes the name
+			# carry the outcome — `vault.zip` for a complete export,
+			# `vault.partial.zip` for a partial one — so a partial vault is served
+			# rather than 404s, and served under the name that says what it is.
+			#
+			# ## The placeholder must be spelled in full
+			#
+			# `{artifact_id}` — the bare capture name — **expands to nothing.**
+			# Caddy rewrote the request to `//vault.zip` and `file_server` then looked
+			# for `/srv/msout/artifacts/vault.zip`, which does not exist. Every layer
+			# above reported success: the matcher matched, the rewrite ran, the file
+			# server answered, and the answer was a 404 for a file that was provably
+			# there.
+			#
+			# Found with `debug` in a throwaway container, on the log line that says
+			# what it actually resolved:
+			#
+			#     "msg":"sanitized path join","request_path":"//vault.zip"
+			#
+			# A named capture is `{http.regexp.<matcher>.<capture>}`. This is the fourth
+			# thing in this file that reads correctly, is described in a comment, and does
+			# not do what it says — after `copy_response_headers`, `protocols`, and
+			# `attachment`. Only running it found any of them.
+			try_files {http.regexp.artifact.artifact_id}/vault.zip {http.regexp.artifact.artifact_id}/vault.partial.zip
 
 			file_server {
 				root /srv/msout/artifacts
 			}
 
 			# `attachment` so a browser saves the archive rather than trying to render
-			# it.
+			# it. Written as a header because **`attachment` is not a Caddy directive**
+			# in v2 — not on its own and not inside `file_server`. Both forms were
+			# rejected by the adapter.
 			#
-			# Written as a header, because **`attachment` is not a Caddy directive at
-			# all** in v2 — not on its own and not inside `file_server`. Both were tried
-			# and rejected by the adapter: "unrecognized directive: attachment". This is
-			# the third instance in this file of a directive that reads correctly and
-			# does not exist, after `copy_response_headers` and `protocols`.
-			#
-			# **No filename is set**, deliberately. A `Content-Disposition` that names a
-			# file overrides the browser's `download` attribute, and §5 requires the
-			# notebook name to reach the client through the snapshot's `artifact.fileName`
-			# so it never appears in a path or an access log. Naming it here would
-			# either leak the artifact id as the saved name or defeat that.
+			# **No filename is set**, deliberately. A `Content-Disposition` naming a file
+			# overrides the browser's `download` attribute, and §5 requires the notebook
+			# name to reach the client through the snapshot's `artifact.fileName` so it
+			# never appears in a path or an access log. Naming it here would either leak
+			# the artifact id as the saved name or defeat that.
 			header Content-Disposition "attachment"
 		}
 

@@ -946,7 +946,23 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
     } catch (error) {
       release();
       deps.db.run(
-        `UPDATE sessions SET export_state = ? WHERE guid = ?`,
+        // **`state` is reset here too**, and it is the field that matters.
+        //
+        // The route set `state = 'exporting'` above, and #44's sweeper guard is
+        // `if (session.state === "exporting") continue;` — so a session left in that
+        // state is **never** released for idle. Nothing else writes it back:
+        // `completeExport` resets it on success, `markExportUnpublishable` resets it
+        // when publishing fails, and this path — the one where the runner refused the
+        // export outright — reset only `export_state`.
+        //
+        // So an export that failed to *start* pinned its slot until `TTL.absolute`
+        // erased the whole session twelve hours later. Observed on the deployed host:
+        // a `502 export failed to start` (the runner was busy listing notebooks, the
+        // most ordinary thing in the world) left `state = exporting` and
+        // `runner_id` bound, permanently.
+        //
+        // On a pool of two, two unlucky clicks lock every user out for half a day.
+        `UPDATE sessions SET state = 'authenticated', export_state = ? WHERE guid = ?`,
         JSON.stringify({
           state: "failed",
           partialReason: null,
@@ -970,7 +986,25 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
       // The full error goes to the log, not to the browser: it is the operator's
       // to read and may contain a path.
       request.log.error({ session: session.guid, err: error }, "export start failed");
-      return reply.code(502).send({ error: "export failed to start" });
+
+      // **Not always a 502.** `busy` and `no_auth` are not gateway failures, and
+      // #40 established the vocabulary for exactly this — it was applied to the
+      // credential and notebook routes and **missed here**, so a user who clicked
+      // export while the runner was still listing notebooks was told the service was
+      // broken. Observed on the deployed host: `the runner is holding another job`
+      // rendered as `502 export failed to start`.
+      //
+      // The two call for opposite advice, so they are answered differently — and the
+      // statuses are `runnerFailure`'s, unchanged from #40, not invented here:
+      //   busy    → 503, retryable: the wait is a listing, tens of seconds
+      //   no_auth → 409, **not** retryable: the runner lost its cookie jar, and
+      //             repeating cannot help until the user signs in again
+      const failure = runnerFailure(error);
+      return reply.code(failure.status).send({
+        error: failure.message,
+        reason: failure.kind,
+        retryable: failure.retryable,
+      });
     }
 
     // The slot is released when the run finishes rather than being held for the

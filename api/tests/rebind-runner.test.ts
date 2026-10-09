@@ -42,6 +42,7 @@ import { RateLimiter } from "../src/rate-limit.js";
 import { SESSION_COOKIE } from "../src/csrf.js";
 import { generateCsrfKey, hashSecret } from "../src/session.js";
 import { PoolBinder } from "../src/sweep.js";
+import { RunnerCallError } from "../src/runner-adapter-http.js";
 import { derive } from "./helpers.js";
 
 const ALLOWED = "https://app.example.com";
@@ -404,5 +405,84 @@ describe("a signed-in session whose runner was released", () => {
     expect(received.filter((e) => e.type === "auth-state")).toHaveLength(0);
     // What it is told is true: still authenticated, and working.
     expect(received.some((e) => e.type === "session-status")).toBe(true);
+  });
+});
+describe("an export that fails to start", () => {
+  /** A runner whose export start is refused, with a named adapter failure. */
+  function refusingRunner(failure: unknown) {
+    return {
+      listNotebooks: async () => {},
+      submitCredential: async () => {},
+      abortExport: async () => {},
+      startExport: async () => {
+        throw failure;
+      },
+    };
+  }
+
+  async function startExport(runner: unknown) {
+    seedSignedInWithoutRunner();
+    const app = buildServer(config, { ...deps(binder()), runner: runner as never });
+    await app.ready();
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/export",
+      headers: { ...authHeaders(), "content-type": "application/json" },
+      payload: JSON.stringify({ notebook: "Notebook" }),
+    });
+    await app.close();
+    return response;
+  }
+
+  it("leaves 'exporting', or the slot is pinned for twelve hours", async () => {
+    // **The field that matters.** #44's sweeper guard is
+    // `if (session.state === "exporting") continue;`, and nothing else writes this
+    // row back on this path — so leaving it here holds the runner until
+    // `TTL.absolute` erases the session. Observed live: a 502 left
+    // `state = exporting` and `runner_id` bound, permanently.
+    const busy = new RunnerCallError("busy", "the runner is holding another job");
+    const response = await startExport(refusingRunner(busy));
+
+    expect(response.statusCode).toBeGreaterThanOrEqual(400);
+    expect(row().state).not.toBe("exporting");
+    expect(row().state).toBe("authenticated");
+  });
+
+  it("records the failure with a finishedAt, so the client stops showing 'running'", async () => {
+    const busy = new RunnerCallError("busy", "the runner is holding another job");
+    await startExport(refusingRunner(busy));
+
+    const parsed = JSON.parse(row().export_state!) as Record<string, unknown>;
+    expect(parsed.state).toBe("failed");
+    expect(parsed.finishedAt).toBeTypeOf("number");
+  });
+
+  it("answers a busy runner with 503 retryable, not 502 Bad Gateway", async () => {
+    // #40 established this vocabulary for the credential and notebook routes and
+    // missed the export route, so clicking export while the runner was still listing
+    // notebooks told the user the service was broken.
+    const busy = new RunnerCallError("busy", "the runner is holding another job");
+    const response = await startExport(refusingRunner(busy));
+
+    // 503, not 409: that is the vocabulary `runnerFailure` already established for
+    // the credential and notebook routes in #40, and this route now uses the same
+    // function rather than a bare 502 of its own.
+    expect(response.statusCode).toBe(503);
+    expect(response.json().retryable).toBe(true);
+    expect(response.json().error).not.toMatch(/gateway/i);
+  });
+
+  it("does not claim a session with no auth state as retryable", async () => {
+    // `no_auth` means the runner lost its cookie jar. Repeating cannot help until the
+    // user signs in again, and telling them to retry is the advice that sends someone
+    // to press a button that will never work.
+    const noAuth = new RunnerCallError(
+      { kind: "not-ready", reason: "no_auth" },
+      "the runner has no auth state for this session",
+    );
+    const response = await startExport(refusingRunner(noAuth));
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json().retryable).toBe(false);
   });
 });

@@ -579,14 +579,49 @@ check(
   `api bind-mounts ${bindsFor("api").map((v) => v.source).join(", ")}; §2.1 gives it no host path`,
 );
 
-// 3c. Caddy takes no host path either, and no socket.
-// Its only host surface is the read-only Caddyfile, which compose renders as a
-// bind; everything else it needs is a named volume.
+// 3c. Caddy takes no host path but two, and no socket.
+//
+// One is the read-only Caddyfile, which compose renders as a bind; everything else
+// it needs is a named volume. The other is the artifact root, which §2.2 requires
+// Caddy to have **read-only** — it serves the archives and makes no authorisation
+// decision, so it needs to see them and nothing more.
+//
+// The second one was added late and **the assertion caught it**: the capability
+// suite went red on a compose file whose change was deliberate, which is what it is
+// for. An allowlist that nobody widens when a control legitimately grows is an
+// allowlist that gets deleted the first time it is inconvenient.
 const caddyBinds = bindsFor("caddy").map((v) => v.source);
+// Compared against `ARTIFACT_HOST_DIR` rather than a literal like "artifacts/",
+// because the two environments that run this disagree about it: CI stages at
+// `/srv/msout/artifacts-host`, the deployed host at `/opt/msout/data/artifacts`.
+// A hardcoded suffix passes CI and is wrong everywhere else — "green because the
+// fixture happened to be right", which is the failure this file exists to catch.
+const artifactRoot = `${process.env.ARTIFACT_HOST_DIR}/`;
+const caddyUnexpected = caddyBinds.filter(
+  (src) => !src.endsWith("Caddyfile") && src !== artifactRoot,
+);
 check(
-  caddyBinds.every((src) => src.endsWith("Caddyfile")),
-  `caddy bind-mounts only its config (${caddyBinds.join(", ") || "none"})`,
-  `caddy bind-mounts something unexpected: ${caddyBinds.join(", ")}`,
+  caddyUnexpected.length === 0,
+  `caddy bind-mounts only its config and the artifact root (${caddyBinds.join(", ") || "none"})`,
+  `caddy bind-mounts something unexpected: ${caddyUnexpected.join(", ")}`,
+);
+
+// The artifact mount must be **read-only**, asserted rather than reviewed.
+//
+// A writable artifact tree is worse than no artifact tree: the orchestrator
+// publishes by renaming a staging directory into place, and a Caddy that can write
+// can replace an archive a user is part-way through downloading. `compose config`
+// reports this as `read_only` on the mount.
+const caddyArtifactMount = bindsFor("caddy").find((v) => String(v.source) === artifactRoot);
+check(
+  caddyArtifactMount !== undefined && caddyArtifactMount.read_only === true,
+  "caddy's artifact mount is read-only",
+  caddyArtifactMount === undefined
+    ? "caddy has no artifact mount at all. /files/* would 404 for every user: the file " +
+      "server's root would not exist inside the container, which is exactly what " +
+      "happened on 2026-10-09 for a deployment that looked entirely healthy"
+    : `caddy's artifact mount is WRITABLE (read_only: ${caddyArtifactMount.read_only}). ` +
+      "Caddy only serves archives; the orchestrator publishes them",
 );
 
 // 4. The edge network holds Caddy alone.

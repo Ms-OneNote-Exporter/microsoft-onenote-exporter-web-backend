@@ -87,6 +87,50 @@ export const UNPUBLISHABLE =
   "Nothing was lost — there is no need to export again.";
 
 /**
+ * NOTEBOOK_NOT_FOUND is the message a user sees when the notebook had no
+ * sections at all — so nothing could be walked.
+ *
+ * `exporter.js` sets `notebookNotFound` for a *genuinely empty* notebook and for
+ * one that never loaded, because both produce the same empty list and the
+ * package's judgement is that *"neither is a success"*. So this message must not
+ * claim the notebook is missing: for a user with an empty notebook that would be
+ * a lie, and it would be a lie about work that was never attempted.
+ *
+ * It is also **not** UNPUBLISHABLE's text. That one says *"Nothing was lost —
+ * there is no need to export again"*, which the frontend then follows with
+ * *"Nothing was completed, so you can start again."* The two contradict each
+ * other on the same line, which is why the classification has its own message.
+ *
+ * Written to read as the middle of a sentence: the frontend wraps it as
+ * `The export failed: ${error} Nothing was completed, so you can start again.`
+ * So it states no outcome of its own and offers no advice of its own.
+ */
+export const NOTEBOOK_NOT_FOUND =
+  "this notebook has no sections, so there was nothing to walk — " +
+  "it may be empty, or OneNote may not have loaded it.";
+
+/**
+ * LOST_ALL_PAGES is the message when the walk ran but wrote no pages at all.
+ *
+ * Distinct from NOTEBOOK_NOT_FOUND because work *was* attempted and failed —
+ * sections were found and could not be exported — which is a different problem
+ * with a different remedy from a notebook that was never there.
+ */
+export const LOST_ALL_PAGES =
+  "every section failed to export, so no pages were written.";
+
+/**
+ * WALK_FAILED is the message when the runner's export threw before any outcome.
+ *
+ * Says nothing about *why*. The cause is in the log (`err`), never here: a stack,
+ * a module path, or "Chromium missing" is our internals and tells the user
+ * nothing they can act on. It also does not claim nothing was lost, because we
+ * cannot know that — the walk threw partway, and the vault may hold pages it had
+ * already written.
+ */
+export const WALK_FAILED = "the export stopped unexpectedly partway through.";
+
+/**
  * completeExport publishes a finished export's vault and records the result.
  *
  * Never throws. It is called from the event pump, where a rejection would tear
@@ -98,6 +142,33 @@ export async function completeExport(
   input: ExportFinishedInput,
 ): Promise<void> {
   const now = deps.now ?? Date.now;
+
+  // ---- Classification: decide whether to stage, finalise, and record
+  //
+  // The order matters. Walk failure is checked first because it's a third,
+  // distinct failure mode (not notebookNotFound and not loss counts).
+  //
+  // - walkFailed → failed, no artifact staged (throw in runExport)
+  // - notebookNotFound → failed, no artifact staged (empty notebook)
+  // - lost > 0 && pages === 0 → failed, no artifact staged (all pages failed)
+  // - lost > 0 && pages > 0 → partial, artifact staged and labelled
+  // - otherwise → done, artifact staged
+  //
+  // On `failed`, we skip staging entirely — no empty vault.zip is written.
+  const lost = input.failedSections + input.failedPages + input.failedGroups;
+
+  // walkFailed means runExport threw; the notebook was not the problem.
+  if (input.walkFailed === true) {
+    return unpublishableWalkFailed(deps, input, "the runner threw while exporting");
+  }
+
+  if (input.notebookNotFound === true) {
+    return unpublishableNotebookNotFound(deps, input, "notebook not found");
+  }
+
+  if (lost > 0 && input.progress?.pages === 0) {
+    return unpublishableLostAllPages(deps, input, "the walk wrote nothing; every page and section failed");
+  }
 
   // ---- 1. stage: the runner zips the vault into the artifact staging directory.
   try {
@@ -191,4 +262,104 @@ function unpublishable(
   // path and no host detail — the same rule as every other error crossing to a
   // browser in this api.
   void detail;
+}
+
+/**
+ * unpublishableNotebookNotFound records a failure where the notebook had no
+ * sections — either genuinely empty or never loaded.
+ *
+ * This is a *failed* export with no artifact written at all. Unlike unpublishable
+ * (which is for "walked but could not publish"), this is "nothing to publish
+ * because the target didn't exist or had no content".
+ *
+ * The key distinction: UNPUBLISHABLE says "nothing was lost, don't re-export".
+ * This says "the notebook was empty or missing, re-export won't help".
+ */
+function unpublishableNotebookNotFound(
+  deps: ExportCompletionDeps,
+  input: ExportFinishedInput,
+  cause: string,
+): void {
+  deps.log.error("export failed because notebook was not found", {
+    session: input.sessionId,
+    artifactId: input.artifactId,
+    err: cause,
+  });
+  deps.db.markExportUnpublishable({
+    guid: input.sessionId,
+    error: NOTEBOOK_NOT_FOUND,
+    artifactId: input.artifactId,
+    notebook: input.notebook,
+    partialReason: input.partialReason,
+    finishedAt: input.finishedAt,
+  });
+  // `cause` is for the log only. The user gets `NOTEBOOK_NOT_FOUND`, which contains
+  // no path and no host detail.
+  void cause;
+}
+
+/**
+ * unpublishableWalkFailed records a failure where runExport threw an error.
+ *
+ * This is a *failed* export with no artifact written at all. The walk did not
+ * even get to run due to a runtime error (Chromium missing, module import failed,
+ * etc).
+ *
+ * The key distinction: this is NOT notebookNotFound (the notebook was fine),
+ * and NOT "walk produced no pages" (no pages were attempted). This is "the
+ * exporter itself threw".
+ */
+function unpublishableWalkFailed(
+  deps: ExportCompletionDeps,
+  input: ExportFinishedInput,
+  cause: string,
+): void {
+  deps.log.error("export failed because the runner threw", {
+    session: input.sessionId,
+    artifactId: input.artifactId,
+    err: cause,
+  });
+  deps.db.markExportUnpublishable({
+    guid: input.sessionId,
+    error: WALK_FAILED,
+    artifactId: input.artifactId,
+    notebook: input.notebook,
+    partialReason: input.partialReason,
+    finishedAt: input.finishedAt,
+  });
+  // `cause` is for the log only. The user gets a message that names the problem
+  // but contains no path, no stack, and no host detail.
+  void cause;
+}
+
+/**
+ * unpublishableLostAllPages records a failure where the walk wrote no pages.
+ *
+ * This is a *failed* export with no artifact written at all. The walk ran, but
+ * every page and section failed, so there is nothing to archive.
+ *
+ * The key distinction: UNPUBLISHABLE says "nothing was lost, don't re-export".
+ * This says "the walk produced nothing; every page and section failed".
+ */
+function unpublishableLostAllPages(
+  deps: ExportCompletionDeps,
+  input: ExportFinishedInput,
+  cause: string,
+): void {
+  deps.log.error("export failed because the walk produced no pages", {
+    session: input.sessionId,
+    artifactId: input.artifactId,
+    err: cause,
+  });
+  deps.db.markExportUnpublishable({
+    guid: input.sessionId,
+    error: LOST_ALL_PAGES,
+    artifactId: input.artifactId,
+    notebook: input.notebook,
+    partialReason: input.partialReason,
+    finishedAt: input.finishedAt,
+  });
+  // `cause` is for the log only. See NOTEBOOK_NOT_FOUND for why this cannot be
+  // UNPUBLISHABLE's text.
+  void cause;
 }

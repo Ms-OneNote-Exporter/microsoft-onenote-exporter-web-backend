@@ -254,7 +254,18 @@ export class MockRunner implements RunnerAdapter, RunnerEraseControl {
       startedAt: Date.now(),
       finishedAt: Date.now(),
     });
-    this.#sse.emit(sessionId, "export-done", { id: exportId, notebook, pages, sections, assets });
+    // The new export-done now includes counts of failed items and notebookNotFound.
+    // The mock always produces a successful export, so all failure counts are zero.
+    this.#sse.emit(sessionId, "export-done", {
+      id: exportId,
+      notebook,
+      pages,
+      sections,
+      assets,
+      failedSections: 0,
+      failedPages: 0,
+      failedGroups: 0,
+    });
   }
 
   /**

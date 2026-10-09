@@ -26,7 +26,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 
-import { completeExport, UNPUBLISHABLE, type ExportCompletionDeps } from "../src/export-completion.js";
+import { completeExport, LOST_ALL_PAGES, NOTEBOOK_NOT_FOUND, UNPUBLISHABLE, WALK_FAILED, type ExportCompletionDeps } from "../src/export-completion.js";
 import type { ExportFinishedInput } from "../src/runner-adapter-http.js";
 
 const GUID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
@@ -254,5 +254,119 @@ describe("when publishing fails", () => {
     // contain a path. The stored error is what a browser renders.
     expect(String(h.unpublishable()?.error)).not.toContain("/");
     expect(String(h.unpublishable()?.error)).not.toContain("ENOSPC");
+  });
+});
+
+describe("classification of failed exports", () => {
+  function failedFinished(overrides: Partial<ExportFinishedInput> = {}): ExportFinishedInput {
+    return finished({
+      ...overrides,
+      partial: false,
+      partialReason: null,
+      progress: { pages: 0, sections: 0, assets: 0 },
+    });
+  }
+
+  it("does not stage when notebookNotFound is true", async () => {
+    const h = harness();
+
+    await completeExport(
+      h.deps,
+      failedFinished({ notebookNotFound: true, notebook: "Notebook" }),
+    );
+
+    // When notebookNotFound, we skip staging entirely - no empty vault.zip is written
+    expect(h.order).toEqual(["unpublishable"]);
+    expect(h.deps.runner.publishArtifact).not.toHaveBeenCalled();
+    expect(h.finalizeInput()).toBeUndefined();
+    expect(h.complete()).toBeUndefined();
+    expect(h.unpublishable()?.error).toBe(NOTEBOOK_NOT_FOUND);
+  });
+
+  it("does not stage when lost > 0 and pages === 0", async () => {
+    const h = harness();
+
+    await completeExport(
+      h.deps,
+      failedFinished({
+        failedSections: 2,
+        failedPages: 5,
+        failedGroups: 1,
+        pages: 0,
+      }),
+    );
+
+    // When the walk produced no pages, we skip staging entirely
+    expect(h.order).toEqual(["unpublishable"]);
+    expect(h.deps.runner.publishArtifact).not.toHaveBeenCalled();
+    expect(h.finalizeInput()).toBeUndefined();
+    expect(h.complete()).toBeUndefined();
+    // **Not** UNPUBLISHABLE. That text says "Nothing was lost — there is no need to
+    // export again", which the frontend then follows with "Nothing was completed,
+    // so you can start again." The two contradict each other on one line, and
+    // this case is a real loss: sections were found and every one failed.
+    expect(h.unpublishable()?.error).toBe(LOST_ALL_PAGES);
+    expect(h.unpublishable()?.error).not.toBe(UNPUBLISHABLE);
+    expect(h.unpublishable()?.error).not.toContain("Nothing was lost");
+  });
+
+  it("stages and records when partial true (some pages succeeded, some failed)", async () => {
+    const h = harness();
+
+    await completeExport(
+      h.deps,
+      finished({
+        partial: true,
+        progress: { pages: 10, sections: 5, assets: 30 },
+        failedSections: 2,
+        failedPages: 3,
+        failedGroups: 1,
+      }),
+    );
+
+    // The order is 'stage', 'finalize', 'record' - all three steps
+    expect(h.order).toEqual(["stage", "finalize", "record"]);
+    expect(h.finalizeInput()?.partial).toBe(true);
+  });
+
+  it("stages and records when partial false (no failures)", async () => {
+    const h = harness();
+
+    await completeExport(h.deps, finished());
+
+    expect(h.order).toEqual(["stage", "finalize", "record"]);
+    expect(h.finalizeInput()?.partial).toBe(false);
+  });
+});
+
+/**
+ * The three failure messages, and the one rule they all obey.
+ *
+ * The frontend renders `state: 'failed'` as
+ * `The export failed: ${running.error} Nothing was completed, so you can start again.`
+ * So a message that says "nothing was lost" or offers its own advice appears on
+ * one line contradicting the sentence wrapped around it. Each of these three
+ * shipped into a draft that way — LOST_ALL_PAGES was literally UNPUBLISHABLE's
+ * text — and the assertion that caught it was the one that pinned the bug.
+ */
+describe("the failure messages", () => {
+  for (const [name, message] of [
+    ["NOTEBOOK_NOT_FOUND", NOTEBOOK_NOT_FOUND],
+    ["LOST_ALL_PAGES", LOST_ALL_PAGES],
+    ["WALK_FAILED", WALK_FAILED],
+  ] as const) {
+    it(`${name} does not contradict the sentence the frontend wraps around it`, () => {
+      // The frontend appends both of these itself.
+      expect(message).not.toMatch(/nothing was lost/i);
+      expect(message).not.toMatch(/no need to export again/i);
+      expect(message).not.toMatch(/you can start again|try exporting again/i);
+      // And no host paths, ids, or internals.
+      expect(message).not.toMatch(/\/|stack|chromium|runner/i);
+    });
+  }
+
+  it("NOTEBOOK_NOT_FOUND is distinct from UNPUBLISHABLE", () => {
+    expect(NOTEBOOK_NOT_FOUND).not.toBe(UNPUBLISHABLE);
+    expect(NOTEBOOK_NOT_FOUND).toMatch(/has no sections|empty|not loaded/i);
   });
 });

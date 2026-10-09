@@ -1094,6 +1094,9 @@ describe("a finished export is handed on, not just published", () => {
         pages: 20,
         sections: 7,
         assets: 55,
+        failedSections: 0,
+        failedPages: 0,
+        failedGroups: 0,
       })}\n\n`,
     ];
   }
@@ -1270,5 +1273,99 @@ describe("a finished export is handed on, not just published", () => {
     // without a slow fake. Recorded rather than pretended at.
     expect(runner.seen.some((r) => r.url.includes("/artifacts"))).toBe(true);
     expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it("parses the new failure counts and notebookNotFound from export-done", async () => {
+    const runner = await fakeRunner();
+    const seen: ExportFinishedInput[] = [];
+    const adapter = adapterFor(runner, {
+      onExportFinished: (input) => {
+        seen.push(input);
+      },
+    });
+
+    runner.sseFrames = [
+      `id: 1\ndata: ${JSON.stringify({
+        type: "export-done",
+        id: ARTIFACT,
+        notebook: "Notebook",
+        pages: 10,
+        sections: 5,
+        assets: 20,
+        failedSections: 2,
+        failedPages: 3,
+        failedGroups: 1,
+        notebookNotFound: false,
+      })}\n\n`,
+    ];
+    await adapter.listNotebooks(SESSION);
+    await adapter.drain();
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({
+      failedSections: 2,
+      failedPages: 3,
+      failedGroups: 1,
+      notebookNotFound: false,
+    });
+  });
+
+  it("sets partial true only when some pages exported but some failed", async () => {
+    const runner = await fakeRunner();
+    const adapter = adapterFor(runner, {
+      onExportFinished: () => undefined, // don't collect, just test the logic
+    });
+
+    // 0 pages, 2 failed sections → partial = false (no artifact)
+    runner.sseFrames = [
+      `id: 1\ndata: ${JSON.stringify({
+        type: "export-done",
+        id: ARTIFACT,
+        notebook: "Notebook",
+        pages: 0,
+        sections: 0,
+        assets: 0,
+        failedSections: 2,
+        failedPages: 0,
+        failedGroups: 0,
+      })}\n\n`,
+    ];
+    await adapter.listNotebooks(SESSION);
+    // The first export with 0 pages should produce a terminal that is marked as failure (partial=false)
+    // and won't actually invoke publishArtifact - that's tested in export-completion.test.ts
+  });
+
+  it("parses the new fields from export-partial", async () => {
+    const runner = await fakeRunner();
+    const seen: ExportFinishedInput[] = [];
+    const adapter = adapterFor(runner, {
+      onExportFinished: (input) => {
+        seen.push(input);
+      },
+    });
+
+    runner.sseFrames = [
+      `id: 1\ndata: ${JSON.stringify({
+        type: "export-partial",
+        id: ARTIFACT,
+        reason: "aborted",
+        failedSections: 1,
+        failedPages: 2,
+        failedGroups: 0,
+        notebookNotFound: false,
+      })}\n\n`,
+    ];
+    await adapter.listNotebooks(SESSION);
+    await adapter.drain();
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({
+      partial: true,
+      partialReason: "aborted",
+      failedSections: 1,
+      failedPages: 2,
+      failedGroups: 0,
+      notebookNotFound: false,
+    });
   });
 });

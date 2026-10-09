@@ -754,11 +754,38 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
     // Listing needs an authenticated session, because the CLI reads auth.json.
     if (requireAuthenticated(session, reply) !== null) return reply;
 
+    // **A released runner is re-bound, not refused.**
+    //
+    // This guard used to be a bare 409. `releaseForIdle` nulls `runner_id` after the
+    // 30-minute idle deadline, so every session that stopped for half an hour came
+    // back unable to list notebooks — while its `auth.json` was still on disk and the
+    // plan's own §2.3 step 3→4 says the runner is meant to be re-claimed transparently:
+    //
+    //     Activity again → new runner claimed, same session volume remounted, so
+    //     auth.json, notebook cache and artifacts are all still there.
+    //
+    // Only the credential route ever did that rebind, so the session was effectively
+    // locked out of both runner routes until it signed in again. Observed live on
+    // 2026-10-09, immediately after a first successful export.
+    //
+    // `claimForRebind` rather than `claimForLogin`: the session is **valid**, and a
+    // login claim would write `auth_state = 'authenticating'` and make every later
+    // route answer "still signing in" for an account that never stopped being signed
+    // in. See `claimForRebind`.
     if (session.runner_id === null) {
-      return reply.code(409).send({ error: "no runner bound to this session" });
+      const rebound = await rebindRunner(request, reply, session, deps);
+      if (rebound !== null) return rebound;
     }
 
-    deps.sse.emit(session.guid, "auth-state", { state: "authenticating" });
+    // **Not `auth-state: authenticating`.** That is what this emitted, one line after
+    // `requireAuthenticated` had just proved the session is `valid` — a browser reading
+    // it would show the sign-in screen for a session that was signed in, which is bug
+    // #21's shape: a right answer to a question nobody should have been asked.
+    //
+    // The listing-progress signal is `session-status`, which says what is true — the
+    // session is authenticated and working — and which this route already emits on
+    // completion below.
+    deps.sse.emit(session.guid, "session-status", { state: "authenticated" });
 
     if (deps.runner === undefined) {
       return reply.code(501).send({ error: "notebook listing not wired yet" });
@@ -856,8 +883,15 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
     };
 
     if (session.runner_id === null) {
-      release();
-      return reply.code(409).send({ error: "no runner bound to this session" });
+      // Same rebind as the notebooks route, for the same reason: `releaseForIdle`
+      // nulls `runner_id` after the idle deadline, and refusing here meant a signed-in
+      // session could export **once**. Every second export answered
+      // `409 no runner bound to this session` until the user signed in again.
+      const rebound = await rebindRunner(request, reply, session, deps);
+      if (rebound !== null) {
+        release();
+        return rebound;
+      }
     }
 
     const exportId = generateArtifactId();
@@ -1144,6 +1178,73 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
  * credential sends them round a loop that cannot end, and the client cannot infer which
  * case it is — that is why `reason` is in the body.
  */
+/**
+ * rebindRunner binds a runner to a session that has none, and reports why if it cannot.
+ *
+ * Returns `null` when the session now has a runner — the caller continues — and the
+ * **already-sent reply** when it does not, so no caller can forget to check.
+ *
+ * ## Why one helper rather than two inline blocks
+ *
+ * Because the failure vocabulary is four answers long and they are not
+ * interchangeable: `busy` means wait, `pool cannot fill` means waiting does not help,
+ * `control plane unreachable` means retry, and `pool diverged` means an operator is
+ * needed. The credential route grew that mapping in #29 and #40 and got it right.
+ * Duplicating it into two more routes is how one of them ends up answering "every
+ * session is busy" for a pool that cannot fill — which is exactly what happened once
+ * already, for hours, on a live host.
+ *
+ * ## Why a rebind and not a login claim
+ *
+ * `claimForRebind` binds the slot and leaves `auth_state` alone. The session is
+ * `valid` — `requireAuthenticated` has just proved it, and the `auth.json` is still
+ * in the vault — so writing `authenticating` would be a lie that every later route
+ * then acts on.
+ */
+async function rebindRunner(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  session: SessionRow,
+  deps: RouteDeps,
+): Promise<FastifyReply | null> {
+  if (deps.poolBinder === undefined) {
+    // The unwired state. Said plainly rather than pretending the pool is busy.
+    return reply.code(409).send({ error: "no runner bound to this session" });
+  }
+
+  const bound = await deps.poolBinder.claimForRebind(session);
+  if (bound.ok) {
+    request.log.info(
+      { session: session.guid, runner: bound.runnerId },
+      "runner rebound to a session with none",
+    );
+    return null;
+  }
+
+  // The same four answers the credential route gives, for the same reasons. See the
+  // comment at that call site for why each is distinct and what each tells a user.
+  const cannotFill = bound.reason === "pool-exhausted" && bound.fillError !== undefined;
+  if (bound.reason === "slot-conflict") {
+    return reply.code(409).send({
+      error: "the service's view of its runner pool is out of date",
+      retryable: false,
+      cause: "pool-diverged",
+    });
+  }
+
+  return reply
+    .code(bound.reason === "pool-exhausted" ? 503 : 502)
+    .send({
+      error: cannotFill
+        ? "the service cannot start a browser right now"
+        : bound.reason === "pool-exhausted"
+          ? "every session is busy"
+          : "runner control plane unreachable",
+      retryable: true,
+      ...(cannotFill ? { cause: "pool-unfillable" } : {}),
+    });
+}
+
 function requireAuthenticated(
   session: SessionRow,
   reply: FastifyReply,

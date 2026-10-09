@@ -37,6 +37,80 @@ export const TTL = {
   absolute: 12 * 60 * 60 * 1000,
 } as const;
 
+/**
+ * Which kind of binding a claim is performing.
+ *
+ * Both take an idle slot and bind it to a session; they differ **only** in what they
+ * then write about the session's state, and that difference is the whole point.
+ */
+export type ClaimMode = "login" | "rebind";
+
+/** What every claim entry point answers with. Named once so the two cannot drift. */
+export type ClaimResult =
+  | { ok: true; runnerId: string; containerId: string; runnerUrl: string | null }
+  | {
+      ok: false;
+      reason: "pool-exhausted" | "orchestrator-unreachable" | "slot-conflict";
+      /**
+       * Why the pool could not fill, when the orchestrator said.
+       *
+       * The distinction is between "busy, try shortly" and "cannot start runners
+       * at all", and it is the difference between a user waiting and an operator
+       * being paged. Found by deploying to a host where every create failed: the
+       * api said *every session is busy* for hours while `healthz` said `ok`.
+       */
+      fillError?: string;
+    };
+
+/**
+ * claimBindingWrite is the one place a claim decides what it says about the session.
+ *
+ * ## Why this is a function and not an `if` at the call site
+ *
+ * Because the two cases differ in exactly one field, and that field is the one the
+ * product is judged on. A login is genuinely `authenticating` — a credential is in
+ * flight. A rebind is **not**: the vault still holds the `auth.json` that made the
+ * session valid, and demoting it to `authenticating` makes `requireAuthenticated`
+ * refuse every later route with *"still signing in"* and tells the browser to show
+ * the sign-in screen for an account that never stopped being signed in.
+ *
+ * `auth_state` is written for a login and **omitted** for a rebind, so the column
+ * keeps whatever it was. Not "restored afterwards" — a claim that wrote the wrong
+ * value and then repaired it has a window in which the wrong value is readable, and
+ * the window *is* the bug.
+ *
+ * The idle deadline differs for the same reason: a rebind is not a 15-minute
+ * sign-in window.
+ */
+function claimBindingWrite(
+  mode: ClaimMode,
+  guid: string,
+  slotId: string,
+  now: number,
+): [string, ...unknown[]] {
+  return mode === "login"
+    ? [
+        `UPDATE sessions SET runner_id = ?, state = 'authenticating', auth_state = 'authenticating',
+                            idle_expires_at = ?, last_activity_at = ?
+          WHERE guid = ?`,
+        slotId,
+        now + TTL.loginInProgress,
+        now,
+        guid,
+      ]
+    : [
+        // `state` only. `auth_state` is not in the SET list at all, so a rebind
+        // cannot demote a valid session whatever it was called with.
+        `UPDATE sessions SET runner_id = ?, state = 'authenticated',
+                            idle_expires_at = ?, last_activity_at = ?
+          WHERE guid = ?`,
+        slotId,
+        now + TTL.authenticatedIdle,
+        now,
+        guid,
+      ];
+}
+
 /** Why a session was reaped. Recorded so the log line is diagnosable. */
 export type ReapReason =
   | "unclaimed-expired"
@@ -159,22 +233,47 @@ export class PoolBinder {
    */
   async claimForLogin(
     session: SessionRow,
-  ): Promise<
-    | { ok: true; runnerId: string; containerId: string; runnerUrl: string | null }
-    | {
-        ok: false;
-        reason: "pool-exhausted" | "orchestrator-unreachable" | "slot-conflict";
-        /**
-         * Why the pool could not fill, when the orchestrator said.
-         *
-         * The distinction is between "busy, try shortly" and "cannot start runners
-         * at all", and it is the difference between a user waiting and an operator
-         * being paged. Found by deploying to a host where every create failed: the
-         * api said *every session is busy* for hours while `healthz` said `ok`.
-         */
-        fillError?: string;
-      }
-  > {
+  ): Promise<ClaimResult> {
+    return this.#claimWithRetries(session, "login");
+  }
+
+  /**
+   * claimForRebind binds a runner to a session that is **already signed in**.
+   *
+   * ## Why this is not `claimForLogin`
+   *
+   * `claimForLogin` writes `auth_state = 'authenticating'` and `state = 'authenticating'`,
+   * because at that point a credential is genuinely on its way and the session is not
+   * yet signed in. For a rebind that would be a **lie**: the vault still holds the
+   * `auth.json` that made the session valid, and nothing about re-binding a container
+   * changes it.
+   *
+   * Observed, had this been reused as-is: a user who exported once, waited out the
+   * 30-minute idle release, and clicked export again would have had their valid
+   * session demoted to `authenticating` — so `requireAuthenticated` would refuse
+   * every subsequent route with *"still signing in; the service is not ready yet"*,
+   * and the browser would be told to show the sign-in screen for an account that was
+   * signed in the whole time.
+   *
+   * That is bug #21's shape exactly: a field made to distinguish two states, and a
+   * writer that puts the wrong one there.
+   *
+   * So this writes `state = 'authenticated'` and **leaves `auth_state` untouched**.
+   * The idle deadline is the authenticated one, not the login one: this is not a
+   * 15-minute sign-in window.
+   */
+  async claimForRebind(session: SessionRow): Promise<ClaimResult> {
+    return this.#claimWithRetries(session, "rebind");
+  }
+
+  /**
+   * #claimWithRetries is the bounded-conflict loop both entry points share.
+   *
+   * Kept as one function so the retry policy and its reasoning cannot drift between
+   * a login and a rebind — they are the same problem, and the drift between them
+   * would be invisible until one of them failed where the other worked.
+   */
+  async #claimWithRetries(session: SessionRow, mode: ClaimMode): Promise<ClaimResult> {
     // Retried a bounded number of times, and only for a **conflict** — the one
     // outcome that a different row can fix.
     //
@@ -190,7 +289,7 @@ export class PoolBinder {
     // across a restart) and short enough that a genuine disagreement surfaces as an
     // error rather than a timeout.
     for (let attempt = 1; ; attempt++) {
-      const result = await this.#claimOnce(session);
+      const result = await this.#claimOnce(session, mode);
       if (result.ok) return result;
       if (result.reason !== "slot-conflict") return result;
       if (attempt >= CLAIM_ATTEMPTS) {
@@ -225,14 +324,7 @@ export class PoolBinder {
    * claimOnce makes one full pass: take a SQLite row, then ask the orchestrator for
    * that slot. The retry policy lives in `claimForLogin`.
    */
-  async #claimOnce(session: SessionRow): Promise<
-    | { ok: true; runnerId: string; containerId: string; runnerUrl: string | null }
-    | {
-        ok: false;
-        reason: "pool-exhausted" | "orchestrator-unreachable" | "slot-conflict";
-        fillError?: string;
-      }
-  > {
+  async #claimOnce(session: SessionRow, mode: ClaimMode): Promise<ClaimResult> {
     const now = this.#now();
 
     if (!this.#db.claimRunner(session.guid)) {
@@ -275,7 +367,7 @@ export class PoolBinder {
           });
           if (this.#db.claimRunner(session.guid)) {
             // Fall through to the rest of the claim on the success path below.
-            return this.#finishClaim(session, now);
+            return this.#finishClaim(session, now, mode);
           }
         }
       }
@@ -297,7 +389,7 @@ export class PoolBinder {
       return { ok: false, reason: "pool-exhausted" };
     }
 
-    return this.#finishClaim(session, now);
+    return this.#finishClaim(session, now, mode);
   }
 
   /**
@@ -311,14 +403,8 @@ export class PoolBinder {
   async #finishClaim(
     session: SessionRow,
     now: number,
-  ): Promise<
-    | { ok: true; runnerId: string; containerId: string; runnerUrl: string | null }
-    | {
-        ok: false;
-        reason: "pool-exhausted" | "orchestrator-unreachable" | "slot-conflict";
-        fillError?: string;
-      }
-  > {
+    mode: ClaimMode,
+  ): Promise<ClaimResult> {
     const claimed = this.#db.get<{ id: string }>(
       `SELECT id FROM runners WHERE session_guid = ?`,
       session.guid,
@@ -441,20 +527,15 @@ export class PoolBinder {
       result.value.runnerUrl ?? null,
       slotId,
     );
-    this.#db.run(
-      `UPDATE sessions SET runner_id = ?, state = 'authenticating', auth_state = 'authenticating',
-                          idle_expires_at = ?, last_activity_at = ?
-        WHERE guid = ?`,
-      slotId,
-      now + TTL.loginInProgress,
-      now,
-      session.guid,
-    );
+    this.#db.run(...claimBindingWrite(mode, session.guid, slotId, now));
 
     this.#log.info("runner claimed", {
       session: session.guid,
       runner: slotId,
       container: result.value.containerId,
+      // Which kind of claim, because the two write different state and an operator
+      // reading "runner claimed" cannot otherwise tell a sign-in from a rebind.
+      mode,
       // Logged rather than assumed: an absent address means every subsequent
       // runner call fails, and the warning belongs next to the claim that
       // caused it rather than in the log of a later login attempt.

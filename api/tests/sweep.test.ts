@@ -574,22 +574,48 @@ describe("sweep", () => {
     expect(db.all<{ id: string }>(`SELECT id FROM runners`).map((r) => r.id)).toEqual(["slot-1"]);
   });
 
-  // It must never *remove* on this path. A slot released mid-session has its row
-  // marked idle, not deleted, and deleting it here would strand the session that
-  // still holds it. §2.5's reconciler is the thing that removes rows, and it acts
-  // on boot with the orchestrator's corroboration.
-  it("never removes a row the orchestrator has stopped reporting", async () => {
+  // It must never remove a row **somebody is bound to**.
+  //
+  // This test used to assert that the sweeper removes *nothing*, and its comment said
+  // why: "deleting it here would strand the session that still holds it". The fixture
+  // seeded two runners and a session that held **neither** — so nothing was at risk,
+  // and the assertion passed on a case that could not express the failure it named.
+  // That is how the sweep ended up never pruning at all, and the pool drifted from
+  // the orchestrator's within an hour of every boot. (Section 0.7.1: a fixture
+  // written from the code under test cannot check the code under test.)
+  //
+  // Both halves are asserted now: the phantom goes, and the bound row stays.
+  it("removes an idle, unattached row the orchestrator has stopped reporting", async () => {
     seedRunners(2); // slot-1, slot-2
     seedSession(GUID, { state: "created", created_at: now + 1000 });
 
-    // The orchestrator now reports only one slot. Acting on that difference here
-    // would delete a row somebody may be bound to.
+    // The orchestrator now reports only one slot. slot-2 is idle with no session on
+    // it, so it is garbage: `claim` on it would be refused, and `claimRunner` picks
+    // by `ORDER BY RANDOM()`, so it poisons a share of every login.
     await sweep(options(orchestratorStub({ stats: "filled", slotIds: ["slot-1"] }).client), new PoolBinder(options(orchestratorStub().client)));
 
     expect(db.all<{ id: string }>(`SELECT id FROM runners`).map((r) => r.id).sort()).toEqual([
       "slot-1",
+    ]);
+  });
+
+  it("keeps a row a session is bound to, even if the orchestrator stops reporting it", async () => {
+    // The protection the old test was reaching for, with the condition it named
+    // actually present this time: the session holds slot-2.
+    seedRunners(2); // slot-1, slot-2
+    seedSession(GUID, { state: "authenticated", created_at: now + 1000, runner_id: "slot-2" });
+    db.run(`UPDATE runners SET session_guid = ? WHERE id = 'slot-2'`, GUID);
+
+    await sweep(options(orchestratorStub({ stats: "filled", slotIds: ["slot-1"] }).client), new PoolBinder(options(orchestratorStub().client)));
+
+    // Bound rows are not the sweeper's to delete. `reconcileRunners` handles that
+    // at boot, when both views have just been rebuilt; on a timer it would unbind a
+    // live session.
+    expect(db.all<{ id: string }>(`SELECT id FROM runners`).map((r) => r.id).sort()).toEqual([
+      "slot-1",
       "slot-2",
     ]);
+    expect(db.getSession(GUID)?.runner_id).toBe("slot-2");
   });
 
   it("keeps a created session inside 10 minutes", async () => {

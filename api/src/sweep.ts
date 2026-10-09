@@ -659,6 +659,39 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
     if (pool.added > 0) {
       log.info("pool slots learned", { added: pool.added, total: pool.total });
     }
+
+    // **Prune the rows the orchestrator does not have.** `syncPool` only ever adds,
+    // and #47 taught that the reconciler — which does prune — runs **at boot only**.
+    // So between boots the two views drift again: the sweeper learns whatever `/stats`
+    // reports, and a slot the orchestrator has since renumbered or dropped stays in
+    // this table for ever.
+    //
+    // Observed on the deployed host with the api up for an hour: the orchestrator
+    // reported `slotIds: ["slot-36","slot-38"]` and this table held
+    // `slot-36, slot-38, slot-39`. `claimRunner` picks by `ORDER BY RANDOM()`, so
+    // roughly one login in three offered `slot-39`, was refused with a 409, and the
+    // user saw `the service's view of its runner pool is out of date` — the exact
+    // symptom #47 was merged to remove, back again inside an hour.
+    //
+    // ## Why this is narrower than the boot reconciler
+    //
+    // `reconcileRunners` deletes rows *and* nulls the `runner_id` of any session
+    // pointing at one — correct at boot, where both views are freshly rebuilt. Doing
+    // that every thirty seconds would unbind a session whose runner is merely being
+    // re-provisioned, and the previous author declined to prune here for exactly that
+    // reason (see the comment above).
+    //
+    // So this only removes rows that **cannot** be anybody's runner: `idle`, with no
+    // session attached. A row in that state has no container to talk to and no
+    // session to break, so removing it cannot strand anything — and a slot being
+    // created right now is not idle-with-no-session, it is claimed or claiming.
+    const pruned = db.removeStaleRunnerRows(new Set(stats.value.slotIds));
+    if (pruned > 0) {
+      log.info("runner rows for slots the orchestrator no longer has, removed", {
+        removed: pruned,
+        live: stats.value.slotIds.length,
+      });
+    }
   }
 
   // Every session, because each TTL depends on a different field.

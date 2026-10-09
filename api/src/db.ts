@@ -617,6 +617,42 @@ export class Db {
   }
 
   /**
+   * removeStaleRunnerRows deletes idle, unattached rows the orchestrator no longer has.
+   *
+   * Narrower than `reconcileRunners` on purpose, and the narrowness is the whole
+   * design. This runs **every sweep**, so it must never remove a row a session could
+   * still be using — and the cheap way to be sure that is not to ask about sessions
+   * at all. A row that is `idle` with `session_guid IS NULL` has no container to talk
+   * to and no session to break; there is nothing it can be holding open.
+   *
+   * A row for a slot the orchestrator is creating right now is not in that state: it
+   * is `claimed`, or bound. So the race this could otherwise have is the one
+   * `claimRunner`'s atomic update already guards.
+   *
+   * `reconcileRunners` stays the boot-time, whole-pool reconciler — it may null a
+   * session's `runner_id`, because at boot both views have just been rebuilt. Doing
+   * that on a timer would unbind live sessions.
+   *
+   * Returns how many rows went, so a caller can log it.
+   */
+  removeStaleRunnerRows(liveRunnerIds: ReadonlySet<string>): number {
+    const stale = this.all<{ id: string }>(`SELECT id FROM runners`).filter(
+      (row) => !liveRunnerIds.has(row.id),
+    );
+    let removed = 0;
+    for (const row of stale) {
+      removed += this.run(
+        `DELETE FROM runners
+           WHERE id = ?
+             AND status = 'idle'
+             AND session_guid IS NULL`,
+        row.id,
+      );
+    }
+    return removed;
+  }
+
+  /**
    * reconcileRunners is the api's half of boot reconciliation (PLAN-v2 §2.5).
    *
    * The api reconciles *sessions*; the orchestrator reconciles *containers*.

@@ -120,6 +120,33 @@ export interface StatResponse {
   size: number;
 }
 
+/** What `/finalize` reports about what it published. */
+export interface FinalizeResponse {
+  artifactId: string;
+  /** `vault.zip`, or `vault.partial.zip`. The name a download dialog will show. */
+  archiveName: string;
+  bytes: number;
+  partial: boolean;
+}
+
+/** What a finalise is asked to publish. */
+export interface FinalizeInput {
+  /** The api's opaque id, 43 base64url characters. Becomes the published directory. */
+  readonly artifactId: string;
+  /** The session whose vault is being published. Never appears in the published path. */
+  readonly sessionGuid: string;
+  /**
+   * The truth about the export, which only the api knows.
+   *
+   * The orchestrator trusts this for *labelling only* — it selects the
+   * `.partial.zip` name and writes the marker — because it never saw the walk and
+   * cannot check. So the caller passing `false` for a truncated vault gets an
+   * unmarked archive, and the only honest source of this bit is the side that
+   * observed whether the export finished.
+   */
+  readonly partial: boolean;
+}
+
 /** Pool occupancy, from GET /stats. */
 export interface OrchestratorStats {
   size: number;
@@ -188,6 +215,20 @@ export interface OrchestratorApi {
   stat(artifactId: string): Promise<OrchestratorResult<StatResponse>>;
   stats(): Promise<OrchestratorResult<OrchestratorStats>>;
   healthz(): Promise<OrchestratorResult<{ ok: boolean; pool: OrchestratorStats }>>;
+  /**
+   * finalize publishes a staged archive under its artifact id.
+   *
+   * PLAN-v3 §2.2 splits publishing in two: the runner streams the zip into a
+   * staging directory, and the orchestrator — the only holder of the artifact
+   * volume — renames it into place. Without this call the archive exists only
+   * under `.staging/`, which `ArtifactStat` skips and Caddy never serves, so a
+   * completed export is not downloadable.
+   *
+   * A `409` here means **nothing was staged**, which is not the same as a
+   * transport failure: the runner never streamed an archive. Callers must treat
+   * it as an export that produced no artifact rather than retrying.
+   */
+  finalize(input: FinalizeInput): Promise<OrchestratorResult<FinalizeResponse>>;
 }
 
 /** Options for the client. */
@@ -362,6 +403,24 @@ export class OrchestratorClient implements OrchestratorApi {
    */
   stat(artifactId: string): Promise<OrchestratorResult<StatResponse>> {
     return this.#call<StatResponse>("POST", "/stat", { artifactId });
+  }
+
+  /**
+   * finalize renames a staged archive into its published location.
+   *
+   * The whole operation is one `os.Rename` on the orchestrator's side, so its cost
+   * does not depend on the vault's size — the reason a multi-gigabyte archive can
+   * be published atomically rather than copied.
+   *
+   * `partial` is forwarded rather than recomputed. See `FinalizeInput.partial`:
+   * the orchestrator cannot verify it and deliberately does not try.
+   */
+  finalize(input: FinalizeInput): Promise<OrchestratorResult<FinalizeResponse>> {
+    return this.#call<FinalizeResponse>("POST", "/finalize", {
+      artifactId: input.artifactId,
+      sessionGuid: input.sessionGuid,
+      partial: input.partial,
+    });
   }
 
   /** stats reports pool occupancy. */

@@ -225,7 +225,7 @@ services:
         # The commit this image is, surfaced as `build` on /api/public/version.
         # Set IMAGE_TAG to the commit and the two cannot drift.
         BUILD_ID: ${IMAGE_TAG:?set IMAGE_TAG in .env - the commit this image is}
-    image: ghcr.io/ms-one-note-exporter/msout-api:${IMAGE_TAG:-dev}
+    image: ghcr.io/ms-one-note-exporter/msout-api:${IMAGE_TAG:?set IMAGE_TAG in .env - the commit this image is}
     networks:
       # msout-control only, and that is deliberate rather than incidental.
       #
@@ -325,7 +325,7 @@ services:
     build:
       context: ./orchestrator
       dockerfile: Dockerfile
-    image: ghcr.io/ms-one-note-exporter/msout-orchestrator:${IMAGE_TAG:-dev}
+    image: ghcr.io/ms-one-note-exporter/msout-orchestrator:${IMAGE_TAG:?set IMAGE_TAG in .env - the commit this image is}
     networks:
       # msout-edge deliberately absent: the orchestrator is not reachable from
       # outside at all, and has no reason to be.
@@ -543,8 +543,8 @@ services:
     build:
       context: ./runner
       args:
-        BUILD_ID: ${IMAGE_TAG:-local}
-    image: ghcr.io/ms-one-note-exporter/msout-runner:${IMAGE_TAG:-local}
+        BUILD_ID: ${IMAGE_TAG:?set IMAGE_TAG in .env - the commit this image is}
+    image: ghcr.io/ms-one-note-exporter/msout-runner:${IMAGE_TAG:?set IMAGE_TAG in .env - the commit this image is}
     networks:
       - msout-runner
       # The credential path. `api` is the only other member; the orchestrator is

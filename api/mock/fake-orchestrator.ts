@@ -22,6 +22,8 @@
  */
 
 import type {
+  FinalizeInput,
+  FinalizeResponse,
   OrchestratorResult,
   OrchestratorStats,
   StatResponse,
@@ -61,6 +63,8 @@ interface FakeSlot {
  */
 export class FakeOrchestrator {
   readonly #slots = new Map<string, FakeSlot>();
+  /** Artifacts `finalize` published, keyed by id. What `stat` reports on. */
+  readonly #finalised = new Map<string, { bytes: number; partial: boolean }>();
   readonly #claimDelayMs: number;
   readonly #now: () => number;
   #seq = 0;
@@ -172,15 +176,49 @@ export class FakeOrchestrator {
   }
 
   /**
-   * stat reports on artifacts.
+   * stat reports on artifacts that were actually finalised.
    *
-   * Reports `exists: false` unless the session recorded an artifact, because
-   * asserting "yes" unconditionally would let a client build a download link that
-   * 404s and hide the bug until the real pipeline exists.
+   * Driven by `#finalised`, which only `finalize` populates — so a client cannot
+   * build a download link for an artifact the pipeline never published. This used
+   * to answer `exists: false` unconditionally, deliberately, so the missing publish
+   * step stayed visible while no code called it. Now that `finalize` exists, a
+   * constant `false` would be a second false claim: it would hide a publish that
+   * silently stopped happening.
    */
   async stat(artifactId: string): Promise<OrchestratorResult<StatResponse>> {
-    void artifactId;
-    return { ok: true, value: { exists: false, size: 0 } };
+    const found = this.#finalised.get(artifactId);
+    return {
+      ok: true,
+      value: found === undefined ? { exists: false, size: 0 } : { exists: true, size: found.bytes },
+    };
+  }
+
+  /**
+   * finalize publishes a staged archive under its artifact id.
+   *
+   * Records what a real `os.Rename` would have moved into place, including the
+   * partial naming, so the mock's `stat` and the mock's archive name agree with the
+   * production shapes rather than with whatever is convenient here.
+   *
+   * A `409` for an id nothing was staged under is kept, because the api's handling
+   * of it is the interesting part: it means "the export produced no archive", not
+   * "try again".
+   */
+  async finalize(input: FinalizeInput): Promise<OrchestratorResult<FinalizeResponse>> {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(input.artifactId)) {
+      return { ok: false, error: { kind: "conflict", status: 409 } };
+    }
+    const bytes = 1024;
+    this.#finalised.set(input.artifactId, { bytes, partial: input.partial });
+    return {
+      ok: true,
+      value: {
+        artifactId: input.artifactId,
+        archiveName: input.partial ? "vault.partial.zip" : "vault.zip",
+        bytes,
+        partial: input.partial,
+      },
+    };
   }
 
   async stats(): Promise<OrchestratorResult<OrchestratorStats>> {

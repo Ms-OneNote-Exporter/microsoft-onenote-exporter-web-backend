@@ -11,20 +11,51 @@ step was wrong the first time, it says so.
 ```bash
 git archive --format=tar.gz -o msout.tar.gz HEAD      # no .git, no node_modules
 scp msout.tar.gz root@<host>:/root/
+SHA=$(git rev-parse HEAD)                              # here, where git exists
 ssh root@<host>
   cd /opt/msout && tar xzf /root/msout.tar.gz --exclude=.env --exclude=secrets && rm /root/msout.tar.gz
-  sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=$(git rev-parse --short HEAD)/" .env   # or set by hand
+  sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=$SHA|" .env        # REQUIRED — see below
   docker compose config --quiet            # refuses rather than defaulting
-  docker compose build
-  docker compose up -d --wait
-curl -s https://one-backend.phttp.com/api/public/version
+  set -a && . ./.env && set +a            # compose interpolates at read time
+  docker compose --profile runner build api orchestrator runner
+  docker compose --profile runner up -d --wait
+  ./infra/verify-deploy.sh "$SHA"         # proves the running stack is that commit
 ```
 
 There is no git clone. The repository is private and putting a deploy key on the
 host for one component's build is a credential to manage for no benefit — a tarball
-of a known commit is the same artefact with nothing extra to revoke. The cost is that
-`git rev-parse` does not work on the host, so `IMAGE_TAG` is set by hand from
-elsewhere.
+of a known commit is the same artefact with nothing extra to revoke.
+
+**The cost is that `git rev-parse` does not work on the host, so `IMAGE_TAG` must
+be passed in — and forgetting to is silent.** See "Stamp the tag you are deploying"
+below, which is the failure this cost produced.
+
+### Stamp the tag you are deploying
+
+`docker compose build` rebuilds the images from the source tree **that is on the
+host**, and tags them with whatever `IMAGE_TAG` says in `.env`. Those are two
+independent facts and nothing connects them. Rebuild today's source under last
+month's tag and the image is new, the label is old, and every signal agrees with
+the label — because all of them read it.
+
+This is not hypothetical. On 2026-10-08 the host was serving `1f555a3` while
+`docker ps`, `docker images` and the api's own `/healthz.build` all named
+`305c56c`, nine commits earlier. The content was current, which is the worst case:
+the tag was the only thing wrong, so nothing looked wrong.
+
+`docker compose config --quiet` does not catch it. That refuses an **unset**
+variable, and this tag was set — to a commit nine commits old. A value that is
+present and wrong satisfies every guard that only checks presence.
+
+So the tag is **verified**, not trusted:
+
+```bash
+./infra/verify-deploy.sh "$SHA"
+```
+
+It asks each running component what it is — the api over `/healthz`, Docker for the
+orchestrator's image reference — and compares that to the commit you deployed. It
+exits non-zero on the first disagreement, naming both values.
 
 ## Host state
 
@@ -97,13 +128,17 @@ Then, in order, because each one has caught a real bug:
 
 ```bash
 docker compose ps                       # all three running, healthchecks passing
+./infra/verify-deploy.sh "$SHA"         # the running stack IS the commit you deployed
 curl -s https://$PUBLIC_HOST/api/public/version
 #   expect {"protocol":3,"build":"<the commit you deployed>"}
 ```
 
-`build` must be a commit, not `dev` or `local`. It is baked in from `IMAGE_TAG` and
-it exists so a `build` that says `dev` on a live host is visibly wrong rather than
-invisibly wrong.
+`verify-deploy.sh` is the load-bearing one and the curl is a cross-check. `build`
+must be a commit, not `dev` or `local` — it is baked in from `IMAGE_TAG` — and
+`verify-deploy.sh` is what proves `IMAGE_TAG` described the tree that was actually
+built, which `build` alone cannot: both are derived from the same variable, so
+agreeing with each other says nothing about either. See "Stamp the tag you are
+deploying".
 
 CORS, cookies and the SSE headers are the things that only a browser proves. mac
 found two bugs in this stack that curl could not see, so treat a green curl as

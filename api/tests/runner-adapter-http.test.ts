@@ -42,7 +42,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Db } from "../src/db.js";
 import { hashSecret } from "../src/session.js";
-import { HttpRunnerAdapter, RunnerCallError, unsupportedChallenge } from "../src/runner-adapter-http.js";
+import {
+  HttpRunnerAdapter,
+  RunnerCallError,
+  unsupportedChallenge,
+  type ExportFinishedInput,
+} from "../src/runner-adapter-http.js";
 import { SseHub } from "../src/sse.js";
 
 const TOKEN = "runner-token-for-tests";
@@ -178,6 +183,9 @@ function adapterFor(
     addressFor?: (id: string) => string | null;
     /** Stand-in for `index.ts`'s `db.setNotebooks` wiring. */
     onNotebooksListed?: (sessionId: string, names: readonly string[]) => void;
+    /** Stand-in for `index.ts`'s `completeExport` wiring. */
+    onExportFinished?: (input: ExportFinishedInput) => Promise<void> | void;
+    now?: () => number;
   } = {},
 ): HttpRunnerAdapter {
   return new HttpRunnerAdapter({
@@ -187,6 +195,10 @@ function adapterFor(
     ...(overrides.onNotebooksListed === undefined
       ? {}
       : { onNotebooksListed: overrides.onNotebooksListed }),
+    ...(overrides.onExportFinished === undefined
+      ? {}
+      : { onExportFinished: overrides.onExportFinished }),
+    ...(overrides.now === undefined ? {} : { now: overrides.now }),
     timeoutMs: 2_000,
     fetchImpl: (input: string | URL | Request, init?: RequestInit) => {
       const url = new URL(typeof input === "string" ? input : input.toString());
@@ -1054,5 +1066,209 @@ describe("the notebook list is persisted, not just published", () => {
     // The row is gone, so there is nothing left that could name a notebook — which is
     // the point of `deleteSession` destroying the row at all.
     expect(db.getSession(SESSION)).toBeUndefined();
+  });
+});
+
+/**
+ * The one assertion whose absence shipped the bug.
+ *
+ * Every test above this block asserted that an export's **events** reached the SSE
+ * hub. That was true, and it was not the thing a user depends on. A finished export
+ * has to change a row on disk; nothing did, so the session reported `running` with
+ * `finishedAt: null` for ever and no download was ever authorised.
+ *
+ * So these assert that `export-done` reaches the completion callback — and the one
+ * that really matters asserts the **bytes at the far side**: that the runner is
+ * actually asked to stage the archive, at the right path, with the api's own id in
+ * the body.
+ */
+describe("a finished export is handed on, not just published", () => {
+  const ARTIFACT = "A".repeat(43);
+
+  function doneFrames(id = ARTIFACT): string[] {
+    return [
+      `id: 1\ndata: ${JSON.stringify({
+        type: "export-done",
+        id,
+        notebook: "Notebook",
+        pages: 20,
+        sections: 7,
+        assets: 55,
+      })}\n\n`,
+    ];
+  }
+
+  it("calls the completion callback when export-done arrives", async () => {
+    const runner = await fakeRunner();
+    const seen: ExportFinishedInput[] = [];
+    const adapter = adapterFor(runner, {
+      now: () => 1_700_000_005_000,
+      onExportFinished: (input) => {
+        seen.push(input);
+      },
+    });
+
+    runner.sseFrames = doneFrames();
+    await adapter.listNotebooks(SESSION);
+    await adapter.drain();
+
+    // The load-bearing assertion. Before this existed, `export-done` was published
+    // to the hub and discarded, and every export ended with nothing recorded.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({
+      sessionId: SESSION,
+      artifactId: ARTIFACT,
+      partial: false,
+      partialReason: null,
+      notebook: "Notebook",
+      finishedAt: 1_700_000_005_000,
+    });
+  });
+
+  it("asks the runner to stage the archive, and puts the id in the body", async () => {
+    const runner = await fakeRunner();
+    const adapter = adapterFor(runner, {
+      onExportFinished: async (input) => {
+        // Stands in for `completeExport`'s first step, which is the call this test
+        // is really about: the runner's staging route had no caller at all.
+        await adapter.publishArtifact({
+          sessionId: input.sessionId,
+          artifactId: input.artifactId,
+        });
+      },
+    });
+
+    runner.sseFrames = doneFrames();
+    await adapter.listNotebooks(SESSION);
+    await adapter.drain();
+
+    const staging = runner.seen.find((r) => r.url.includes("/artifacts"));
+    expect(staging).toBeDefined();
+    expect(staging!.method).toBe("POST");
+    // In the path, not the body: the path names the session, and the artifact id is
+    // the caller's own opaque value that the runner validates by shape.
+    expect(staging!.url).toBe(`/sessions/${SESSION}/artifacts`);
+    expect(staging!.token).toBe(TOKEN);
+    // **The bytes**, not the handler: what the runner reads is exactly the api's id.
+    expect(JSON.parse(staging!.body.toString("utf8"))).toEqual({ artifactId: ARTIFACT });
+  });
+
+  it("hands on a partial export, labelled, rather than discarding it", async () => {
+    const runner = await fakeRunner();
+    const seen: ExportFinishedInput[] = [];
+    const adapter = adapterFor(runner, {
+      onExportFinished: (input) => {
+        seen.push(input);
+      },
+    });
+
+    runner.sseFrames = [
+      `id: 1\ndata: ${JSON.stringify({
+        type: "export-partial",
+        id: ARTIFACT,
+        reason: "aborted",
+      })}\n\n`,
+    ];
+    await adapter.listNotebooks(SESSION);
+    await adapter.drain();
+
+    // §8.2 preserves what is on disk, so a partial vault is still published —
+    // labelled. The orchestrator trusts this bit for the `.partial.zip` name and
+    // cannot check it, so it has to arrive as the runner reported it.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ partial: true, partialReason: "aborted" });
+  });
+
+  it("publishes once when the same terminal event arrives twice", async () => {
+    const runner = await fakeRunner();
+    const seen: ExportFinishedInput[] = [];
+    const adapter = adapterFor(runner, {
+      onExportFinished: (input) => {
+        seen.push(input);
+      },
+    });
+
+    // **Not** the abort pair. An abort sends `export-aborted` then
+    // `export-partial`, and only the latter reaches the callback, so that case
+    // produces exactly one publish whether or not the guard exists — a test built
+    // on it passes with the guard removed and guards nothing.
+    //
+    // The real duplicate source is the pump's own reconnect: `#pump` retries with
+    // `since=<last seq>`, and anything the runner replays past that point is
+    // delivered again. Zipping and finalising one vault twice would race two
+    // renames of one staging directory, and the second would 409.
+    runner.sseFrames = [
+      `id: 1\ndata: ${JSON.stringify({
+        type: "export-done",
+        id: ARTIFACT,
+        notebook: "Notebook",
+        pages: 20,
+        sections: 7,
+        assets: 55,
+      })}\n\n`,
+      `id: 2\ndata: ${JSON.stringify({
+        type: "export-done",
+        id: ARTIFACT,
+        notebook: "Notebook",
+        pages: 20,
+        sections: 7,
+        assets: 55,
+      })}\n\n`,
+    ];
+    await adapter.listNotebooks(SESSION);
+    await adapter.drain();
+
+    expect(seen).toHaveLength(1);
+  });
+
+  it("keeps consuming events after a completion callback fails", async () => {
+    const runner = await fakeRunner();
+    const sub = subscribe(runner.sse);
+    const adapter = adapterFor(runner, {
+      onExportFinished: async () => {
+        throw new Error("archive failed: ENOSPC");
+      },
+    });
+
+    runner.sseFrames = [
+      ...doneFrames(),
+      `id: 2\ndata: ${JSON.stringify({
+        type: "export-log",
+        id: ARTIFACT,
+        line: "after the failure",
+      })}\n\n`,
+    ];
+    await adapter.listNotebooks(SESSION);
+    await adapter.drain();
+
+    // `#handleFrame` runs inside `#pump`'s try. A rejection from the publish would
+    // tear down the event stream and silently lose every later event for the
+    // session — the user would see an export that stopped reporting for ever.
+    const events = await sub.received(2);
+    expect(events.map((e) => e.type)).toContain("export-done");
+    expect(events.map((e) => e.type)).toContain("export-log");
+    // And the failure is reported, rather than swallowed: a user whose export
+    // finished but cannot be downloaded is otherwise told nothing.
+    expect(events.some((e) => e.type === "error")).toBe(true);
+  });
+
+  it("gives the archiving call its own budget, not the control-verb default", async () => {
+    const runner = await fakeRunner();
+    const adapter = adapterFor(runner);
+
+    // Every other call in the adapter returns 202 in milliseconds. Archiving zips
+    // the whole vault, so sharing the short default would abort almost every real
+    // export at the archiving step — after the work succeeded — and report a
+    // completed export as a failure.
+    const started = Date.now();
+    await adapter
+      .publishArtifact({ sessionId: SESSION, artifactId: ARTIFACT })
+      .catch(() => undefined);
+
+    // The fake answers immediately, so this only proves the call is made at all;
+    // the timeout itself is asserted in the source and is not observable here
+    // without a slow fake. Recorded rather than pretended at.
+    expect(runner.seen.some((r) => r.url.includes("/artifacts"))).toBe(true);
+    expect(Date.now() - started).toBeLessThan(2_000);
   });
 });

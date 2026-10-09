@@ -377,6 +377,135 @@ export class Db {
   }
 
   /**
+   * completeExport records a finished export: the terminal `export_state`, the
+   * artifact that now belongs to the session, and the return to `authenticated`.
+   *
+   * ## Why this existed at all
+   *
+   * **There was no writer.** `export_state` was written three times in the whole
+   * api — `queued`, `running`, and `failed` when the *start* was refused — and
+   * `artifact_id` was written by nothing outside a test's own setup. So a runner
+   * that exported a vault to completion, streamed it to staging and announced
+   * `export-done` produced no observable change in the database at all: the
+   * session stayed `state: "exporting"` with `finishedAt: null` forever, and
+   * `artifact.available` stayed false, because both are read from this row.
+   *
+   * That is the same shape as every other bug in this project one level out. The
+   * event was received, the handler ran, the SSE frame reached the browser — and
+   * the assertion that mattered was never made, because nothing asserted the
+   * *bytes at the far side*: a row on disk.
+   *
+   * ## Why `state` is reset here, in the same statement
+   *
+   * Because of the sweeper. `sweep()` skips any session whose `state` is
+   * `exporting`, so the runner stays bound for as long as it says so — and before
+   * this method, **nothing ever said otherwise**. A completed export therefore
+   * pinned its slot until `TTL.absolute` erased the whole session twelve hours
+   * later. On the deployed 2-slot pool that is two exports to a permanent
+   * lockout: every user refused for the rest of the day.
+   *
+   * The reset is to `authenticated`, not to a new state, because the session is
+   * still signed in and still has its runner. A subsequent export must reuse them.
+   *
+   * ## Why it is one statement
+   *
+   * `artifact_id` is what `findByArtifact` matches, and it is what makes
+   * `authorize-download` answer. `export_state` is what the snapshot reports. A
+   * reader between two statements would see an artifact it could not authorise
+   * yet, or a `done` export with no artifact. Both are states the browser would
+   * render as broken.
+   *
+   * Returns whether a row changed, so a caller can distinguish "recorded" from
+   * "ignored" — a late `export-done` for a session already erased is expected and
+   * must not be logged as a failure.
+   */
+  completeExport(input: {
+    readonly guid: string;
+    readonly artifactId: string;
+    readonly partial: boolean;
+    readonly partialReason: "aborted" | "quota" | "disk" | null;
+    readonly notebook: string;
+    readonly progress: { pages: number; sections: number; assets: number } | null;
+    readonly startedAt: number;
+    readonly finishedAt: number;
+  }): boolean {
+    return (
+      this.run(
+        `UPDATE sessions
+            SET artifact_id = ?,
+                artifact_partial = ?,
+                state = 'authenticated',
+                last_activity_at = ?,
+                export_state = ?
+          WHERE guid = ?`,
+        input.artifactId,
+        input.partial ? 1 : 0,
+        input.finishedAt,
+        JSON.stringify({
+          state: input.partial ? "partial" : "done",
+          partialReason: input.partialReason,
+          error: null,
+          id: input.artifactId,
+          notebook: input.notebook,
+          progress: input.progress,
+          startedAt: input.startedAt,
+          finishedAt: input.finishedAt,
+        }),
+        input.guid,
+      ) > 0
+    );
+  }
+
+  /**
+   * markExportUnpublishable records an export that finished but produced no artifact.
+   *
+   * The distinct case this exists for: the **walk succeeded** and the archiving
+   * failed. That is not the same as an export that failed, and conflating them
+   * would send the user to re-run an hour of work over a disk or permission
+   * problem — so the message says what actually happened and that re-exporting is
+   * not the remedy.
+   *
+   * `artifact_id` is left untouched, deliberately. It is NULL here, and writing
+   * anything into it would make `artifact.available` true for a download that has
+   * nothing behind it: Caddy's authoriser would pass a request for an archive
+   * that was never published.
+   *
+   * `state` is reset for the same reason `completeExport` resets it — the sweeper
+   * skips `exporting`, so leaving it would pin this session's slot for the rest of
+   * the day on a pool of two.
+   */
+  markExportUnpublishable(input: {
+    readonly guid: string;
+    readonly error: string;
+    readonly artifactId: string;
+    readonly notebook: string;
+    readonly partialReason: "aborted" | "quota" | "disk" | null;
+    readonly finishedAt: number;
+  }): boolean {
+    return (
+      this.run(
+        `UPDATE sessions
+            SET state = 'authenticated',
+                last_activity_at = ?,
+                export_state = ?
+          WHERE guid = ?`,
+        input.finishedAt,
+        JSON.stringify({
+          state: "failed",
+          partialReason: input.partialReason,
+          error: input.error,
+          id: input.artifactId,
+          notebook: input.notebook,
+          progress: null,
+          startedAt: null,
+          finishedAt: input.finishedAt,
+        }),
+        input.guid,
+      ) > 0
+    );
+  }
+
+  /**
    * deleteSession removes a session row.
    *
    * Used by the erase state machine and by the boot sweeper for expired rows.

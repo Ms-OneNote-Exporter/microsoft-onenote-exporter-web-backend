@@ -85,6 +85,20 @@ export interface AbortExportInput {
   readonly exportId: string;
 }
 
+/** Input for publishing a finished export's vault. */
+export interface PublishArtifactInput {
+  readonly sessionId: string;
+  /**
+   * The api's opaque id — the same one `startExport` was given as `exportId`.
+   *
+   * The runner does **not** generate one, and must not: it knows the session GUID,
+   * and a runner-derived id would put that GUID into every download path, Caddy
+   * access log and `Referer`. PLAN-v3 §5 makes the id opaque for exactly that
+   * reason, so the id is minted by the api and carried through unchanged.
+   */
+  readonly artifactId: string;
+}
+
 /**
  * RunnerAdapter is everything the api needs from a container it cannot reach.
  *
@@ -112,6 +126,28 @@ export interface RunnerAdapter {
 
   /** Start an export, reporting progress as `export-*` events. */
   startExport(input: StartExportInput): Promise<void>;
+
+  /**
+   * Stream the finished vault into the artifact staging directory.
+   *
+   * This is the second half of publishing, and it is **not** called automatically
+   * by `startExport`: an export finishes inside the runner while `startExport` has
+   * long since returned 202. Something has to ask, after the work is done.
+   *
+   * It exists here rather than being folded into `startExport` because the two
+   * answer different questions and have different failure modes. `startExport` is
+   * fast and failing means the export never began; this is slow (it zips a vault
+   * that may be gigabytes) and failing means the export succeeded and produced an
+   * archive nobody can download. Collapsing them would make the second failure
+   * look like the first, and the user's remedy for each is opposite.
+   *
+   * PLAN-v3 §2.2: the runner writes to `<ArtifactRoot>/.staging/<artifactId>/` and
+   * the orchestrator renames it into place. Neither half is self-publishing — a
+   * zip written directly into its final name is readable while it is being
+   * written, which is the truncated-archive-with-a-200 failure staging exists to
+   * prevent.
+   */
+  publishArtifact(input: PublishArtifactInput): Promise<void>;
 
   // ---------------------------------------------------------------------
   // Not in this interface, deliberately, and worth stating because its

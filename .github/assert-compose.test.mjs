@@ -165,6 +165,18 @@ const cases = [
     expectMessage: /API_TRUSTED_PROXIES/,
   },
   {
+    // The api's `environment:` is an allowlist, so a variable absent from it is a
+    // variable the process never reads. The operator sets it in `.env`, sees no
+    // error, and the api keeps its compiled-in default — for the rate limiter that
+    // means raising the cap has no effect and a 429 still arrives mid-proof,
+    // which reads as a fault in the thing being proved rather than a config miss.
+    name: "drops RATE_LIMIT_SESSIONS_PER_HOUR from the api's environment",
+    mutate: (c) => {
+      delete c.services.api.environment.RATE_LIMIT_SESSIONS_PER_HOUR;
+    },
+    expectMessage: /RATE_LIMIT_SESSIONS_PER_HOUR/,
+  },
+  {
     // A container's IP changes on recreate, so an exact address works until the next
     // deploy and then fails by becoming a silent global limit again.
     name: "trusts a single container address rather than a network",

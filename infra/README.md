@@ -264,6 +264,33 @@ than inferred from a user's report:
 docker logs msout-api-1 | grep 'session creation rate limited'
 ```
 
+### Raising the per-hour session cap
+
+`RATE_LIMIT_SESSIONS_PER_HOUR` (default `3`) exists so a deployment that repeatedly
+re-proves the chain is not stopped by its own limiter. It was set to **42** on this host
+while bug #54's re-proof was pending, because a `429 too-many-sessions` arriving
+mid-proof reads as a fault in the thing being proved.
+
+Three things to know before raising it:
+
+- **It is not a concurrency control.** The pool is two slots. Forty-two sessions an hour
+  is still two at a time, so this buys retry budget, not throughput.
+- **It is the knob behind the section above.** With `API_TRUSTED_PROXIES` correctly set
+  the bucket is per client; with it misconfigured every caller on the internet shares
+  one, and raising this widens a global allowance rather than tightening anything. Fix
+  the proxy configuration first.
+- **A bad value is refused at startup, not coerced.** `0`, `-1`, `many` and `3.5` all
+  stop the process naming the variable. An empty value means "unset" and takes the
+  default, which is the restrictive end.
+
+```sh
+sed -i 's|^RATE_LIMIT_SESSIONS_PER_HOUR=.*|RATE_LIMIT_SESSIONS_PER_HOUR=42|' .env
+docker compose up -d --wait api      # the limiter is built at boot, so a restart is required
+```
+
+Put it back the same way once the proving is done. Nothing else in the file changes, and
+the committed default is untouched.
+
 ## What is verified, and how
 
 | checked | by |

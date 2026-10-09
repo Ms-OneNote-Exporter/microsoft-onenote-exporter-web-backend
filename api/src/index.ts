@@ -39,7 +39,7 @@ import { dirname } from "node:path";
 import { loadConfig, ConfigError } from "./config.js";
 import { Db } from "./db.js";
 import { SseHub } from "./sse.js";
-import { RateLimiter } from "./rate-limit.js";
+import { buildRateLimiter } from "./rate-limit.js";
 import { OrchestratorClient, type OrchestratorApi } from "./orchestrator-client.js";
 import { HttpRunnerAdapter } from "./runner-adapter-http.js";
 import { completeExport } from "./export-completion.js";
@@ -277,7 +277,7 @@ runner = new HttpRunnerAdapter({
       db,
       orchestrator,
       sse,
-      limiter: new RateLimiter({ logSalt: "api" }),
+      limiter: buildRateLimiter(config),
       // The four runner-facing routes. Previously 501.
       runner,
       poolBinder: binder,

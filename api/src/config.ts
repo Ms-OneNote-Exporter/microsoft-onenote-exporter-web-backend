@@ -11,6 +11,28 @@
  * useful during an incident if the operator can tell which line to fix.
  */
 
+/**
+ * The committed default for `RATE_LIMIT_SESSIONS_PER_HOUR`.
+ *
+ * ## Why this is a literal and not a reference to `DEFAULT_LIMITS`
+ *
+ * It was a reference, and it did not work: `config.ts` importing `rate-limit.ts`
+ * closes a **runtime cycle**, because `rate-limit.ts` imports `client-ip.ts`,
+ * which value-imports `ConfigError` from this file. Module evaluation order then
+ * leaves `DEFAULT_LIMITS` undefined exactly where it is read, and two suites
+ * died with `Cannot read properties of undefined (reading 'sessionsPerWindow')`.
+ * A *type*-only import back the other way is erased and is fine; a value import
+ * is not, and the difference stays invisible until the cycle is actually closed.
+ *
+ * So the number is written here and held in step by **tests rather than by a
+ * reference** — `config.test.ts` asserts this equals
+ * `DEFAULT_LIMITS.sessionsPerWindow.max`, and `rate-limit-config.test.ts`
+ * asserts the limiter's own default is what the configuration reports. A copy
+ * guarded by a test fails when either side moves; a copy guarded by a comment
+ * does not.
+ */
+const DEFAULT_SESSIONS_PER_HOUR = 3;
+
 /** A configuration value that failed validation. */
 export class ConfigError extends Error {
   constructor(
@@ -80,6 +102,34 @@ export interface ApiConfig {
   readonly sseBufferEvents: number;
   /** SSE keepalive interval, in milliseconds. */
   readonly sseKeepaliveMs: number;
+  /**
+   * New sessions permitted per hour from one address.
+   *
+   * Defaults to `DEFAULT_LIMITS.sessionsPerWindow.max` (3) and exists so a
+   * **deployment** can raise it for repeated verification without the committed
+   * default being weakened for everyone.
+   *
+   * Raised to 42 on the live host while bug #54's re-proof was pending: §5.6's
+   * three-per-hour budget runs out during exactly the kind of repeated live
+   * proving this project depends on, and a 429 in the middle of a re-proof reads
+   * as a fault in the thing being proved.
+   *
+   * Two things this does **not** buy, and the reason the default stays low:
+   *
+   * - **It is not a concurrency control.** The pool is two slots. Forty-two
+   *   sessions an hour is still two at a time, so raising this buys retry budget,
+   *   not throughput.
+   * - **It widens a real DoS surface.** Bug #37 was a proxy-trust mistake that
+   *   made every caller on the internet share one bucket, and this is that same
+   *   knob. Behind a correctly configured proxy the bucket is per client; behind
+   *   a misconfigured one it is still global, and a larger number means a larger
+   *   blast radius rather than a louder failure.
+   *
+   * So it is an environment variable and not a code change: raising it is one
+   * line in `.env` on the host that wants it, and lowering it back is one more.
+   * The repository default is unchanged.
+   */
+  readonly sessionsPerHour: number;
 }
 
 /**
@@ -440,5 +490,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
     databasePath: env.DATABASE_PATH?.trim() || "/srv/msout/data/api.db",
     sseBufferEvents: positiveInt(env, "SSE_BUFFER_EVENTS", 500),
     sseKeepaliveMs: positiveInt(env, "SSE_KEEPALIVE_MS", 15_000),
+    // Default is DEFAULT_LIMITS.sessionsPerWindow.max. A deployment that proves
+    // the chain repeatedly raises this; see the note on `sessionsPerHour`.
+    sessionsPerHour: positiveInt(env, "RATE_LIMIT_SESSIONS_PER_HOUR", DEFAULT_SESSIONS_PER_HOUR),
   };
 }

@@ -21,6 +21,9 @@
  */
 
 import { hashForLog } from "./client-ip.js";
+// Type-only, so the import is erased and this is not a runtime cycle with
+// config.ts — which imports DEFAULT_LIMITS from this module.
+import type { ApiConfig } from "./config.js";
 
 /** A limit: how many requests, over what window. */
 export interface Limit {
@@ -61,6 +64,42 @@ export interface RateLimiterOptions {
   /** Salt for log hashes. Not secret; per-deployment so buckets are not portable. */
   readonly logSalt?: string;
   readonly now?: () => number;
+}
+
+/**
+ * buildRateLimiter constructs the limiter from configuration.
+ *
+ * ## Why this is a function and not an expression in `index.ts`
+ *
+ * Because it is the **only** place that decides which limits a deployment may
+ * move. Written inline at the call site, the wiring is invisible to a test: a
+ * test can build a limiter the way it *believes* `index.ts` does, pass, and the
+ * call site can be deleted without anything turning red — which is precisely what
+ * happened to the first version of this test. A fixture that reimplements the
+ * wiring is a second implementation of it, and §0.6.4 is the record of what that
+ * costs.
+ *
+ * The two limits this does **not** take from configuration are deliberate. The
+ * per-minute request cap bounds one client's request rate and the global
+ * concurrent-export backstop bounds the whole service regardless of how many
+ * addresses are in play. Neither is the knob a deployment raises to prove the
+ * chain repeatedly, and a deployment that could raise the global backstop could
+ * raise the one control that holds when the per-IP limits are wrong.
+ */
+export function buildRateLimiter(
+  config: Pick<ApiConfig, "sessionsPerHour">,
+  logSalt = "api",
+): RateLimiter {
+  return new RateLimiter({
+    logSalt,
+    limits: {
+      ...DEFAULT_LIMITS,
+      sessionsPerWindow: {
+        ...DEFAULT_LIMITS.sessionsPerWindow,
+        max: config.sessionsPerHour,
+      },
+    },
+  });
 }
 
 export class RateLimiter {

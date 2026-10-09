@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ConfigError, loadConfig, validateInternalOrigin, validateOrigins, validateSecret } from "../src/config.js";
+import { DEFAULT_LIMITS } from "../src/rate-limit.js";
 
 /** A minimal valid environment, so each test states only what it varies. */
 function baseEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
@@ -201,6 +202,49 @@ describe("loadConfig", () => {
     expect(() => loadConfig(baseEnv({ SESSION_TTL_HOURS: "0" }))).toThrow(ConfigError);
     expect(() => loadConfig(baseEnv({ SESSION_TTL_HOURS: "-1" }))).toThrow(/positive/);
     expect(() => loadConfig(baseEnv({ MIN_FREE_DISK_MB: "lots" }))).toThrow(/positive/);
+  });
+
+  describe("RATE_LIMIT_SESSIONS_PER_HOUR", () => {
+    // The default is read from `rate-limit.ts` rather than repeated here, so the
+    // test fails if the two drift apart instead of agreeing by coincidence.
+    it("defaults to the limiter's own default", () => {
+      expect(loadConfig(baseEnv()).sessionsPerHour).toBe(DEFAULT_LIMITS.sessionsPerWindow.max);
+    });
+
+    it("takes an explicit value, so a deployment can prove the chain repeatedly", () => {
+      // The live value while bug #54's re-proof was pending. Thirty-nine more
+      // attempts in the hour than the committed default allows.
+      expect(loadConfig(baseEnv({ RATE_LIMIT_SESSIONS_PER_HOUR: "42" })).sessionsPerHour).toBe(
+        42,
+      );
+    });
+
+    it("refuses a bad value rather than falling back to the default", () => {
+      // The failure mode this guards is the one that produced bug #37 in another
+      // form: a value that is present and wrong must not look like a value that is
+      // absent. A typo here would otherwise silently reinstate the limit the
+      // operator was trying to raise, and the 429 would read as a fault in the
+      // thing being proved.
+      for (const bad of ["0", "-1", "many", "3.5", "4 2"]) {
+        expect(() => loadConfig(baseEnv({ RATE_LIMIT_SESSIONS_PER_HOUR: bad }))).toThrow(
+          /RATE_LIMIT_SESSIONS_PER_HOUR|positive/,
+        );
+      }
+    });
+
+    it("treats an empty value as unset, which is safe because the default is lower", () => {
+      // Not a refusal, and deliberately so — `positiveInt` reads an empty string as
+      // "absent" for every variable in this file, and a special case here would be
+      // the kind of inconsistency that surprises the next reader.
+      //
+      // It is safe for this variable specifically because the fallback is the
+      // **restrictive** end: an operator who leaves it blank gets 3, not 42. The
+      // dangerous direction — a typo silently landing on a permissive default —
+      // is the case the test above refuses.
+      expect(loadConfig(baseEnv({ RATE_LIMIT_SESSIONS_PER_HOUR: "" })).sessionsPerHour).toBe(
+        DEFAULT_LIMITS.sessionsPerWindow.max,
+      );
+    });
   });
 
   it("rejects an unknown log level", () => {

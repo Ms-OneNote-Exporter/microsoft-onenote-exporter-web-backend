@@ -380,6 +380,31 @@ check(
   `runner publishes ${JSON.stringify(services.runner?.ports ?? [])}`,
 );
 
+// The api's `environment:` is an ALLOWLIST, not a passthrough.
+//
+// Every variable the api reads has to be named in that block, because a variable
+// in `.env` that is not listed here never reaches the process. The api then reads
+// its own compiled-in default while the operator believes the change took effect,
+// and nothing reports it — the configuration is a claim and nothing checks it.
+//
+// This has already produced "a configuration the process never read" twice in this
+// stack, so the variables that exist to be tuned per-deployment are asserted
+// rather than trusted. `RATE_LIMIT_SESSIONS_PER_HOUR` is the first of them: it was
+// added with a default and an `.env` entry, and would have been silently ignored
+// without this line.
+const TUNABLE_API_ENV = ["RATE_LIMIT_SESSIONS_PER_HOUR"];
+const apiEnv = services.api?.environment ?? {};
+for (const key of TUNABLE_API_ENV) {
+  check(
+    key in apiEnv,
+    `api environment names ${key}`,
+    `FAIL: the api's environment block omits ${key}. That block is an allowlist — a ` +
+      `variable in .env that is not named there never reaches the process, so the ` +
+      `operator would set it and the api would keep using its compiled-in default, ` +
+      `reporting nothing`,
+  );
+}
+
 // The api can authenticate to a runner, which means it holds the same token.
 //
 // Without the mount the api has no token to present, so every credential

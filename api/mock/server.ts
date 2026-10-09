@@ -57,7 +57,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { NO_PROXIES } from "../src/client-ip.js";
 import { Db } from "../src/db.js";
 import { SseHub } from "../src/sse.js";
-import { RateLimiter } from "../src/rate-limit.js";
+import { RateLimiter, DEFAULT_LIMITS } from "../src/rate-limit.js";
 import { buildServer } from "../src/server.js";
 import { PoolBinder, syncPool } from "../src/sweep.js";
 import type { ApiConfig } from "../src/config.js";
@@ -181,6 +181,11 @@ const config: ApiConfig = {
   databasePath: process.env.MOCK_DB ?? ":memory:",
   sseBufferEvents: 500,
   sseKeepaliveMs: 15_000,
+  // The mock is a development server, so it keeps the committed default rather
+  // than the raised live value. A developer looping on the chain locally is the
+  // case the small number suits; a deployment that proves the chain repeatedly
+  // raises it in its own environment.
+  sessionsPerHour: DEFAULT_LIMITS.sessionsPerWindow.max,
 };
 
 /**

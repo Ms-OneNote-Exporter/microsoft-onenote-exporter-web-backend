@@ -377,6 +377,75 @@ export class Db {
   }
 
   /**
+   * markExportStranded resets a session whose runner was released before the
+   * export could finish.
+   *
+   * ## Why this fix was needed
+   *
+   * Sessions in `state: 'exporting'` with `runner_id IS NULL` are stuck refusing
+   * every future export because `POST /api/export` (`routes.ts:860`) checks
+   * `export_state.state IN ('queued', 'running')` and answers 409. Without a
+   * runner to complete the export, and the sweeper skipping `exporting` sessions
+   * to protect them from idle timeouts, the only relief is the 12-hour absolute
+   * cap. Two such rows existed on the deployed host.
+   *
+   * This method is called from the sweeper for sessions that match that pattern:
+   * `state === 'exporting' && runner_id === null`. It is atomic so it cannot
+   * race `completeExport`, and the WHERE clause protects a live export from
+   * being touched.
+   *
+   * The data loss guard (`ELSE export_state` in the SQL) is load-bearing:
+   * session `80837b89` is `export_state.state='partial'` with a real
+   * `artifact_id` — a finished, downloadable result whose state is wrongly
+   * `exporting`. Overwriting its export_state would destroy the download.
+   *
+   * ## Why the target state is pinned in SQL, not passed as a parameter
+   *
+   * Passing `'failed'` in a bind parameter would work, but it risks
+   * re-serialising a `running` object from `export_state`, which would leave
+   * the route guard still reading `running`. That would be a silent no-op fix.
+   * The SQL CASE WHEN pins the replacement to `'failed'` so the guard
+   * (`export_state.state IN ('queued', 'running')`) definitely sees the new
+   * state.
+   *
+   * ## Why json_valid guard
+   *
+   * `json_extract` and `json_set` throw on malformed JSON. The sweep loop has
+   * no per-session try/catch; a throw reaches the outer catch in index.ts and
+   * abandons every remaining session for that tick. The guard keeps the sweep
+   * from failing on corrupted data.
+   *
+   * Returns true when a row was changed, so a caller can distinguish "reset"
+   * from "no-op".
+   */
+  markExportStranded(input: { readonly guid: string; readonly now: number; readonly idleExpiresAt: number }): boolean {
+    return (
+      this.run(
+        `UPDATE sessions
+           SET state = 'authenticated',
+               last_activity_at = ?,
+               idle_expires_at = ?,
+               export_state = CASE
+                 WHEN json_valid(export_state)
+                  AND json_extract(export_state, '$.state') IN ('queued', 'running')
+                   THEN json_set(export_state,
+                           '$.state', 'failed',
+                           '$.error', ?,
+                           '$.progress', NULL,
+                           '$.finishedAt', ?)
+                 ELSE export_state
+               END
+         WHERE guid = ? AND state = 'exporting' AND runner_id IS NULL`,
+        input.now,
+        input.idleExpiresAt,
+        "the runner was released before this export finished",
+        input.now,
+        input.guid,
+      ) > 0
+    );
+  }
+
+  /**
    * completeExport records a finished export: the terminal `export_state`, the
    * artifact that now belongs to the session, and the return to `authenticated`.
    *

@@ -11,6 +11,7 @@ import { generateCsrfKey, hashSecret } from "../src/session.js";
 
 let db: Db;
 const NOW = 1_700_000_000_000;
+const GUID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
 
 function seedSession(guid: string, overrides: Partial<SessionRow> = {}): void {
   db.run(
@@ -343,5 +344,269 @@ describe("WAL mode", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  describe("markExportStranded", () => {
+    it("marks a running export_state as failed", () => {
+      db.createSession({
+        guid: GUID,
+        secretHash: hashSecret("A".repeat(43)),
+        csrfKey: generateCsrfKey(),
+        now: NOW,
+        expiresAt: NOW + 43_200_000,
+      });
+      db.run(
+        `UPDATE sessions SET state = 'exporting', runner_id = NULL,
+                         export_state = ? WHERE guid = ?`,
+        '{"state":"running","id":"artifact123","notebook":"Notebook"}',
+        GUID,
+      );
+
+      const changed = db.markExportStranded({
+        guid: GUID,
+        now: NOW + 1000,
+        idleExpiresAt: NOW + 50_000,
+      });
+
+      expect(changed).toBe(true);
+
+      const row = db.getSession(GUID)!;
+      expect(row.state).toBe("authenticated");
+      expect(row.last_activity_at).toBe(NOW + 1000);
+      expect(row.idle_expires_at).toBe(NOW + 50_000);
+      expect(row.runner_id).toBeNull();
+
+      const parsed = JSON.parse(row.export_state!);
+      expect(parsed.state).toBe("failed");
+      expect(parsed.error).toBe("the runner was released before this export finished");
+      expect(parsed.progress).toBeNull();
+      expect(parsed.finishedAt).toBe(NOW + 1000);
+      expect(parsed.id).toBe("artifact123");
+      expect(parsed.notebook).toBe("Notebook");
+    });
+
+    it("marks a queued export_state as failed", () => {
+      db.createSession({
+        guid: GUID,
+        secretHash: hashSecret("A".repeat(43)),
+        csrfKey: generateCsrfKey(),
+        now: NOW,
+        expiresAt: NOW + 43_200_000,
+      });
+      db.run(
+        `UPDATE sessions SET state = 'exporting', runner_id = NULL,
+                         export_state = ? WHERE guid = ?`,
+        '{"state":"queued","id":"artifact123","notebook":"Notebook"}',
+        GUID,
+      );
+
+      const changed = db.markExportStranded({
+        guid: GUID,
+        now: NOW + 1000,
+        idleExpiresAt: NOW + 50_000,
+      });
+
+      expect(changed).toBe(true);
+
+      const row = db.getSession(GUID)!;
+      const parsed = JSON.parse(row.export_state!);
+      expect(parsed.state).toBe("failed");
+      expect(parsed.id).toBe("artifact123");
+      expect(parsed.notebook).toBe("Notebook");
+    });
+
+    it("leaves partial export_state unchanged (data-loss guard)", () => {
+      const partialState = JSON.stringify({
+        state: "partial",
+        partialReason: "quota",
+        id: "artifact123",
+        notebook: "Notebook",
+        progress: null,
+        startedAt: 1234567890,
+        finishedAt: 1234567900,
+      });
+
+      db.createSession({
+        guid: GUID,
+        secretHash: hashSecret("A".repeat(43)),
+        csrfKey: generateCsrfKey(),
+        now: NOW,
+        expiresAt: NOW + 43_200_000,
+      });
+      db.run(
+        `UPDATE sessions SET state = 'exporting', runner_id = NULL,
+                         export_state = ?, artifact_id = 'artifact123'
+                       WHERE guid = ?`,
+        partialState,
+        GUID,
+      );
+
+      const changed = db.markExportStranded({
+        guid: GUID,
+        now: NOW + 1000,
+        idleExpiresAt: NOW + 50_000,
+      });
+
+      // Should be true because the WHERE clause matched (state=exporting AND runner_id=NULL)
+      // but the CASE WHEN didn't change export_state
+      expect(changed).toBe(true);
+
+      const row = db.getSession(GUID)!;
+      expect(row.state).toBe("authenticated");
+      expect(row.export_state).toBe(partialState);
+      expect(row.artifact_id).toBe("artifact123");
+    });
+
+    it("leaves malformed export_state unchanged AND does not throw", () => {
+      db.createSession({
+        guid: GUID,
+        secretHash: hashSecret("A".repeat(43)),
+        csrfKey: generateCsrfKey(),
+        now: NOW,
+        expiresAt: NOW + 43_200_000,
+      });
+      db.run(
+        `UPDATE sessions SET state = 'exporting', runner_id = NULL, export_state = ?
+        WHERE guid = ?`,
+        "not valid json {",
+        GUID,
+      );
+
+      // Should not throw
+      expect(() =>
+        db.markExportStranded({
+          guid: GUID,
+          now: NOW + 1000,
+          idleExpiresAt: NOW + 50_000,
+        }),
+      ).not.toThrow();
+
+      const row = db.getSession(GUID)!;
+      // state is updated to 'authenticated' unconditionally by the WHERE clause
+      expect(row.state).toBe("authenticated");
+      // export_state unchanged (data-loss guard)
+      expect(row.export_state).toBe("not valid json {");
+    });
+
+    it("leaves NULL export_state unchanged AND does not throw", () => {
+      db.createSession({
+        guid: GUID,
+        secretHash: hashSecret("A".repeat(43)),
+        csrfKey: generateCsrfKey(),
+        now: NOW,
+        expiresAt: NOW + 43_200_000,
+      });
+      db.run(
+        `UPDATE sessions SET state = 'exporting', runner_id = NULL, export_state = NULL
+        WHERE guid = ?`,
+        GUID,
+      );
+
+      expect(() =>
+        db.markExportStranded({
+          guid: GUID,
+          now: NOW + 1000,
+          idleExpiresAt: NOW + 50_000,
+        }),
+      ).not.toThrow();
+
+      const row = db.getSession(GUID)!;
+      // state is updated to 'authenticated' unconditionally by the WHERE clause
+      expect(row.state).toBe("authenticated");
+      expect(row.export_state).toBeNull();
+    });
+
+    it("re-running on an already failed row is a no-op (state stays failed)", () => {
+      db.createSession({
+        guid: GUID,
+        secretHash: hashSecret("A".repeat(43)),
+        csrfKey: generateCsrfKey(),
+        now: NOW,
+        expiresAt: NOW + 43_200_000,
+      });
+      db.run(
+        `UPDATE sessions SET state = 'exporting', runner_id = NULL,
+                         export_state = ? WHERE guid = ?`,
+        '{"state":"failed","error":"previous error"}',
+        GUID,
+      );
+
+      // First run
+      db.markExportStranded({
+        guid: GUID,
+        now: NOW + 1000,
+        idleExpiresAt: NOW + 50_000,
+      });
+
+      // Second run
+      const changed = db.markExportStranded({
+        guid: GUID,
+        now: NOW + 2000,
+        idleExpiresAt: NOW + 60_000,
+      });
+
+      // Second call should return false because the WHERE clause doesn't match
+      // (export_state.state is 'failed', not 'queued' or 'running')
+      expect(changed).toBe(false);
+
+      const row = db.getSession(GUID)!;
+      expect(row.last_activity_at).toBe(NOW + 1000);
+      expect(row.idle_expires_at).toBe(NOW + 50_000);
+    });
+
+    it("a session with a live runner (runner_id non-null) is never touched", () => {
+      db.createSession({
+        guid: GUID,
+        secretHash: hashSecret("A".repeat(43)),
+        csrfKey: generateCsrfKey(),
+        now: NOW,
+        expiresAt: NOW + 43_200_000,
+      });
+      db.run(
+        `UPDATE sessions SET state = 'exporting', runner_id = 'slot-1',
+                         export_state = ? WHERE guid = ?`,
+        '{"state":"running"}',
+        GUID,
+      );
+
+      const changed = db.markExportStranded({
+        guid: GUID,
+        now: NOW + 1000,
+        idleExpiresAt: NOW + 50_000,
+      });
+
+      expect(changed).toBe(false);
+
+      const row = db.getSession(GUID)!;
+      expect(row.state).toBe("exporting");
+      expect(row.runner_id).toBe("slot-1");
+    });
+
+    it("a session not in exporting state is never touched", () => {
+      db.createSession({
+        guid: GUID,
+        secretHash: hashSecret("A".repeat(43)),
+        csrfKey: generateCsrfKey(),
+        now: NOW,
+        expiresAt: NOW + 43_200_000,
+      });
+      db.run(
+        `UPDATE sessions SET state = 'authenticated', runner_id = NULL,
+                         export_state = ? WHERE guid = ?`,
+        '{"state":"running"}',
+        GUID,
+      );
+
+      const changed = db.markExportStranded({
+        guid: GUID,
+        now: NOW + 1000,
+        idleExpiresAt: NOW + 50_000,
+      });
+
+      expect(changed).toBe(false);
+
+      const row = db.getSession(GUID)!;
+      expect(row.state).toBe("authenticated");
+    });
   });
 });

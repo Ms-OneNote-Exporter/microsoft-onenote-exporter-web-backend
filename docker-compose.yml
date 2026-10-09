@@ -265,6 +265,18 @@ services:
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?set the exact frontend origin(s), comma separated}
       SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-12}
       MIN_FREE_DISK_MB: ${MIN_FREE_DISK_MB:-2048}
+
+      # New sessions per hour from one client address. Listed here because this
+      # block is an **allowlist**, not a passthrough: a variable in `.env` that is
+      # not named below never reaches the process, and the api then reads its own
+      # compiled-in default while the operator believes the change took. That has
+      # happened twice in this stack already (§0.4).
+      #
+      # The default is 3, which is a control rather than a tuning knob. Raising it
+      # is for deployments that repeatedly re-prove the chain; see infra/README.md
+      # for what it does not buy, and why it is the same knob as the proxy-trust
+      # failure in the Client IP section.
+      RATE_LIMIT_SESSIONS_PER_HOUR: ${RATE_LIMIT_SESSIONS_PER_HOUR:-3}
       ORCHESTRATOR_URL: http://orchestrator:9100
       DATABASE_PATH: /srv/msout/data/api.db
       LOG_LEVEL: ${LOG_LEVEL:-info}

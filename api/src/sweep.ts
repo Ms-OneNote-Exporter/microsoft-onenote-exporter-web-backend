@@ -144,6 +144,14 @@ export interface SweepReport {
    * to look at when an export is slow.
    */
   exportsHeld: number;
+  /**
+   * Runners released because the session's login was refused.
+   *
+   * Counted because 'a session went idle' and 'a login was rejected' look identical from
+   * outside and were being conflated — the slot was bound for the rest of a 15-minute
+   * window instead of one sweep interval.
+   */
+  authFailedReleased: number;
 }
 
 /** Options for the sweeper. */
@@ -592,6 +600,57 @@ export class PoolBinder {
   }
 
   /**
+   * releaseForAuthFailure returns a runner after a login failure.
+   *
+   * A failed login with `auth_state = 'failed'` never produced a usable session:
+   * the vault's `auth.json` was refuted, and the container was a Chromium process
+   * that should not be kept warm for it. The container is destroyed rather than
+   * recycled (`Pool.Release` destroys it) — correct here: the vault's auth.json
+   * just failed and the container is a Chromium process that should not be kept
+   * warm for it. The session volume is untouched, so the row is retained and a
+   * retry can rebind.
+   *
+   * ## Why this is not a copy of `releaseForIdle`
+   *
+   * That method's full UPDATE also writes `state='authenticated'` and arms a
+   * 30-minute `idle_expires_at`, which beside `auth_state='failed'` would
+   * report a signed-in-looking snapshot for a refused login. This method only
+   * nulls `runner_id` and leaves `state` and `auth_state` exactly as
+   * `markAuthFailed` wrote them — deliberately the smallest delta, so nothing
+   * downstream (including the `failed`→`expired` transition at +15min, tracked
+   * as issue #49) moves as a side effect of fixing this.
+   *
+   * ## Why the release was late, not missing, before this fix
+   *
+   * `markAuthFailed` records the failure at once but nothing freed the slot, so
+   * a mistyped password held it for the full 15-minute `TTL.loginInProgress` —
+   * a quarter-hour of lockout on the deployed 2-slot pool, from one typo. The
+   * existing login-expiry branch above does eventually release it 15 minutes
+   * later, because it is guarded on `state` (which `markAuthFailed` does not
+   * change) rather than on `auth_state`. So the release was **late, not
+   * missing** — and this fix simply makes it immediate.
+   */
+  async releaseForAuthFailure(session: SessionRow): Promise<boolean> {
+    if (session.runner_id === null) return false;
+    const released = await this.#orchestrator.release(session.runner_id);
+    if (!released.ok && released.error.kind !== "conflict") {
+      this.#log.warn("release after a failed login failed, slot retained for retry", {
+        session: session.guid,
+        runner: session.runner_id,
+        error: released.error.kind,
+      });
+      return false;
+    }
+    this.#db.releaseRunner(session.runner_id);
+    this.#db.run(`UPDATE sessions SET runner_id = NULL WHERE guid = ?`, session.guid);
+    this.#log.info("runner released after a failed login", {
+      session: session.guid,
+      runner: session.runner_id,
+    });
+    return true;
+  }
+
+  /**
    * releaseForAbsence returns a runner for a session that is going away.
    *
    * Distinct from `releaseForIdle`: the session row goes too, so the vault has to
@@ -633,6 +692,7 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
     loginExpired: 0,
     skippedErasing: 0,
     exportsHeld: 0,
+    authFailedReleased: 0,
   };
 
   // Learn the pool's current membership, not just its size.
@@ -783,6 +843,19 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
       if (await binder.releaseForIdle(session)) {
         report.idleReleased++;
       }
+    }
+
+    // A login that failed is over, and the slot is worth more to somebody else.
+    //
+    // The login-expiry branch above is guarded on `state`, which `markAuthFailed` does
+    // not change — so without this the slot sits bound for the rest of the 15-minute
+    // window, which on the deployed two-slot pool is a quarter-hour of lockout for
+    // everyone from one mistyped password.
+    if (session.auth_state === "failed" && session.runner_id !== null) {
+      if (await binder.releaseForAuthFailure(session)) {
+        report.authFailedReleased++;
+      }
+      continue;
     }
   }
 

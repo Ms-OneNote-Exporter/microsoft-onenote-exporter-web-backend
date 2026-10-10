@@ -95,7 +95,16 @@ function seedSession(store: Db, guid = GUID): void {
   });
 }
 
-/** A session that is logged in, for the routes that require auth.state valid. */
+/**
+ * A session that is logged in, for the routes that require auth.state valid.
+ *
+ * **Not for the credential route.** §4.7 — "no retry on the credential route" —
+ * means a submit against a `valid` or `authenticating` session is now a 409
+ * (`already-authenticated` / `login-in-progress`), so a credential test that wants
+ * a 202 has to start from `seedFresh()`. That is a real behaviour change and the
+ * tests below are shaped to reach the runner, which is what makes them
+ * non-vacuous: each asserts the status it needs to be past the guard.
+ */
 function seed(runnerId: string | null = "slot-1") {
   seedSession(db);
   db.run(
@@ -229,7 +238,9 @@ describe("the mock uses the real api", () => {
 
 describe("routes that were 501", () => {
   it("accepts a credential and logs in", async () => {
-    seed();
+    // `seedFresh()`, not `seed()`: a session that is already `valid` is refused by
+    // the credential route's §4.7 guard, so this has to be the first submit.
+    seedFresh();
     const { app } = await newApp();
     try {
       const response = await app.inject({
@@ -256,7 +267,7 @@ describe("routes that were 501", () => {
   });
 
   it("reports a bad password as login-failed, and does not mark the session valid", async () => {
-    seed();
+    seedFresh();
     runner.setNextLogin("bad-password");
     const { app } = await newApp();
     try {
@@ -282,7 +293,11 @@ describe("routes that were 501", () => {
 
   it("emits an MFA challenge rather than hanging", async () => {
     // PLAN-v2 §6.1: a swallowed challenge is a hang, not an error.
-    seed();
+    //
+    // `seedFresh()` because `auth_state` starts at `none` here and the MFA script
+    // leaves it at `authenticating` — a state the §4.7 guard now refuses, so seeding
+    // it as `valid` would turn this into a 409 test of nothing.
+    seedFresh();
     runner.setNextLogin("mfa-number");
     const { app } = await newApp();
     try {
@@ -578,12 +593,23 @@ describe("binding a runner on login", () => {
 describe("the mock does not handle the credential", () => {
   // The property the whole credential path exists to have. A dev tool that logged
   // or inspected the password would be a second handler for it.
-  it("never stores the credential anywhere", async () => {
-    seed();
+  //
+  // **This used to be one test with two POSTs, and both POSTs have to reach the
+  // runner or it asserts nothing.** The §4.7 guard changed that: the first POST
+  // drives `auth_state` to `valid` and the second is now a
+  // `409 already-authenticated`, so nothing was stored and nothing was emitted —
+  // the assertions stayed green while guarding nothing. It is split in two instead
+  // of patched with a mid-test `UPDATE ... auth_state = 'expired'`, because a
+  // surgical reset is how a test gets to keep a shape it can no longer earn: each
+  // half below seeds its own session and asserts the 202 that proves the submit
+  // got past the guard and into the mock. If the guard ever closes these again,
+  // both go red on the status rather than passing on an empty database.
+  it("never stores the credential in the database", async () => {
+    seedFresh();
     const { app } = await newApp();
     const password = "correct-horse-battery-staple";
 
-    await app.inject({
+    const response = await app.inject({
       method: "POST",
       url: "/api/session/credential",
       headers: {
@@ -596,13 +622,23 @@ describe("the mock does not handle the credential", () => {
       payload: password,
     });
 
-    // Not in the database...
+    // The submit was accepted, so the mock really did read the stream and really
+    // did drive a login — and the password is nowhere in what it wrote.
+    expect(response.statusCode).toBe(202);
+    expect(db.getSession(GUID)?.auth_state).toBe("valid");
     for (const row of db.all<Record<string, unknown>>(`SELECT * FROM sessions`)) {
       expect(JSON.stringify(row)).not.toContain(password);
     }
-    // ...not in the response...
-    // ...and not echoed into any SSE frame. The hub's buffer is the only place a
-    // leak could hide, so it is checked through a subscriber.
+    await app.close();
+  });
+
+  it("never echoes the credential into an SSE frame", async () => {
+    // The hub is the only place a leak could hide, so it is checked through a
+    // subscriber rather than by reading the buffer.
+    seedFresh();
+    const { app } = await newApp();
+    const password = "correct-horse-battery-staple";
+
     const captured: string[] = [];
     const { EventEmitter } = require("node:events") as typeof import("node:events");
     const res = new EventEmitter() as unknown as import("node:http").ServerResponse;
@@ -611,9 +647,11 @@ describe("the mock does not handle the credential", () => {
       return true;
     }) as never;
     res.end = (() => res) as never;
+    // Attached before the submit, so the frames the login itself produces are the
+    // ones under test.
     sse.attach(GUID, res, null);
 
-    await app.inject({
+    const response = await app.inject({
       method: "POST",
       url: "/api/session/credential",
       headers: {
@@ -626,12 +664,20 @@ describe("the mock does not handle the credential", () => {
       payload: password,
     });
 
+    // Two guards against vacuity, not one: the submit has to have been accepted
+    // *and* frames have to have been written. An empty capture would satisfy
+    // `not.toContain` for the wrong reason.
+    expect(response.statusCode).toBe(202);
+    expect(captured.length).toBeGreaterThan(0);
     expect(captured.join("")).not.toContain(password);
     await app.close();
   });
 
   it("reports only a byte count, never the content", async () => {
-    seed();
+    // A 202 body, so the submit has to be the first one: seeded `valid` this would
+    // be a 409 and `Object.keys(...)).toEqual(["accepted"])` would be asserting a
+    // body the route never produced.
+    seedFresh();
     const { app } = await newApp();
     try {
       const response = await app.inject({
@@ -647,6 +693,7 @@ describe("the mock does not handle the credential", () => {
         payload: "hunter2",
       });
       // The response is about acceptance, and says nothing about the value.
+      expect(response.statusCode).toBe(202);
       expect(Object.keys(response.json())).toEqual(["accepted"]);
     } finally {
       await app.close();

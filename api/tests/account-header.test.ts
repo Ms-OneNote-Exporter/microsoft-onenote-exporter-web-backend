@@ -198,6 +198,18 @@ describe("the account on the credential route", () => {
     ]) {
       await app.close();
       app = await build();
+      // **Each iteration must be a first submit, not a replay of the previous one.**
+      // The row survives the rebuild above — `beforeEach` seeded the session once and
+      // `build()` only makes a new server and SSE hub — so after iteration one the
+      // scripted login has written `auth_state = 'valid'`. That is the state the
+      // credential route now refuses in §4.7 ("no retry on the credential route"),
+      // so without this reset iterations two to five answer 409 and the loop stops
+      // testing byte equality at all. It is five different account spellings, not
+      // five sign-ins, that is the subject here.
+      db.run(
+        `UPDATE sessions SET state = 'created', auth_state = 'none' WHERE guid = ?`,
+        GUID,
+      );
       const response = await app.inject({
         method: "POST",
         url: "/api/session/credential",

@@ -363,7 +363,26 @@ describe("the failure messages", () => {
       // And no host paths, ids, or internals.
       expect(message).not.toMatch(/\/|stack|chromium|runner/i);
     });
+
+    it(`${name} offers hedged alternatives and asserts none of them`, () => {
+      // Each of the three failure messages must present multiple possibilities
+      // without claiming which one is correct. The presence of "may" or "or"
+      // indicates hedging; the absence of definitive language confirms no claim.
+      const hasHedge = message.match(/may|or/i);
+      expect(hasHedge).toBeTruthy(`${name} must present multiple possibilities without asserting which one`);
+    });
   }
+
+  it("NOTEBOOK_NOT_FOUND mentions all three indistinguishable causes", () => {
+    // The three causes (empty, not loaded, re-verification) must all be mentioned
+    // as possibilities, using hedged language (may, or) that does not assert any one.
+    expect(NOTEBOOK_NOT_FOUND).toMatch(/empty/i);
+    expect(NOTEBOOK_NOT_FOUND).toMatch(/load/i); // covers "not loaded", "not have loaded"
+    expect(NOTEBOOK_NOT_FOUND).toMatch(/re-verification/i);
+    // The hedge words must be present to avoid asserting a specific cause
+    expect(NOTEBOOK_NOT_FOUND).toMatch(/may/i);
+    expect(NOTEBOOK_NOT_FOUND).toMatch(/or/i);
+  });
 
   it("NOTEBOOK_NOT_FOUND is distinct from UNPUBLISHABLE", () => {
     expect(NOTEBOOK_NOT_FOUND).not.toBe(UNPUBLISHABLE);

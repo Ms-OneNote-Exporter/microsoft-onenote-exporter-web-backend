@@ -3,7 +3,9 @@ package pool
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/Ms-OneNote-Exporter/microsoft-onenote-exporter-web-backend/orchestrator/internal/dockerapi"
@@ -33,6 +35,50 @@ type fakeDaemon struct {
 	// the pool, not strand it.
 	failing    string
 	failingErr error
+
+	// blockOn names the operation that blocks until the caller's context is done,
+	// answering as the Engine does after a client has stopped listening. It exists
+	// because this fake used to ignore its context parameter entirely, which made
+	// the worst bug in this component untestable: every cleanup path runs after
+	// something has already gone wrong, and the question those paths exist to
+	// answer — *did the cleanup reach the daemon, or did it die with the request?*
+	// — is precisely a question about the context.
+	//
+	// Two operations are useful, and they are the two the observed incident needed,
+	// because they leave different things behind:
+	//
+	//   - "create": the Engine finishes the write the client asked for and the
+	//     client never learns the id. Reproduces `msout-slot-1-…`, sitting in
+	//     `Created` with nothing pointing at it.
+	//   - "inspect": create **and** start have already succeeded, and the abort
+	//     lands in the readiness wait. Reproduces `msout-slot-2-…`, **Up (healthy)**
+	//     — a running Chromium holding the session's vault bind, owned by nothing.
+	//
+	// Both were invisible to the pool, which is the property the hook exists to make
+	// assertable.
+	blockOn string
+
+	// blocked is closed by the blocked operation when it is reached, so a test knows
+	// when the abort will actually land inside it. A sleep would race: a
+	// cancellation arriving earlier aborts the *destroy* leg instead, which is a
+	// different defect with a different fix.
+	blocked     chan struct{}
+	blockOnce   sync.Once
+	blockWaited time.Duration
+
+	// calls records every operation the pool asked for, with the context state it
+	// carried. The assertion a cancellation test needs is not "remove was called"
+	// but "remove was called with a context that was still alive".
+	calls []fakeCall
+}
+
+// fakeCall is one recorded Docker call.
+type fakeCall struct {
+	op string
+	// live is whether the caller's context was still usable when the call was
+	// made — the whole point of the recording. `ctx.Err() != nil` answers it
+	// exactly as the real client would have failed the request.
+	live bool
 }
 
 // fakeContainer is one container in the fake daemon.
@@ -79,6 +125,39 @@ func (d *fakeDaemon) count() int {
 	return len(d.containers)
 }
 
+// findByName returns the container carrying name, or nil.
+//
+// By name rather than by id because that is how the pool reaches the one container
+// it has no id for: a create the Engine finished after the caller hung up. Asserting
+// on the count alone would miss the case that matters, where the survivor is the
+// one thing nobody has a handle to.
+func (d *fakeDaemon) findByName(name string) *fakeContainer {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, c := range d.containers {
+		if c.name == name {
+			return c
+		}
+	}
+	return nil
+}
+
+// names returns every container's Engine-visible name, sorted by id.
+//
+// Read directly rather than through `ListContainersByLabel` because it is the
+// host-level view this assertion is about: what `docker ps -a` would show, which is
+// what an operator looked at to find the two orphans in the first place.
+func (d *fakeDaemon) names() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([]string, 0, len(d.containers))
+	for _, c := range d.containers {
+		out = append(out, c.name)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // failNext makes the named operation fail once, then clear itself.
 //
 // "once" matters: a test that wants to observe recovery — a slot returned to the
@@ -88,6 +167,89 @@ func (d *fakeDaemon) failNext(op string, err error) {
 	defer d.mu.Unlock()
 	d.failing = op
 	d.failingErr = err
+}
+
+// cancelCreates arms the hook on "create": the next create blocks until its caller
+// gives up, and every call after that is recorded with the context it carried.
+func (d *fakeDaemon) cancelCreates() {
+	d.armBlock("create")
+}
+
+// cancelInspects arms the hook on "inspect", so the abort lands in the readiness
+// wait — after create and start have already succeeded. That is the window that left
+// a **running** container behind, and the one that matters more.
+func (d *fakeDaemon) cancelInspects() {
+	d.armBlock("inspect")
+}
+
+func (d *fakeDaemon) armBlock(op string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.blockOn = op
+	d.blocked = make(chan struct{})
+	d.blockWaited = 5 * time.Second
+}
+
+// waitForBlockedCreate blocks until a create has reached the cancellation hook.
+//
+// Without it a test cancels at an arbitrary moment and asserts on a window it did
+// not aim at: cancel too early and the abort lands in `destroy` (which has its own
+// test), too late and the claim has already finished. A test that cannot say *when*
+// it cancelled is a test that proves nothing about the create path.
+func (d *fakeDaemon) waitForBlockedCreate(t *testing.T) {
+	t.Helper()
+	d.mu.Lock()
+	blocked := d.blocked
+	wait := d.blockWaited
+	d.mu.Unlock()
+	if blocked == nil {
+		t.Fatal("waitForBlockedCreate without an armed cancellation hook")
+	}
+	select {
+	case <-blocked:
+	case <-time.After(wait):
+		t.Fatalf("no create blocked within %v; the test did not reach the window it "+
+			"was aiming at", wait)
+	}
+}
+
+// markBlocked signals that a create has reached the blocking point.
+func (d *fakeDaemon) markBlocked() {
+	d.mu.Lock()
+	blocked := d.blocked
+	d.mu.Unlock()
+	if blocked == nil {
+		return
+	}
+	d.blockOnce.Do(func() { close(blocked) })
+}
+
+// callsFor returns the recorded calls of one operation, in order.
+func (d *fakeDaemon) callsFor(op string) []fakeCall {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var out []fakeCall
+	for _, c := range d.calls {
+		if c.op == op {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// forgetCalls clears the recording, so a test can assert about the calls made
+// after a given event rather than everything that preceded it.
+func (d *fakeDaemon) forgetCalls() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.calls = nil
+}
+
+// record notes a call and the state of the context it arrived on.
+func (d *fakeDaemon) record(ctx context.Context, op string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.calls = append(d.calls, fakeCall{op: op, live: ctx.Err() == nil})
 }
 
 // lastCreate returns the most recent create request, so a test can assert what
@@ -116,10 +278,26 @@ func (d *fakeDaemon) shouldFail(op string) error {
 	return nil
 }
 
-func (d *fakeDaemon) CreateContainer(_ context.Context, req dockerapi.CreateRequest, name string) (dockerapi.CreateResponse, error) {
+func (d *fakeDaemon) CreateContainer(ctx context.Context, req dockerapi.CreateRequest, name string) (dockerapi.CreateResponse, error) {
+	d.record(ctx, "create")
+	// The hook: the Engine finishes the write the client asked for even though the
+	// client has stopped listening, so the container exists — and the caller is told
+	// it failed, because the answer never reached it. That combination is the leak:
+	// something on the host that this process created and cannot name.
+	//
+	// Observed as `msout-slot-1-…` sitting in `Created` with nothing pointing at it.
+	if d.shouldBlock(ctx, "create") {
+		d.store(req, name)
+		return dockerapi.CreateResponse{}, ctx.Err()
+	}
 	if err := d.shouldFail("create"); err != nil {
 		return dockerapi.CreateResponse{}, err
 	}
+	return dockerapi.CreateResponse{ID: d.store(req, name)}, nil
+}
+
+// store records a created container and returns its id.
+func (d *fakeDaemon) store(req dockerapi.CreateRequest, name string) string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	id := fmt.Sprintf("ctr%d", d.nextID)
@@ -131,10 +309,34 @@ func (d *fakeDaemon) CreateContainer(_ context.Context, req dockerapi.CreateRequ
 		mounts: req.Mounts,
 		image:  req.Image,
 	}
-	return dockerapi.CreateResponse{ID: id}, nil
+	return id
 }
 
-func (d *fakeDaemon) StartContainer(_ context.Context, id string) error {
+// shouldBlock reports whether `op` is the armed hook, consuming the arming so only
+// the first such call blocks — the ones after it are the recovery the test watches
+// for. When it is armed it waits for the context to be done and reports that the
+// call died with it, which is what the real client does.
+func (d *fakeDaemon) shouldBlock(ctx context.Context, op string) bool {
+	d.mu.Lock()
+	if d.blockOn != op {
+		d.mu.Unlock()
+		return false
+	}
+	d.blockOn = ""
+	blocked := d.blocked
+	d.mu.Unlock()
+
+	d.blockOnce.Do(func() {
+		if blocked != nil {
+			close(blocked)
+		}
+	})
+	<-ctx.Done()
+	return true
+}
+
+func (d *fakeDaemon) StartContainer(ctx context.Context, id string) error {
+	d.record(ctx, "start")
 	if err := d.shouldFail("start"); err != nil {
 		return err
 	}
@@ -148,7 +350,8 @@ func (d *fakeDaemon) StartContainer(_ context.Context, id string) error {
 	return nil
 }
 
-func (d *fakeDaemon) StopContainer(_ context.Context, id string, _ int) error {
+func (d *fakeDaemon) StopContainer(ctx context.Context, id string, _ int) error {
+	d.record(ctx, "stop")
 	if err := d.shouldFail("stop"); err != nil {
 		return err
 	}
@@ -162,17 +365,40 @@ func (d *fakeDaemon) StopContainer(_ context.Context, id string, _ int) error {
 	return nil
 }
 
-func (d *fakeDaemon) RemoveContainer(_ context.Context, id string) error {
+// RemoveContainer removes by id or by name.
+//
+// By name, because the pool removes a container by name on one path: a create the
+// Engine completed after the client hung up leaves a container with no id this
+// process ever saw, and the name is the only handle it has. The real client accepts
+// either, so the fake must too or that path cannot be tested at all.
+func (d *fakeDaemon) RemoveContainer(ctx context.Context, id string) error {
+	d.record(ctx, "remove")
 	if err := d.shouldFail("remove"); err != nil {
 		return err
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if _, ok := d.containers[id]; !ok {
+		for key, c := range d.containers {
+			if c.name == id {
+				delete(d.containers, key)
+				break
+			}
+		}
+		return nil
+	}
 	delete(d.containers, id)
 	return nil
 }
 
-func (d *fakeDaemon) InspectContainer(_ context.Context, id string) (*dockerapi.Container, error) {
+func (d *fakeDaemon) InspectContainer(ctx context.Context, id string) (*dockerapi.Container, error) {
+	d.record(ctx, "inspect")
+	// The readiness wait is where the observed abort landed: create and start had
+	// both succeeded, so the container was **running**, and the cleanup that should
+	// have taken it down was about to run on a dead context.
+	if d.shouldBlock(ctx, "inspect") {
+		return nil, ctx.Err()
+	}
 	if err := d.shouldFail("inspect"); err != nil {
 		return nil, err
 	}
@@ -205,7 +431,8 @@ func (d *fakeDaemon) InspectContainer(_ context.Context, id string) (*dockerapi.
 	}, nil
 }
 
-func (d *fakeDaemon) ListContainersByLabel(_ context.Context, label string) ([]string, error) {
+func (d *fakeDaemon) ListContainersByLabel(ctx context.Context, label string) ([]string, error) {
+	d.record(ctx, "list")
 	if err := d.shouldFail("list"); err != nil {
 		return nil, err
 	}

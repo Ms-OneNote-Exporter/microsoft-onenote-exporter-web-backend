@@ -104,6 +104,36 @@ type Slot struct {
 // IsIdle reports whether the slot can be handed to a session.
 func (s *Slot) IsIdle() bool { return s.State == StateIdle }
 
+// refillable reports whether EnsurePool owes this slot a container.
+//
+// "Holds no container" rather than "is vacant", because a containerless slot is
+// not one state but five writers' work, and only one of them ever said so:
+// `fail()` leaves one `idle` with no container, `Release`/`Recycle`/`Remove` leave
+// one `dead` when their destroy fails, and `Reconcile`'s dead and expired branches
+// leave one `dead`. Only the release path set `StateVacant`, which was the single
+// state `EnsurePool` looked for — so the other four were counted as filled and
+// were never created for again.
+//
+// Observed on the live host: `size: 2`, one runner, slot-2 containerless across
+// hundreds of 10-second ticks, and a `runners` row the api had already classified
+// `idle`. The pool reported itself full and could serve nobody.
+//
+// The three exclusions are the windows where an empty container id means a
+// container is *on its way*, not lost. `starting` is the direct one (`EnsurePool`
+// moves a slot there before creating). `bound` is `Claim`: it binds the slot
+// before it creates, so a claim on a containerless slot spends its whole
+// create-and-wait window with an empty id. `draining` keeps its id until the
+// destroy finishes. Creating a second container for any of them would put two
+// runners on one `msout.slot.id`, which the reconciler adopts by — so it could
+// not tell which is the slot's, and the loser is unowned memory holding somebody's
+// vault bind.
+func (s *Slot) refillable() bool {
+	return s.ContainerID == "" &&
+		s.State != StateStarting &&
+		s.State != StateBound &&
+		s.State != StateDraining
+}
+
 // Daemon is the Docker Engine surface the pool uses.
 //
 // An interface rather than a concrete *dockerapi.Client, for two reasons. It is
@@ -480,6 +510,7 @@ func (p *Pool) provision(ctx context.Context, slot *Slot, sessionGUID string,
 	// one: the browser process tree that was idle is discarded, so no state
 	// carries across into the session that is about to type a password.
 	if err := p.destroy(ctx, idleContainerID); err != nil {
+		p.logAbortedClaim(slotID, "destroy", err)
 		p.fail(slot, idleContainerID)
 		return nil, err
 	}
@@ -519,6 +550,41 @@ func (p *Pool) fail(slot *Slot, deadContainerID string) {
 	slot.SessionGUID = ""
 	slot.BoundAt = time.Time{}
 	slot.SessionExpiresAt = time.Time{}
+}
+
+// logAbortedClaim records a claim that died because the caller went away, naming
+// the phase it died in. It is a no-op for every other error.
+//
+// ## Why this line exists
+//
+// The api's client budget was 15 s against ~57 s of work, so claims were aborted
+// mid-provision — and the orchestrator said nothing. The api recorded
+// `error: "unreachable"` and dropped the cause, and the orchestrator's own error
+// (`context canceled`) was carried out to an http handler writing a response
+// nobody was reading. So a grep for `context canceled` came back empty on a run
+// that had in fact been cancelled: the diagnostic disproved the hypothesis it was
+// checking, which is worse than having no diagnostic at all.
+//
+// `error`, not `warn`, because an aborted claim is not a transient warning — it
+// is the one that leaves something behind, and it needs to be findable in a wall
+// of `INFO claimed slot` lines.
+//
+// `phase` is what makes the line actionable rather than merely present: the abort
+// can land in any of four legs, and they leave different things behind. `destroy`
+// orphans nothing by itself (it only removes). `create` may have left a container
+// with a name but no id — the one to go looking for with `docker ps -a`. `start`
+// and `ready` leave a container the pool still holds an id for.
+//
+// The sentinel rather than the returned error, because the returned error wraps
+// whatever the Docker client said — `create container: …` — and the thing an
+// operator needs is which cause killed the request, not which call it landed in.
+// That is what `phase` is for.
+func (p *Pool) logAbortedClaim(slotID, phase string, err error) {
+	if !errors.Is(err, context.Canceled) {
+		return
+	}
+	p.log.Error("claim: caller canceled the request", "slot", slotID, "phase", phase,
+		"ctxError", context.Canceled)
 }
 
 // Release unbinds a session and stops the container.
@@ -655,36 +721,43 @@ func (p *Pool) Remove(ctx context.Context, slotID string) error {
 // Idempotent and safe to call on a timer. Two things need filling, and counting
 // only one of them is how the pool used to shrink without limit:
 //
-//   - a **vacant** slot: one that was released or lost its container. It is already
-//     in the map, so counting slots found the pool full and did nothing. This is the
-//     bug `StateVacant` exists for.
+//   - a slot that already exists and holds **no container** — released, or emptied
+//     by a failure, in any of the states `refillable` allows. It is already in the
+//     map, so counting slots found the pool full and did nothing. This is the bug
+//     `StateVacant` was the first half of a fix for; `refillable` is the whole of
+//     it, because the writers that hollow a slot outnumber the one that marks it
+//     vacant.
 //   - a slot that does not exist yet.
 //
-// A slot whose create is **in flight** is `StateStarting` with no container id, and
-// is deliberately not in either group: refilling it would let a second tick create a
-// duplicate container for a slot already being filled. The vacant slots are moved to
-// `StateStarting` under this same lock, which is what claims them.
+// A slot whose create is **in flight** has an empty container id too, and is
+// deliberately not in either group: refilling it would let a second tick create a
+// duplicate container for a slot already being filled. `refillable` is where those
+// windows are excluded. The slots it admits are moved to `StateStarting` under this
+// same lock, which is what claims them.
 func (p *Pool) EnsurePool(ctx context.Context) error {
 	p.mu.Lock()
 
-	var vacant []*Slot
+	// `refillable`, not `StateVacant`: an idle or dead slot with no container is
+	// exactly as empty as a vacant one, and counting it as filled is what left
+	// slot-2 hollow on a host that reported `size: 2` for an hour and a half.
+	var refilling []*Slot
 	filled := 0
 	for _, slot := range p.slots {
-		if slot.State == StateVacant {
-			vacant = append(vacant, slot)
+		if slot.refillable() {
+			refilling = append(refilling, slot)
 			continue
 		}
 		filled++
 	}
-	for _, slot := range vacant {
+	for _, slot := range refilling {
 		slot.State = StateStarting
 	}
 
-	// The vacant slots are about to be filled by this same call, so they count
+	// These slots are about to be filled by this same call, so they count
 	// towards capacity. Leaving them out of `filled` and then adding `need` on top
 	// would give the pool one slot more than it asked for — a pool of 2 with one
 	// empty slot would create *two* containers and report three idle runners.
-	need := p.cfg.PoolSize - filled - len(vacant)
+	need := p.cfg.PoolSize - filled - len(refilling)
 	if need < 0 {
 		need = 0
 	}
@@ -727,15 +800,15 @@ func (p *Pool) EnsurePool(ctx context.Context) error {
 	p.bootstrapped = true
 	p.mu.Unlock()
 
-	if len(vacant) == 0 && need <= 0 {
+	if len(refilling) == 0 && need <= 0 {
 		return nil
 	}
 
 	var firstErr error
-	// A vacant slot is refilled **in place**, keeping its id, because `api` may still
-	// hold that id in `sessions.runner_id`. Removing it on failure — as a newly
+	// An existing slot is refilled **in place**, keeping its id, because `api` may
+	// still hold that id in `sessions.runner_id`. Removing it on failure — as a newly
 	// created slot is — would strand that row against a slot that no longer exists.
-	for _, slot := range append(vacant, created...) {
+	for _, slot := range append(refilling, created...) {
 		if err := p.create(ctx, slot); err != nil {
 			p.mu.Lock()
 			if newlyRegistered[slot.ID] {
@@ -1145,14 +1218,52 @@ func (p *Pool) start(ctx context.Context, slot *Slot, sessionGUID string, sessio
 		return err
 	}
 
-	created, err := p.docker.CreateContainer(ctx, req, containerName(slotID, containerID))
+	// Kept in a variable because the create can fail *after* the Engine finished
+	// it, and then the name is the only handle left on the container — see the
+	// failure path below. Both halves are orchestrator-generated, so there is no
+	// request field anywhere in it.
+	name := containerName(slotID, containerID)
+
+	created, err := p.docker.CreateContainer(ctx, req, name)
 	if err != nil {
+		// **A failed create is not proof that nothing was created.**
+		//
+		// The Engine completes the write and then fails to tell the client — most
+		// often because the client stopped listening first. The api's 15 s budget
+		// was shorter than the ~57 s of work it asked for, so its abort landed
+		// inside the create and the container survived it:
+		//
+		//     msout-slot-1-c-slot-1-…  Created  ← Docker finished; nobody told us
+		//
+		// The id never arrived, so there is nothing to remove it *by*. The name is
+		// deterministic and ours, and `dockerapi.RemoveContainer` already answers a
+		// 404 with nil, which makes this safe to attempt unconditionally: on the
+		// ordinary "the Engine rejected it" failure nothing is there to remove and
+		// the call is a no-op.
+		//
+		// Detached from `ctx` for the reason `destroy` is: the caller is the reason
+		// this path is running at all, so its context is the one thing that
+		// certainly cannot carry the cleanup. The Docker client still bounds the
+		// call (`dockerapi.New(cfg.DockerSocket, cfg.RequestTimeout)`), so a daemon
+		// that is genuinely unreachable fails rather than hangs.
+		p.logAbortedClaim(slotID, "create", err)
+		if rmErr := p.docker.RemoveContainer(context.WithoutCancel(ctx), name); rmErr != nil {
+			p.log.Warn("create failed: cannot remove the container it may have left",
+				"slot", slotID, "container", name, "error", rmErr)
+		}
 		return fmt.Errorf("create container: %w", err)
 	}
 	if err := p.docker.StartContainer(ctx, created.ID); err != nil {
 		// A created-but-unstarted container left behind would be adopted by the
 		// next reconcile as a live runner that never ran.
-		_ = p.docker.RemoveContainer(ctx, created.ID)
+		//
+		// Detached for the same reason as above. Every path that reaches this
+		// cleanup has just learned that the request is over, and running the
+		// removal on `ctx` meant an abort turned the cleanup into a no-op — which
+		// is how `msout-slot-2-c-slot-2-…` answered `/healthz` for 1 h 47 m with
+		// nothing in this process owning it and a session's vault bind mounted.
+		p.logAbortedClaim(slotID, "start", err)
+		_ = p.docker.RemoveContainer(context.WithoutCancel(ctx), created.ID)
 		return fmt.Errorf("start container: %w", err)
 	}
 
@@ -1175,8 +1286,15 @@ func (p *Pool) start(ctx context.Context, slot *Slot, sessionGUID string, sessio
 	//
 	// The container is removed on failure so it is not adopted by the next
 	// reconcile as a live runner that never became ready.
+	//
+	// Detached, like the two cleanups above: the abort that lands here has *already*
+	// happened — `waitReady` returns `ctx.Err()` — so this is the one place a
+	// claim was observed leaving a **running** Chromium behind. The cleanup sharing
+	// the dead context meant the survivor had an owner-shaped hole where its
+	// cleanup should have been.
 	if err := p.waitReady(ctx, created.ID); err != nil {
-		_ = p.docker.RemoveContainer(ctx, created.ID)
+		p.logAbortedClaim(slotID, "ready", err)
+		_ = p.docker.RemoveContainer(context.WithoutCancel(ctx), created.ID)
 		return err
 	}
 
@@ -1279,6 +1397,7 @@ func (p *Pool) destroy(ctx context.Context, containerID string) error {
 	if containerID == "" {
 		return nil
 	}
+	ctx = context.WithoutCancel(ctx)
 	// 10s grace for Chromium to exit cleanly before the daemon escalates to
 	// SIGKILL. A runner that cannot be killed would otherwise wedge release and
 	// leave the slot draining for the life of the process.

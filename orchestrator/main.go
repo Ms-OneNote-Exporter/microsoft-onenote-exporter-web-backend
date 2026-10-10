@@ -39,6 +39,14 @@ func main() {
 	}
 }
 
+// writeTimeout is how long a response write may take, and it is the last of the
+// three deadlines in the agreement `main_test.go` describes.
+//
+// Named here rather than inlined at the one use so a test can assert the property it
+// belongs to — that it clears the work `/claim` asks for — without restating the
+// number and pinning a copy.
+const writeTimeout = 90 * time.Second
+
 func run(args []string) error {
 	// The container healthcheck mode.
 	//
@@ -165,8 +173,34 @@ func run(args []string) error {
 		// hold a goroutine indefinitely.
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		// 90s, and it has to be here rather than at 60s.
+		//
+		// `WriteTimeout` covers the whole `/claim` handler, and the handler's own
+		// worst case is:
+		//
+		//     10s   stop grace before SIGKILL   (pool.destroy, hardcoded)
+		//     ~2s   create + start              (pool.start)
+		//     45s   waiting for the healthcheck (RunnerReadyTimeout, not env-settable)
+		//     ---
+		//     ~57s  plus the response write
+		//
+		// At 60s that budget did not cover the work, so net/http closed the
+		// connection from the *server* side on a claim that was still legitimately
+		// running — the api read that as `unreachable` and compensated by dropping
+		// its SQLite row. A deadline below the work produces the same failure
+		// whichever end imposes it.
+		//
+		// The three deadlines are one agreement and they are ordered:
+		// 57s of work < the api's 75s client budget (orchestrator-client.ts,
+		// CONTAINER_VERB_TIMEOUT_MS) < this 90s. So a legitimate claim always
+		// completes before either side gives up, and a wedged one is still bounded.
+		//
+		// A named constant rather than a literal, because
+		// `TestWriteTimeoutExceedsTheClaimWorstCase` has to read it to assert the
+		// property against the claim's arithmetic — and a test that copies the
+		// number instead of reading it pins nothing.
+		WriteTimeout: writeTimeout,
+		IdleTimeout:  120 * time.Second,
 		// Do not advertise the Go version. The orchestrator is not published,
 		// but a version string in an error page is free reconnaissance.
 		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),

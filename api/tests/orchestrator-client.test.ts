@@ -1,8 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  CONTAINER_VERB_TIMEOUT_MS,
   OrchestratorClient,
   computeSignature,
   signingString,
+  type OrchestratorResult,
 } from "../src/orchestrator-client.js";
 
 /**
@@ -297,5 +299,171 @@ describe("OrchestratorClient", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.value.boundSessions).toBeUndefined();
+  });
+});
+
+/**
+ * The per-verb budget.
+ *
+ * ## Why this file's worth an assertion per verb
+ *
+ * The client budget was 15 s for everything. The orchestrator's own worst case for a
+ * claim is ~57 s — a 10 s SIGTERM grace to stop the idle runner, ~2 s to create and
+ * start its replacement, and a 45 s healthcheck wait — so the api was aborting
+ * legitimate claims *mid-provision*. Far-side, the in-flight Docker calls died with
+ * the request context, and two containers were left running and invisible to the
+ * pool. The user saw a failed login, twice.
+ *
+ * The number is a property of the far side's work, so it cannot be re-derived here.
+ * What this pins is that each verb carries the budget the constant names, and that
+ * the four container verbs are not silently sharing the read budget again.
+ */
+describe("per-verb timeout budgets", () => {
+  const GUID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+
+  const client = (fetchImpl: typeof fetch) =>
+    new OrchestratorClient({
+      baseUrl: "http://orchestrator:9100",
+      secret: SECRET,
+      fetchImpl,
+      now: () => new Date(Number(TS)),
+    });
+
+  /**
+   * A fetch that never resolves on its own and settles only when its signal aborts —
+   * the shape of a call against an orchestrator that has stopped answering, which is
+   * the only situation the timeout exists for.
+   *
+   * `seen.at` records the fake-clock time of the abort, because *when* the client
+   * gives up is the assertion; a promise that merely settles eventually would not
+   * distinguish a 15 s budget from a 75 s one.
+   */
+  function wedgedFetch(seen: { at: number | null }): typeof fetch {
+    return ((_url: string, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          seen.at = Date.now();
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      })) as typeof fetch;
+  }
+
+  /**
+   * Drives one wedged call across the fake clock and reports how much of it elapsed
+   * before the client aborted.
+   *
+   * `observeMs` is deliberately *less* than the budget for the "does not give up"
+   * assertion: a client that had already given up would show `settled: true` here,
+   * which is the regression being pinned rather than a timing fluke.
+   */
+  async function wedge(
+    invoke: (c: OrchestratorClient) => Promise<OrchestratorResult<unknown>>,
+    observeMs: number,
+  ): Promise<{
+    abortedAfterMs: number | null;
+    settled: boolean;
+    result?: OrchestratorResult<unknown>;
+  }> {
+    const seen = { at: null as number | null };
+    const c = client(wedgedFetch(seen));
+    const startedAt = Date.now();
+    const pending = invoke(c);
+    let settled = false;
+    void pending.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(observeMs);
+
+    const abortedAfterMs = seen.at === null ? null : seen.at - startedAt;
+    if (!settled) return { abortedAfterMs, settled: false };
+    return { abortedAfterMs, settled: true, result: await pending };
+  }
+
+  /** The four verbs whose server-side work is a container lifecycle. */
+  const containerVerbs: Array<[string, (c: OrchestratorClient) => Promise<OrchestratorResult<unknown>>]> =
+    [
+      ["claim", (c) => c.claim(GUID, new Date(Number(TS)))],
+      ["release", (c) => c.release("slot-1")],
+      ["recycle", (c) => c.recycle("slot-1", "runner ttl")],
+      ["remove", (c) => c.remove("slot-1")],
+    ];
+
+  /** The reads, which stay on the 15 s default. */
+  const readVerbs: Array<[string, (c: OrchestratorClient) => Promise<OrchestratorResult<unknown>>]> =
+    [
+      ["stat", (c) => c.stat(ARTIFACT_ID)],
+      ["stats", (c) => c.stats()],
+    ];
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  for (const [verb, invoke] of containerVerbs) {
+    it(`does not abort ${verb} at the old 15s mark`, async () => {
+      vi.useFakeTimers();
+
+      const { settled, abortedAfterMs } = await wedge(invoke, 15_000);
+
+      expect(abortedAfterMs).toBeNull();
+      expect(settled).toBe(false);
+    });
+
+    it(`aborts ${verb} inside the container-verb budget, and says so`, async () => {
+      vi.useFakeTimers();
+
+      const { settled, abortedAfterMs, result } = await wedge(
+        invoke,
+        CONTAINER_VERB_TIMEOUT_MS + 1,
+      );
+
+      expect(settled).toBe(true);
+      expect(abortedAfterMs).toBe(CONTAINER_VERB_TIMEOUT_MS);
+      // The cause carries the number, because this is the string an operator reads to
+      // tell a slow orchestrator from a budget that was too small for the work. It
+      // was the field `sweep.ts` dropped on the floor, and losing it is why the 15 s
+      // was unrecoverable from the api's own log.
+      expect(result).toEqual({
+        ok: false,
+        error: { kind: "unreachable", cause: `timed out after ${CONTAINER_VERB_TIMEOUT_MS}ms` },
+      });
+    });
+  }
+
+  for (const [verb, invoke] of readVerbs) {
+    it(`still gives up on ${verb} at 15s`, async () => {
+      vi.useFakeTimers();
+
+      const { settled, abortedAfterMs, result } = await wedge(invoke, 15_001);
+
+      expect(settled).toBe(true);
+      expect(abortedAfterMs).toBe(15_000);
+      // Reads are fast, and a long budget on a wedged read would hold a request open
+      // for nothing — so widening the container verbs must not have widened these.
+      expect(result).toEqual({
+        ok: false,
+        error: { kind: "unreachable", cause: "timed out after 15000ms" },
+      });
+    });
+  }
+
+  // The derivation itself, asserted rather than trusted: the budget has to clear the
+  // orchestrator's worst case (10 s stop grace + ~2 s create/start + 45 s ready) or
+  // the api is back to aborting legitimate claims mid-provision. The number in the
+  // orchestrator's own comment is 57 s; this pins it from the api's side.
+  it("clears the orchestrator's worst case for a claim", () => {
+    const stopGraceMs = 10_000;
+    const createAndStartMs = 2_000;
+    const runnerReadyTimeoutMs = 45_000;
+
+    expect(CONTAINER_VERB_TIMEOUT_MS).toBeGreaterThan(
+      stopGraceMs + createAndStartMs + runnerReadyTimeoutMs,
+    );
   });
 });

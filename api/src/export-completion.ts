@@ -90,24 +90,23 @@ export const UNPUBLISHABLE =
  * NOTEBOOK_NOT_FOUND is the message a user sees when the notebook had no
  * sections at all — so nothing could be walked.
  *
- * `exporter.js` sets `notebookNotFound` for a *genuinely empty* notebook and for
- * one that never loaded, because both produce the same empty list and the
- * package's judgement is that *"neither is a success"*. So this message must not
- * claim the notebook is missing: for a user with an empty notebook that would be
- * a lie, and it would be a lie about work that was never attempted.
+ * `exporter.js` sets `notebookNotFound` for *three distinct causes* that all
+ * produce the same symptom: an empty section list. This code cannot tell them
+ * apart, so each cause must be presented as a possibility, not a diagnosis.
  *
- * It is also **not** UNPUBLISHABLE's text. That one says *"Nothing was lost —
- * there is no need to export again"*, which the frontend then follows with
- * *"Nothing was completed, so you can start again."* The two contradict each
- * other on the same line, which is why the classification has its own message.
+ * 1. The notebook is genuinely empty (no sections ever created).
+ * 2. The notebook never loaded into OneNote (stale credential, network hiccup).
+ * 3. The credential is no longer accepted by OneNote (account re-verification).
+ *
+ * It is critical this message remains hedged: claiming any one cause would be
+ * a lie about the others. It must never be "improved" into a definite statement.
  *
  * Written to read as the middle of a sentence: the frontend wraps it as
  * `The export failed: ${error} Nothing was completed, so you can start again.`
  * So it states no outcome of its own and offers no advice of its own.
  */
 export const NOTEBOOK_NOT_FOUND =
-  "this notebook has no sections, so there was nothing to walk — " +
-  "it may be empty, or OneNote may not have loaded it.";
+  "this notebook has no sections — it may be empty, may not have loaded into OneNote, or the account may need re-verification.";
 
 /**
  * LOST_ALL_PAGES is the message when the walk ran but wrote no pages at all.

@@ -56,6 +56,41 @@ export function computeSignature(
     .digest("base64url");
 }
 
+/**
+ * The budget for the four verbs whose server-side work is a container lifecycle.
+ *
+ * `claim`, `release`, `recycle` and `remove` are the **slowest** calls in this
+ * surface, not the fast ones, and 15 s — the shared default — was shorter than the
+ * work they ask for. A claim on a *warm* pool first destroys the idle runner, and
+ * that is `StopContainer` with a 10-second SIGTERM grace, before anything is
+ * created. Ten seconds of stop grace alone put the claim at the edge of the old
+ * budget, and two of three attempts breached it: the api aborted, the
+ * orchestrator's in-flight Docker calls died with the request context, and the api
+ * compensated by releasing its SQLite row. The user saw a failed login, twice.
+ *
+ * The derivation, which is the whole reason this is a named constant:
+ *
+ *     10s   stop grace before SIGKILL          (orchestrator pool.destroy)
+ *     ~2s   create + start                     (orchestrator start)
+ *     45s   waiting for the healthcheck        (RunnerReadyTimeout, not env-settable)
+ *     ---
+ *     ~57s  the orchestrator's own worst case
+ *
+ * So the client budget must sit **above** it, and **below** the server's
+ * `WriteTimeout`, which must sit above it too: 75 s here, 90 s there. A legitimate
+ * claim then always completes before the client gives up, and a wedged one is still
+ * bounded on both sides.
+ *
+ * This constant is the one place that agreement is written down. The api cannot
+ * read the orchestrator's configuration, and the orchestrator cannot read the
+ * api's — which is exactly how a 15 s budget came to sit below a 60 s server that
+ * sat below 57 s of real work.
+ *
+ * `stat`, `stats`, `healthz` and `finalize` keep the 15 s default: they are all
+ * fast, and a long budget on a wedged read would hold a request open for nothing.
+ */
+export const CONTAINER_VERB_TIMEOUT_MS = 75_000;
+
 /** The five verbs. The orchestrator's entire surface; see PLAN-v3 §2.1. */
 export type OrchestratorVerb =
   | "claim"
@@ -257,7 +292,16 @@ export interface OrchestratorClientOptions {
   secret: string;
   /** Replay window, for the error the orchestrator would return. */
   replayWindowSeconds?: number;
-  /** Per-request timeout. */
+  /**
+   * Per-request timeout, for the **read** verbs (`stat`, `stats`, `healthz`,
+   * `finalize`).
+   *
+   * It deliberately does not apply to `claim`, `release`, `recycle` or `remove`:
+   * those are sized by `CONTAINER_VERB_TIMEOUT_MS` from the orchestrator's own
+   * worst case, which is a property of that server's work rather than of this
+   * deployment. An option that could lower it below the work being asked for is the
+   * bug this budget was introduced to fix, so those four ignore it.
+   */
   timeoutMs?: number;
   /** Injected for tests. */
   fetchImpl?: typeof fetch;
@@ -294,11 +338,18 @@ export class OrchestratorClient implements OrchestratorApi {
    *
    * The body is serialised once and the same bytes are signed and sent, so a
    * mismatch between what was signed and what was transmitted is not possible.
+   *
+   * `timeoutMs` defaults to the configured read budget; the four container verbs pass
+   * `CONTAINER_VERB_TIMEOUT_MS` explicitly. It is a parameter rather than a second
+   * client because the budget is a property of the *verb* — of the work the
+   * orchestrator is asked to do — and a second client would be a second place for
+   * that agreement to be written down wrongly.
    */
   async #call<T>(
     method: "GET" | "POST",
     path: string,
     body?: unknown,
+    timeoutMs: number = this.#timeoutMs,
   ): Promise<OrchestratorResult<T>> {
     const payload =
       body === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(body), "utf8");
@@ -306,7 +357,7 @@ export class OrchestratorClient implements OrchestratorApi {
     const sig = computeSignature(this.#secret, ts, method, path, payload);
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.#timeoutMs);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
       // Built conditionally rather than with `body: undefined`, because
@@ -371,7 +422,7 @@ export class OrchestratorClient implements OrchestratorApi {
       if (controller.signal.aborted) {
         return {
           ok: false,
-          error: { kind: "unreachable", cause: `timed out after ${this.#timeoutMs}ms` },
+          error: { kind: "unreachable", cause: `timed out after ${timeoutMs}ms` },
         };
       }
       return {
@@ -389,26 +440,37 @@ export class OrchestratorClient implements OrchestratorApi {
     sessionExpiresAt: Date,
     slotId?: string,
   ): Promise<OrchestratorResult<ClaimResponse>> {
-    return this.#call<ClaimResponse>("POST", "/claim", {
-      sessionGuid,
-      sessionExpiresAtMs: sessionExpiresAt.getTime(),
-      ...(slotId === undefined ? {} : { slotId }),
-    } satisfies ClaimBody);
+    return this.#call<ClaimResponse>(
+      "POST",
+      "/claim",
+      {
+        sessionGuid,
+        sessionExpiresAtMs: sessionExpiresAt.getTime(),
+        ...(slotId === undefined ? {} : { slotId }),
+      } satisfies ClaimBody,
+      CONTAINER_VERB_TIMEOUT_MS,
+    );
   }
 
   /** release returns a slot and destroys its container. */
   release(slotId: string): Promise<OrchestratorResult<{ released: boolean }>> {
-    return this.#call("POST", "/release", { slotId });
+    return this.#call("POST", "/release", { slotId }, CONTAINER_VERB_TIMEOUT_MS);
   }
 
-  /** recycle replaces a container that outlived the runner TTL. */
+  /**
+   * recycle replaces a container that outlived the runner TTL.
+   *
+   * Same budget as the other container verbs and for the same reason: a timed-out
+   * `/remove` is exactly what makes erase retain its row, so the verb that destroys
+   * a container is the last one that should be cut short.
+   */
   recycle(slotId: string, reason: string): Promise<OrchestratorResult<{ recycled: boolean }>> {
-    return this.#call("POST", "/recycle", { slotId, reason });
+    return this.#call("POST", "/recycle", { slotId, reason }, CONTAINER_VERB_TIMEOUT_MS);
   }
 
   /** remove tears a slot down entirely. */
   remove(slotId: string): Promise<OrchestratorResult<{ removed: boolean }>> {
-    return this.#call("POST", "/remove", { slotId });
+    return this.#call("POST", "/remove", { slotId }, CONTAINER_VERB_TIMEOUT_MS);
   }
 
   /**

@@ -1,6 +1,8 @@
 package pool
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/Ms-OneNote-Exporter/microsoft-onenote-exporter-web-backend/orchestrator/internal/config"
 	"github.com/Ms-OneNote-Exporter/microsoft-onenote-exporter-web-backend/orchestrator/internal/dockerapi"
+	"github.com/Ms-OneNote-Exporter/microsoft-onenote-exporter-web-backend/orchestrator/internal/labels"
 )
 
 // testConfig returns a config rooted in a temp dir, with the pool sized for the
@@ -1504,4 +1507,416 @@ func slotIDsContain(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// An aborted claim must not leave a container behind.
+//
+// ## Why this file exists
+//
+// The api's client budget was 15 s and the orchestrator's own worst case for a claim
+// is ~57 s — a 10 s SIGTERM grace to stop the idle runner, ~2 s to create and start
+// its replacement, and a 45 s healthcheck wait. So the api was aborting legitimate
+// claims *mid-provision*, and the abort killed the orchestrator's own Docker calls
+// with the request context. Two containers survived on the host, neither visible to
+// the pool:
+//
+//	msout-slot-2-c-slot-2-…  Up (healthy)   ← create+start succeeded, the abort
+//	                                          landed in waitReady, and the cleanup
+//	                                          remove ran on the dead context too
+//	msout-slot-1-c-slot-1-…  Created        ← Docker finished the create after the
+//	                                          client had stopped listening
+//
+// One of them was a running Chromium holding the session's vault bind, owned by
+// nothing. The user saw a failed login, twice.
+//
+// Nothing here caught it because the fake daemon **ignored its context parameter
+// entirely** — so the one question every cleanup path exists to answer, *did this
+// call reach the daemon or did it die with the request?*, could not be asked. The
+// fake now records the context state of every call, and can block a create until
+// the caller goes away.
+
+// abortedClaim runs a claim that the caller abandons at `hook` — "create" or
+// "inspect" — and returns once the claim has finished failing.
+//
+// The claim runs on its own goroutine because the cancellation is the point: the
+// armed operation blocks *inside* the daemon until `cancel` fires, which is the only
+// way to put the abort at a chosen point in the work rather than at an arbitrary
+// one.
+func abortedClaim(t *testing.T, p *Pool, d *fakeDaemon, hook, slotID, sessionGUID string) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	switch hook {
+	case "create":
+		d.cancelCreates()
+	case "inspect":
+		d.cancelInspects()
+	default:
+		t.Fatalf("unknown cancellation hook %q", hook)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// The pool is asked for a specific slot so the test can predict the name the
+		// orphan would carry, which is the only handle left for it.
+		_, _ = p.Claim(ctx, sessionGUID, time.Now().Add(time.Hour), slotID)
+	}()
+
+	// Wait until the armed call is genuinely blocked, then hang up. A sleep here
+	// would race: cancelling before the claim reaches it would abort the *stop* of
+	// the idle container instead, which is a different bug with a different fix.
+	d.waitForBlockedCreate(t)
+	cancel()
+	<-done
+}
+
+// The container a create produced despite the abort must be gone.
+//
+// Asserted on the daemon's own inventory rather than on the pool's, because the pool
+// had no id for it: the create never answered. That is precisely why it was
+// invisible, and an assertion against `p.Slots()` would pass on a host that still
+// had a runner holding a vault bind.
+func TestAnAbortedClaimDoesNotLeaveItsContainerBehind(t *testing.T) {
+	cfg := testConfig(t, 1)
+	d := newFakeDaemon()
+	p := New(cfg, d, discardLog())
+
+	if err := p.EnsurePool(t.Context()); err != nil {
+		t.Fatalf("EnsurePool: %v", err)
+	}
+	slotID := slotIDsOf(p)[0]
+	sessionGUID := "7a74af5c-7c5d-49a8-baa6-ab7df19d10fc"
+
+	abortedClaim(t, p, d, "create", slotID, sessionGUID)
+
+	if got := d.count(); got != 0 {
+		t.Errorf("%d container(s) survived an aborted claim: %v. The Engine completed "+
+			"the create after the client hung up, and nothing removed it — an "+
+			"unowned runner holding a session's vault bind", got, d.names())
+	}
+}
+
+// The cleanup must have run with a **live** context. This is the assertion the
+// others rest on: a remove that was attempted and failed leaves the same orphan as
+// one that was never attempted, and only the recorded context tells them apart.
+//
+// Driven through the **readiness wait** rather than the create, because that is
+// where the worse orphan came from. By then create and start have both succeeded, so
+// the container is `Up (healthy)` — a running Chromium holding the session's vault
+// bind, which is a different and larger thing to leave behind than a `Created` one
+// that never ran.
+func TestAnAbortedClaimCleansUpWithALiveContext(t *testing.T) {
+	cfg := testConfig(t, 1)
+	d := newFakeDaemon()
+	p := New(cfg, d, discardLog())
+
+	if err := p.EnsurePool(t.Context()); err != nil {
+		t.Fatalf("EnsurePool: %v", err)
+	}
+	slotID := slotIDsOf(p)[0]
+
+	abortedClaim(t, p, d, "inspect", slotID, "7a74af5c-7c5d-49a8-baa6-ab7df19d10fc")
+
+	if got := d.count(); got != 0 {
+		t.Errorf("%d container(s) survived an abort in the readiness wait: %v. "+
+			"Create and start had both succeeded, so that was a running runner — "+
+			"msout-slot-2-… was Up (healthy) on the host for exactly this reason",
+			got, d.names())
+	}
+	removes := d.callsFor("remove")
+	if len(removes) == 0 {
+		t.Fatal("no remove was attempted after the abort; the container is still " +
+			"there and the pool never even tried to clean it up")
+	}
+	for _, call := range removes {
+		if !call.live {
+			t.Error("a remove ran on an already-cancelled context: it failed before " +
+				"reaching the daemon, so the container it was cleaning up survived")
+		}
+	}
+}
+
+// The aborted claim must leave no runner labelled for the session.
+//
+// A different assertion from the container count, because they fail differently: a
+// survivor can be renamed, relabelled or adopted by a later reconcile and still be
+// the same leaked Chromium. The label is the durable record of what a container was
+// for, so "nothing on the host claims to be this session's runner" is the property
+// that survives the next restart.
+func TestAnAbortedClaimLeavesNoRunnerLabelledForTheSession(t *testing.T) {
+	cfg := testConfig(t, 1)
+	d := newFakeDaemon()
+	p := New(cfg, d, discardLog())
+
+	if err := p.EnsurePool(t.Context()); err != nil {
+		t.Fatalf("EnsurePool: %v", err)
+	}
+	slotID := slotIDsOf(p)[0]
+	sessionGUID := "7a74af5c-7c5d-49a8-baa6-ab7df19d10fc"
+
+	abortedClaim(t, p, d, "create", slotID, sessionGUID)
+
+	// What the reconciler reads on the next boot, and what an operator reads with
+	// `docker ps --filter label=msout.role=runner`.
+	ids, err := d.ListContainersByLabel(t.Context(), labels.RunnerFilter)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	for _, id := range ids {
+		if got := d.labels(id)[labels.SessionGUID]; got == sessionGUID {
+			t.Errorf("container %s is still labelled for session %s; a runner nothing "+
+				"owns, holding that session's vault bind", id, sessionGUID)
+		}
+	}
+}
+
+// The slot the aborted claim emptied must be refilled.
+//
+// This is the third root cause of the same incident, and it is the one that made it
+// *permanent*: `fail()` drops the slot to `idle` with `ContainerID = ""`, and
+// `EnsurePool` counted every non-`vacant` slot as filled — so the comment saying
+// "EnsurePool refills it on the next tick" was false. Proven on the host where
+// slot-2 had been containerless through eight minutes of 10-second ticks with
+// nothing created. The pool reported `size: 2` and could serve nobody.
+func TestTheSlotAnAbortedClaimEmptiedIsRefilled(t *testing.T) {
+	cfg := testConfig(t, 1)
+	d := newFakeDaemon()
+	p := New(cfg, d, discardLog())
+
+	if err := p.EnsurePool(t.Context()); err != nil {
+		t.Fatalf("EnsurePool: %v", err)
+	}
+	slotID := slotIDsOf(p)[0]
+	sessionGUID := "7a74af5c-7c5d-49a8-baa6-ab7df19d10fc"
+
+	abortedClaim(t, p, d, "create", slotID, sessionGUID)
+
+	// The pool is now one short and says so, which is what makes this distinguishable
+	// from a full pool: a claim that arrives before the refill must still work.
+	if idle := p.Stats().ByState[string(StateIdle)]; idle != 1 {
+		t.Fatalf("idle = %d after an aborted claim, want 1: %+v. The slot is left "+
+			"holding a session it failed to serve, and nothing ever clears it", idle,
+			p.Stats().ByState)
+	}
+
+	if err := p.EnsurePool(t.Context()); err != nil {
+		t.Fatalf("refill after an aborted claim: %v", err)
+	}
+	if idle := p.Stats().ByState[string(StateIdle)]; idle != 1 {
+		t.Errorf("idle = %d after the refill, want 1: %+v. A containerless non-vacant "+
+			"slot is counted as filled and never refilled — the pool shrinks by one "+
+			"per aborted claim and stays there", idle, p.Stats().ByState)
+	}
+	if got := d.count(); got != 1 {
+		t.Errorf("%d container(s) after the refill, want 1: %v", got, d.names())
+	}
+
+	// And the refilled slot is usable, which is the property that was actually lost.
+	if _, err := p.Claim(t.Context(), sessionGUID, time.Now().Add(time.Hour), slotID); err != nil {
+		t.Errorf("claim on the refilled slot failed: %v; the pool reports itself full "+
+			"while serving nobody, which is what a user sees as 'every session is busy'",
+			err)
+	}
+}
+
+// A `destroy` that runs on a dead context leaves the slot at `StateDead` holding the
+// id of a container nothing owns — so the leak is also reachable from the verbs that
+// carry a request context and are not claims. One place, four callers, one fix.
+//
+// The context is cancelled *before* the verb is called rather than during, because
+// `destroy` is the first thing `Release` reaches and there is no earlier window to
+// interrupt: the point is that a caller who is already gone still gets the container
+// removed.
+func TestReleaseRemovesItsContainerEvenWhenTheCallerIsGone(t *testing.T) {
+	cfg := testConfig(t, 1)
+	d := newFakeDaemon()
+	p := New(cfg, d, discardLog())
+
+	if err := p.EnsurePool(t.Context()); err != nil {
+		t.Fatalf("EnsurePool: %v", err)
+	}
+	claimed, err := p.Claim(t.Context(), "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+		time.Now().Add(time.Hour), "")
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := p.Release(ctx, claimed.ID); err != nil {
+		t.Fatalf("release with a dead context: %v", err)
+	}
+
+	if got := d.count(); got != 0 {
+		t.Errorf("%d container(s) survived a release whose caller had gone: %v. The "+
+			"stop and the remove both ran on the cancelled context, so neither reached "+
+			"the daemon", got, d.names())
+	}
+	for _, call := range d.callsFor("remove") {
+		if !call.live {
+			t.Error("a remove ran on an already-cancelled context")
+		}
+	}
+}
+
+// A create that fails is not proof that nothing was created.
+//
+// Docker completes the write and then fails to tell the client, and the one thing
+// the client still holds is the name — deterministic, generated here, no request
+// field in it. This is `msout-slot-1-c-slot-1-…` in `Created`: a container with a
+// name, no id anyone recorded, and no verb that can reach it.
+func TestACreateThatFailedAfterTheEngineFinishedIsRemovedByName(t *testing.T) {
+	cfg := testConfig(t, 1)
+	d := newFakeDaemon()
+	p := New(cfg, d, discardLog())
+
+	if err := p.EnsurePool(t.Context()); err != nil {
+		t.Fatalf("EnsurePool: %v", err)
+	}
+	slotID := slotIDsOf(p)[0]
+
+	// The create blocks until the caller gives up and then leaves the container in
+	// place, which is what the Engine does.
+	//
+	// `abortedClaim` and not a hand-rolled goroutine, because it returns only once
+	// the claim has finished failing. Without that wait the assertion below reads
+	// the daemon while the provision goroutine is still running, and the container
+	// it is about to remove has not been stored yet — so the test passes on the
+	// code that leaks, on every run, and proves nothing about the cleanup.
+	abortedClaim(t, p, d, "create", slotID, "7a74af5c-7c5d-49a8-baa6-ab7df19d10fc")
+
+	if got := d.count(); got != 0 {
+		t.Errorf("%d container(s) survived a create that failed after the Engine "+
+			"finished it: %v. Its name is deterministic and known — removing by it is "+
+			"the only way to reach a container whose id never arrived", got, d.names())
+	}
+}
+
+// A slot that lost its container must come back, whatever state it was left in.
+//
+// Five writers produce that state — `fail()` (idle), `Release`/`Recycle`/`Remove` on
+// a failed destroy (dead), and `Reconcile`'s dead and expired branches (dead) — and
+// before this, only the released one refilled. Each is seeded here directly rather
+// than through its verb, because the verb that produces it is a failure path and the
+// property under test is that *every* one of them refills, not that one of them does.
+func TestEveryContainerlessSlotIsRefilledWhateverStateItWasLeftIn(t *testing.T) {
+	for _, state := range []State{StateVacant, StateIdle, StateDead} {
+		t.Run(string(state), func(t *testing.T) {
+			cfg := testConfig(t, 1)
+			d := newFakeDaemon()
+			p := New(cfg, d, discardLog())
+
+			// A slot with no container, left in `state`, on a pool that already
+			// believes it is full.
+			p.slots["slot-1"] = &Slot{ID: "slot-1", State: state}
+
+			if err := p.EnsurePool(t.Context()); err != nil {
+				t.Fatalf("EnsurePool: %v", err)
+			}
+
+			s := p.slots["slot-1"]
+			if s.ContainerID == "" {
+				t.Errorf("slot left %q with no container after EnsurePool; the pool "+
+					"counts it as filled and will never create for it again", state)
+			}
+			// Idle, so it is claimable. A refilled slot that came back `dead` or
+			// `vacant` would be counted as capacity and refused at claim time.
+			if s.State != StateIdle {
+				t.Errorf("refilled slot state = %q, want idle", s.State)
+			}
+		})
+	}
+}
+
+// A create that is in flight must not be duplicated.
+//
+// The exclusion is what keeps the broader predicate safe: `ContainerID == ""` is also
+// true for a slot whose create has not finished yet, and a second create for the
+// same slot produces two runners carrying the same `msout.slot.id`. The reconciler
+// adopts by that label, so it cannot tell which of them is the slot's — and the
+// loser is unowned memory holding somebody's vault bind.
+//
+// `bound` is the case the derivation missed: `Claim` binds the slot *before* it
+// creates, so a claim on a containerless slot spends its whole create+ready window
+// in a state with an empty container id. `draining` is the same window seen from a
+// recycle, which destroys first and creates second.
+func TestACreateInFlightIsNotDuplicated(t *testing.T) {
+	for _, state := range []State{StateStarting, StateBound, StateDraining} {
+		t.Run(string(state), func(t *testing.T) {
+			cfg := testConfig(t, 1)
+			d := newFakeDaemon()
+			p := New(cfg, d, discardLog())
+
+			p.slots["slot-1"] = &Slot{ID: "slot-1", State: state}
+
+			if err := p.EnsurePool(t.Context()); err != nil {
+				t.Fatalf("EnsurePool: %v", err)
+			}
+
+			if got := d.count(); got != 0 {
+				t.Errorf("EnsurePool created %d container(s) for a %q slot that "+
+					"already has one on the way: %v. Two runners carry the same "+
+					"msout.slot.id, and the reconciler adopts by that label", got,
+					state, d.names())
+			}
+		})
+	}
+}
+
+// The cancellation is worth an error line naming the phase.
+//
+// The api's `runner claim failed` says only `unreachable`, and the orchestrator's own
+// log said nothing at all — the `context canceled` error was carried out to an http
+// handler writing a response nobody was reading. So a grep for `context canceled`
+// came back empty on a run that had in fact been cancelled, which is the worst
+// possible outcome for a diagnostic: it disproves the hypothesis being checked.
+func TestAnAbortedClaimIsLoggedWithItsPhase(t *testing.T) {
+	cfg := testConfig(t, 1)
+	d := newFakeDaemon()
+
+	var lines bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&lines, nil))
+	p := New(cfg, d, log)
+
+	if err := p.EnsurePool(t.Context()); err != nil {
+		t.Fatalf("EnsurePool: %v", err)
+	}
+	slotID := slotIDsOf(p)[0]
+
+	abortedClaim(t, p, d, "create", slotID, "7a74af5c-7c5d-49a8-baa6-ab7df19d10fc")
+
+	records := strings.Split(strings.TrimSpace(lines.String()), "\n")
+	var found bool
+	for _, line := range records {
+		if !strings.Contains(line, "caller canceled the request") {
+			continue
+		}
+		found = true
+		var entry struct {
+			Level string `json:"level"`
+			Phase string `json:"phase"`
+			Error string `json:"ctxError"`
+		}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("log line is not JSON: %v (%s)", err, line)
+		}
+		if entry.Level != "ERROR" {
+			t.Errorf("level = %q, want ERROR: an aborted claim is not a warning, it "+
+				"is the one that leaves something behind", entry.Level)
+		}
+		// The phase is the part that makes the line actionable: `destroy` orphans
+		// nothing, `create` may have left a container to go looking for.
+		if entry.Phase != "create" {
+			t.Errorf("phase = %q, want create; the abort landed in the create leg and "+
+				"the operator needs to know to check for a stray container", entry.Phase)
+		}
+		if entry.Error != context.Canceled.Error() {
+			t.Errorf("ctxError = %q, want %q — the cause is the whole point of the line",
+				entry.Error, context.Canceled.Error())
+		}
+	}
+	if !found {
+		t.Errorf("an aborted claim logged nothing naming the cancellation:\n%s", lines.String())
+	}
 }

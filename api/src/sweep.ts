@@ -504,6 +504,20 @@ export class PoolBinder {
         session: session.guid,
         runner: claimed.id,
         error: result.error.kind as string,
+        // The cause is the whole diagnosis and it used to be dropped here.
+        //
+        // `error: "unreachable"` was all this line carried while the client was
+        // aborting at 15 s, so a claim that had died mid-provision and a claim that
+        // had never found the orchestrator were the same log line. The number that
+        // explained the whole incident — a budget shorter than the work — was
+        // inside the `cause` and was thrown away.
+        //
+        // Only `unreachable` carries one. Built conditionally rather than with an
+        // explicit `undefined`, because `exactOptionalPropertyTypes` treats
+        // `cause: undefined` as a different value from an absent key, and "the
+        // failure named no cause" must stay distinguishable from "the cause is
+        // empty".
+        ...(result.error.kind === "unreachable" ? { cause: result.error.cause } : {}),
       });
       return { ok: false, reason: "orchestrator-unreachable" };
     }

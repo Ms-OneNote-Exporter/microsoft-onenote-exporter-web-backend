@@ -18,10 +18,119 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Ms-OneNote-Exporter/microsoft-onenote-exporter-web-backend/orchestrator/internal/config"
 )
+
+// The three deadlines are one agreement, and this is the Go half of it.
+//
+// `WriteTimeout` covers the whole `/claim` handler, so it has to be longer than the
+// work that handler does. That work is:
+//
+//	10s   stop grace before SIGKILL   (pool.destroy, hardcoded)
+//	~2s   create + start              (pool.start)
+//	45s   waiting for the healthcheck (RunnerReadyTimeout, not env-settable)
+//
+// and the deadline must clear **that** *and* the api's own budget, because the api
+// gives up at 75s and a server that gives up first turns a legitimate claim into a
+// transport failure the api cannot tell from a dead orchestrator. At 60s the
+// ordering was inverted — the api was still waiting when net/http closed the
+// connection — and the claim's in-flight Docker calls died with the request
+// context, leaving two containers on the host that nothing owned.
+//
+// So the assertion is the ordering:
+//
+//	stop grace + create/start + ready timeout  <  api's budget  <  WriteTimeout
+//
+// The numbers are not asserted. They come from three places this package does not
+// own and any of which can move: the stop grace is a literal in `pool.destroy`, the
+// ready timeout is a compile-time constant in `config`, and the client budget is the
+// api's. A test that copies them pins nothing, so the api's is **parsed** from its
+// source and the ready timeout is **read** through the same loader the process uses.
+func TestWriteTimeoutExceedsTheClaimWorstCase(t *testing.T) {
+	// Read through the same loader the process uses, so the ready timeout is the one
+	// that ships rather than a copy of it in a test. It is deliberately not
+	// env-settable (config.go), so this cannot drift away from the default.
+	//
+	// Only the one variable the loader insists on is answered; the rest read as
+	// absent, which is what an operator who set nothing gets.
+	cfg, err := config.Load(
+		func(key string) string {
+			if key == "ORCH_HMAC_SECRET_FILE" {
+				return "/dev/null"
+			}
+			return ""
+		},
+		func(string) ([]byte, error) { return make([]byte, 64), nil },
+	)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+
+	const (
+		stopGrace      = 10 * time.Second
+		createAndStart = 2 * time.Second
+	)
+	worstCase := stopGrace + createAndStart + cfg.RunnerReadyTimeout
+
+	clientBudget := time.Duration(apiContainerVerbBudget(t)) * time.Millisecond
+
+	if clientBudget <= worstCase {
+		t.Fatalf("the api's container-verb budget is %v and the claim's worst case is "+
+			"%v (stop grace %v + create/start %v + ready timeout %v). The client gives "+
+			"up before the work is finished, which is the bug: it aborts a legitimate "+
+			"claim mid-provision and the cleanup dies with the request context",
+			clientBudget, worstCase, stopGrace, createAndStart, cfg.RunnerReadyTimeout)
+	}
+	if clientBudget >= writeTimeout {
+		t.Fatalf("WriteTimeout is %v and the api's container-verb budget is %v. The "+
+			"server must outlast the client: if it does not, net/http closes a claim "+
+			"the api is still waiting for and the api records it as `unreachable`",
+			writeTimeout, clientBudget)
+	}
+}
+
+// apiContainerVerbBudget reads CONTAINER_VERB_TIMEOUT_MS from the api's source.
+//
+// Parsed rather than restated, and that is the point of the helper: the two sides
+// share no code and cannot import each other, so this agreement is held only by the
+// number being right in both places. A copy here would go stale silently — which is
+// exactly how a 15s client budget came to sit below a 60s server.
+//
+// Skipped rather than failed when the api's tree is not alongside this one, because
+// a Go test that cannot see the other component has no opinion about it. The api's
+// own suite asserts its half (`per-verb timeout budgets`).
+func apiContainerVerbBudget(t *testing.T) int {
+	t.Helper()
+
+	src, err := os.ReadFile("../api/src/orchestrator-client.ts")
+	if err != nil {
+		t.Skipf("api source not readable from here: %v", err)
+	}
+	const decl = "CONTAINER_VERB_TIMEOUT_MS"
+	i := strings.Index(string(src), decl+" = ")
+	if i < 0 {
+		t.Fatalf("api/src/orchestrator-client.ts no longer declares %s. It is the one "+
+			"place the two components' deadline agreement is written down: the api "+
+			"cannot read the orchestrator's configuration and the orchestrator cannot "+
+			"read the api's, so a constant that stops existing is an unagreed budget",
+			decl)
+	}
+	rest := string(src)[i+len(decl)+3:]
+	end := strings.IndexAny(rest, ";,\n")
+	if end < 0 {
+		t.Fatalf("could not parse %s from api/src/orchestrator-client.ts", decl)
+	}
+	n, err := strconv.Atoi(strings.ReplaceAll(strings.TrimSpace(rest[:end]), "_", ""))
+	if err != nil {
+		t.Fatalf("could not parse %s as a number of milliseconds: %v", decl, err)
+	}
+	return n
+}
 
 // Every flag referenced by docker-compose.yml must be one this binary handles.
 //

@@ -573,6 +573,56 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
       return reply.code(501).send({ error: "credential forwarding not wired yet" });
     }
 
+    // §4.7: "No retry on the credential route — replaying a password defeats the
+    // point of a single submission." This is the one route that had no `auth_state`
+    // guard, and that is what let a second submit 40 seconds after the first
+    // restart the login on a session that was already signed in. Observed live:
+    // `auth.json` rotated to `auth.json.old` at 19:10:15 and rewritten at 19:10:53,
+    // so for 38 seconds the session had **no credentials at all** — while a
+    // concurrent `POST /api/session/notebooks` answered `no_auth`.
+    //
+    // **The position below the 501 is load-bearing; it is not a style choice.**
+    // Moved above that block and exactly three tests go red:
+    //
+    //   routes.test.ts > "answers 501 when no runner adapter is wired"
+    //   routes.test.ts > "accepts a json content type"
+    //   mock.test.ts    > "still 501s without a runner"
+    //
+    // All three seed a `valid` session into an unwired server, so a guard ahead of
+    // the 501 answers 409 where the contract says 501 and the unwired state stops
+    // being tested at all — the tests still pass if someone deletes them, because
+    // nothing else in the suite pins that status.
+    //
+    // Two neighbours of theirs do **not** go red, and the asymmetry is worth
+    // knowing before anyone "fixes" them: "never echoes the credential in its
+    // response" and the query-string framing test both assert an *absence*, which a
+    // 409 satisfies as well as a 501 does. Only status-bearing assertions notice.
+    //
+    // `reason`, not `cause`: `ApiError` in the frontend reads `error`, `reason` and
+    // `retryable` out of this body and discards everything else, so a `cause` would
+    // be invisible to the client — the same mistake `runnerFailure` made once.
+    //
+    // `retryable: false` on both, deliberately. A real login takes ~38 seconds and
+    // `TTL.loginInProgress` is 15 minutes, so telling a user to retry is advice
+    // that cannot help for 94x the duration of the thing it advises. That is
+    // §0.9.11's `no_auth` over-confidence again: a `retryable` flag nobody can act
+    // on is worse than no flag at all.
+    if (session.auth_state === "valid" || session.auth_state === "authenticating") {
+      // The cap is created and destroyed here for the same reason it is on the
+      // refusal path above: §4.7 lists "capStream created even on the refusal path"
+      // as load-bearing, and a caller who understates `Content-Length` and sends
+      // 4 MB must still be cut off at 4 KB when the answer is a 409.
+      capStream(request.body as Readable, MAX_CREDENTIAL_BYTES).destroy();
+      const alreadySignedIn = session.auth_state === "valid";
+      return reply.code(409).send({
+        error: alreadySignedIn
+          ? "this session is already signed in"
+          : "a sign-in is already in progress for this session",
+        retryable: false,
+        reason: alreadySignedIn ? "already-authenticated" : "login-in-progress",
+      });
+    }
+
     // The credential reaches the runner through the orchestrator's claim, so a
     // session needs a container before it can accept one. Binding is lazy —
     // here, at login — rather than at session creation, so a session that is

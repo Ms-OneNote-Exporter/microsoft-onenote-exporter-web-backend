@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance } from "fastify";
 
 import { buildServer, type ServerDeps } from "../src/server.js";
@@ -9,6 +9,9 @@ import { SseHub } from "../src/sse.js";
 import { RateLimiter } from "../src/rate-limit.js";
 import { CSRF_COOKIE, SESSION_COOKIE } from "../src/csrf.js";
 import { deriveCsrfToken, generateCsrfKey, hashSecret } from "../src/session.js";
+import type { RunnerAdapter } from "../src/runner-adapter.js";
+import { PoolBinder, syncPool } from "../src/sweep.js";
+import { FakeOrchestrator } from "../mock/fake-orchestrator.js";
 import { derive, parseSetCookies } from "./helpers.js";
 
 /**
@@ -608,6 +611,148 @@ describe("POST /api/session/credential", () => {
     expect(response.statusCode).toBe(501);
     expect(response.json().error).toBe("credential forwarding not wired yet");
   });
+});
+
+// ---- the §4.7 auth_state guard -------------------------------------------
+
+describe("POST /api/session/credential refuses a replay", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * A harness with a runner wired, which `deps()` above deliberately does not have.
+   *
+   * That is the whole reason these tests cannot live in the block above: a status
+   * assertion against a 501 proves nothing about whether the password was forwarded
+   * before the refusal, because the route never got that far. So the refusals below
+   * are asserted on **the three things that must not have happened** —
+   * `claimForLogin`, `submitCredential` and `sse.emit` — and each is a spy on the
+   * real object rather than on a stand-in, so "not called" is a fact about the
+   * production code path and not about a fake that was never wired in.
+   *
+   * The pool binder is the real `PoolBinder` over a `FakeOrchestrator`, so the
+   * claim path is the production one and the spy counts its calls rather than
+   * standing in for it.
+   */
+  function harness() {
+    const orchestrator = new FakeOrchestrator({ size: 1 });
+    syncPool(db, orchestrator.slotIds());
+    const binder = new PoolBinder({ db, orchestrator, sse, now: () => Date.now() });
+
+    const submitCredential = vi.fn().mockResolvedValue(undefined);
+    const runner: RunnerAdapter = {
+      submitCredential,
+      listNotebooks: vi.fn().mockResolvedValue(undefined),
+      startExport: vi.fn().mockResolvedValue(undefined),
+      publishArtifact: vi.fn().mockResolvedValue(undefined),
+      abortExport: vi.fn().mockResolvedValue(undefined),
+    };
+
+    return {
+      claimForLogin: vi.spyOn(binder, "claimForLogin"),
+      submitCredential,
+      emit: vi.spyOn(sse, "emit"),
+      deps: { db, sse, limiter, orchestrator, runner, poolBinder: binder } as ServerDeps,
+    };
+  }
+
+  async function post(deps: ServerDeps) {
+    const app = buildServer(config, deps);
+    await app.ready();
+    try {
+      return await app.inject({
+        method: "POST",
+        url: "/api/session/credential",
+        headers: {
+          "content-type": "text/plain",
+          "x-microsoft-account": ACCOUNT,
+          cookie: cookieHeader(),
+          origin: ALLOWED,
+          "x-csrf-token": derive(csrfKey, GUID),
+        },
+        payload: "hunter2",
+      });
+    } finally {
+      await app.close();
+    }
+  }
+
+  it("409s a submit against a session that is already signed in", async () => {
+    // The live bug: a second submit 40 seconds after the first restarted the login
+    // on a session that was already signed in, and `auth.json` was rotated away for
+    // 38 seconds while a concurrent `POST /api/session/notebooks` answered `no_auth`.
+    //
+    // Seeded with **no** runner, so a route that skipped the guard would claim a
+    // container and hand the password over — which is what makes the `claimForLogin`
+    // assertion below reachable rather than trivially true.
+    seed(GUID, { runnerId: null, auth: "valid" });
+    const h = harness();
+    const response = await post(h.deps);
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({
+      error: expect.any(String),
+      retryable: false,
+      reason: "already-authenticated",
+    });
+    // `reason` and not `cause`: `ApiError` reads error/reason/retryable out of this
+    // body and drops everything else, so a `cause` here would be invisible to the
+    // client — asserted rather than left to a comment.
+    expect(response.json()).not.toHaveProperty("cause");
+
+    // Not one of the three things that would mean the password moved.
+    expect(h.claimForLogin).not.toHaveBeenCalled();
+    expect(h.submitCredential).not.toHaveBeenCalled();
+    expect(h.emit).not.toHaveBeenCalled();
+
+    // And no row was written. The refusal is a read.
+    expect(db.getSession(GUID)?.auth_state).toBe("valid");
+    expect(db.getSession(GUID)?.runner_id).toBeNull();
+  });
+
+  it("409s a submit while a sign-in is already in progress, and says retrying cannot help", async () => {
+    // A real login takes ~38 seconds; `TTL.loginInProgress` is 15 minutes. So
+    // `retryable: false` is not a formality — "try again" would be advice that
+    // provably cannot work for 94x the duration of the thing it advises.
+    seed(GUID, { runnerId: null, auth: "authenticating" });
+    const h = harness();
+    const response = await post(h.deps);
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({
+      retryable: false,
+      reason: "login-in-progress",
+    });
+    expect(h.claimForLogin).not.toHaveBeenCalled();
+    expect(h.submitCredential).not.toHaveBeenCalled();
+    expect(h.emit).not.toHaveBeenCalled();
+    expect(db.getSession(GUID)?.auth_state).toBe("authenticating");
+  });
+
+  // The other half of the guard, and the one a reviewer should read first: a guard
+  // that refuses a second submit must not refuse the *first* one. `expired`,
+  // `failed` and `none` are all states a real user reaches by signing in again, and
+  // all three have to reach the runner.
+  it.each(["expired", "failed", "none"] as const)(
+    "still forwards a credential when the session is %s",
+    async (auth) => {
+      seed(GUID, { runnerId: null, auth });
+      const h = harness();
+      const response = await post(h.deps);
+
+      expect(response.statusCode).toBe(202);
+      // All three, and the order they have to happen in: the container is claimed,
+      // the login is announced, and only then is the credential handed over.
+      expect(h.claimForLogin).toHaveBeenCalledTimes(1);
+      expect(h.emit).toHaveBeenCalledWith(GUID, "login-started", {});
+      expect(h.submitCredential).toHaveBeenCalledTimes(1);
+      expect(h.submitCredential.mock.calls[0]![0]).toMatchObject({
+        sessionId: GUID,
+        account: ACCOUNT,
+      });
+    },
+  );
 });
 
 // ---- POST /api/session/notebooks -----------------------------------------

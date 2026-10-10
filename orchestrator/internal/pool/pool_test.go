@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1262,6 +1263,143 @@ func slotIDsPool(t *testing.T, n int) *Pool {
 		p.slots[id] = &Slot{ID: id, State: StateIdle}
 	}
 	return p
+}
+
+// ---- boundSessions ----------------------------------------------------------
+//
+// /stats could report `byState: {bound: 2}` and nothing could say *which two*.
+// A slot held for a session that no longer existed was then indistinguishable from
+// a slot doing work, and only `api` can tell them apart — it owns the session
+// rows. These tests pin what it is told, because the observed outage was two such
+// slots on a pool of two: `EnsurePool` counts slots, the pool looked full, and
+// every login 409'd until someone restarted the orchestrator.
+
+const (
+	boundGUIDOne = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+	boundGUIDTwo = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+)
+
+// The map is what makes "which slots are held, and by whom" answerable at all.
+func TestStatsReportsBoundSessions(t *testing.T) {
+	p := slotIDsPool(t, 3)
+	p.slots["slot-1"].State = StateBound
+	p.slots["slot-1"].SessionGUID = boundGUIDOne
+	p.slots["slot-2"].State = StateBound
+	p.slots["slot-2"].SessionGUID = boundGUIDTwo
+
+	bound := p.Stats().BoundSessions
+
+	if len(bound) != 2 {
+		t.Fatalf("BoundSessions = %v, want the two bound slots", bound)
+	}
+	if bound["slot-1"] != boundGUIDOne || bound["slot-2"] != boundGUIDTwo {
+		t.Errorf("BoundSessions = %v, want slot-1→%s and slot-2→%s",
+			bound, boundGUIDOne, boundGUIDTwo)
+	}
+	// slot-3 stayed idle. Listing it with a blank GUID would name a session that
+	// does not exist, and the api's sweep reads that as an orphan to release.
+	if _, listed := bound["slot-3"]; listed {
+		t.Errorf("an idle slot is reported as bound: %v", bound)
+	}
+}
+
+// Slot ids as keys, never container ids — the same §2.1 boundary `SlotIDs` draws.
+// A container id here would be an identity the api cannot verify, and the reason
+// `SlotIDs` was added in the first place.
+func TestStatsBoundSessionsAreKeyedBySlotNotContainer(t *testing.T) {
+	p := slotIDsPool(t, 2)
+	p.slots["slot-1"].State = StateBound
+	p.slots["slot-1"].SessionGUID = boundGUIDOne
+	p.slots["slot-1"].ContainerID = "329029f8aabb"
+
+	bound := p.Stats().BoundSessions
+
+	// Asserted first, because a loop over an empty map proves nothing at all.
+	if len(bound) != 1 {
+		t.Fatalf("BoundSessions = %v, want the one bound slot", bound)
+	}
+	for slotID, guid := range bound {
+		for _, s := range p.Slots() {
+			if slotID == s.ContainerID {
+				t.Fatalf("key %q is a container id, not a slot id", slotID)
+			}
+		}
+		if guid == "" {
+			t.Fatalf("slot %q is mapped to no session", slotID)
+		}
+	}
+	if bound["slot-1"] != boundGUIDOne {
+		t.Errorf("slot-1 → %q, want %s", bound["slot-1"], boundGUIDOne)
+	}
+}
+
+// `omitempty` is what keeps an idle pool's response byte-identical to the one it
+// sent before this field existed. Asserted on the marshalled body, because the
+// struct tag is not the behaviour — the JSON is.
+func TestStatsOmitsBoundSessionsWhenNothingIsBound(t *testing.T) {
+	p := slotIDsPool(t, 2)
+
+	stats := p.Stats()
+	if len(stats.BoundSessions) != 0 {
+		t.Fatalf("BoundSessions = %v on an idle pool, want empty", stats.BoundSessions)
+	}
+	body, err := json.Marshal(stats)
+	if err != nil {
+		t.Fatalf("marshal stats: %v", err)
+	}
+	if strings.Contains(string(body), "boundSessions") {
+		t.Errorf("an idle pool's /stats body carries the new key: %s", body)
+	}
+}
+
+// A slot in `StateBound` whose GUID was lost — mid-recycle, or adopted from
+// labels that never carried one — must contribute nothing. Reporting it with an
+// empty value would tell `api` a slot is held by *no session*, which is precisely
+// the orphan shape the api's sweep releases; the runner is in use.
+func TestStatsIgnoresABoundSlotWithNoRecordedGUID(t *testing.T) {
+	p := slotIDsPool(t, 2)
+	p.slots["slot-1"].State = StateBound // bound, SessionGUID left empty
+	p.slots["slot-2"].State = StateBound
+	p.slots["slot-2"].SessionGUID = boundGUIDTwo
+
+	bound := p.Stats().BoundSessions
+
+	if len(bound) != 1 {
+		t.Fatalf("BoundSessions = %v, want only the slot that records a GUID", bound)
+	}
+	if _, listed := bound["slot-1"]; listed {
+		t.Errorf("a bound slot with no GUID is reported: %v", bound)
+	}
+}
+
+// The both-ends pin. The api's sweep reads this field by name, across an HTTP
+// boundary, from a component that shares no code with this one — so the name is
+// a contract and neither side may keep a private copy of it. See
+// `api/tests/orchestrator-client.test.ts`, which parses this exact literal.
+func TestStatsMarshalsBoundSessionsUnderItsJSONKey(t *testing.T) {
+	p := slotIDsPool(t, 2)
+	p.slots["slot-1"].State = StateBound
+	p.slots["slot-1"].SessionGUID = boundGUIDOne
+
+	body, err := json.Marshal(p.Stats())
+	if err != nil {
+		t.Fatalf("marshal stats: %v", err)
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("unmarshal stats: %v", err)
+	}
+	raw, present := decoded["boundSessions"]
+	if !present {
+		t.Fatalf("/stats body has no boundSessions key: %s", body)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("boundSessions is not a slot→guid string map: %v", err)
+	}
+	if got["slot-1"] != boundGUIDOne {
+		t.Errorf("boundSessions = %v, want slot-1→%s", got, boundGUIDOne)
+	}
 }
 
 // ---- Claim with a named slot -------------------------------------------------

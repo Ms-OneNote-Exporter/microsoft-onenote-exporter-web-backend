@@ -35,8 +35,26 @@ function orchestratorStub(opts: {
   stats?: "ok" | "unreachable" | "cannot-fill" | "filled";
   /** Slot ids the orchestrator names. Defaults to what `stats` implies. */
   slotIds?: string[];
+  /**
+   * What `/stats` reports as `boundSessions`: slot id → session guid.
+   *
+   * Left out of the response when undefined, which is how this stub also stands in
+   * for an orchestrator predating the field — the rolling-deploy case the sweeper's
+   * `stats.ok` / `slotIds` guards exist for, and the one test (c) pins.
+   */
+  boundSessions?: Record<string, string>;
+  /**
+   * Runs inside the `/release` handler, before the answer is returned.
+   *
+   * Exists so a test can produce the window the pre-act liveness re-check exists
+   * for — a session appearing *between* the `/stats` snapshot and the `/release` —
+   * which is otherwise a race no deterministic test can reach.
+   */
+  onRelease?: (slotId: string) => void;
 }) {
   const calls: string[] = [];
+  /** The slot ids `/release` was actually asked to release, in order. */
+  const released: string[] = [];
   let lastClaimBody: string | undefined;
   const client = new OrchestratorClient({
     baseUrl: "http://127.0.0.1:1",
@@ -80,6 +98,12 @@ function orchestratorStub(opts: {
         throw new Error("ECONNREFUSED");
       }
       if (path === "/release") {
+        // Recorded from the **body**, not just the path: "a release happened" and
+        // "a release happened for *that* slot" are different assertions, and the
+        // sweeper's job is to name the right slot.
+        const body = JSON.parse(decodeBody(init?.body) ?? "{}") as { slotId?: string };
+        if (typeof body.slotId === "string") released.push(body.slotId);
+        if (typeof body.slotId === "string") opts.onRelease?.(body.slotId);
         if (opts.release === "ok") return new Response(JSON.stringify({ released: true }));
         if (opts.release === "conflict") return new Response("{}", { status: 409 });
         throw new Error("ECONNREFUSED");
@@ -100,6 +124,10 @@ function orchestratorStub(opts: {
               byState: { idle: slotIds.length },
               runnerTtlSeconds: 300,
               slotIds,
+              // Conditional spread, matching `omitempty` on the Go side: an
+              // orchestrator with nothing bound does not send the key at all, and a
+              // stub that always sent `{}` would make that case unreachable.
+              ...(opts.boundSessions === undefined ? {} : { boundSessions: opts.boundSessions }),
             }),
           );
         }
@@ -122,7 +150,7 @@ function orchestratorStub(opts: {
       return new Response("{}", { status: 404 });
     }) as typeof fetch,
   });
-  return { client, calls };
+  return { client, calls, released };
 }
 
 /** `fetch` bodies arrive as bytes here, so a stub has to decode before parsing. */
@@ -987,6 +1015,263 @@ describe("sweep authFailedReleased", () => {
     // Release was attempted but failed; slot remains bound.
     expect(report.authFailedReleased).toBe(0);
     expect(db.getSession(GUID)?.runner_id).toBe("slot-1");
+  });
+});
+
+/**
+ * The orphan-bound slot: a slot held for a session that no longer exists.
+ *
+ * Two records describe the same fact and neither had a reconciler. The
+ * orchestrator's is a slot in `StateBound`; this process's is a `runners` row with
+ * a `session_guid`. Either can outlive the session it names, and the observed
+ * outage was both at once — two slots on a pool of two held by sessions whose rows
+ * were gone, so `EnsurePool` counted a full pool and every login 409'd until someone
+ * restarted the orchestrator.
+ *
+ * The one rule underneath both halves: **live = a `sessions` row exists and its
+ * state is not `erasing`.** Every test below is a version of that rule, including
+ * the ones that must not fire.
+ */
+describe("sweep reclaims orphan bindings", () => {
+  /** A session that does not exist. The shape both halves detect it from. */
+  const DEAD = "99999999-9999-4999-8999-999999999999";
+  /** A second one, so a test can have two orphans and an ordering. */
+  const DEAD_TWO = "88888888-8888-4888-8888-888888888888";
+
+  /**
+   * A `runners` row in the leaked shape: `active`, still bound, to a session
+   * nothing names any more.
+   *
+   * Written rather than claimed, because claiming would need a live session — and
+   * the whole subject here is a binding whose session is gone.
+   */
+  function bindRow(slotId: string, guid: string): void {
+    db.registerRunner(slotId, "ctr", "active");
+    db.run(`UPDATE runners SET session_guid = ? WHERE id = ?`, guid, slotId);
+  }
+
+  function rowFor(slotId: string): { status: string; session_guid: string | null } | undefined {
+    return db.get<{ status: string; session_guid: string | null }>(
+      `SELECT status, session_guid FROM runners WHERE id = ?`,
+      slotId,
+    );
+  }
+
+  const runWith = async (opts: Parameters<typeof orchestratorStub>[0]) => {
+    const { client, released } = orchestratorStub(opts);
+    const report = await sweep(options(client), new PoolBinder(options(client)));
+    return { report, released };
+  };
+
+  // (a) The detection B case: the orchestrator says so, and the api agrees.
+  it("releases a slot the orchestrator holds for a session that no longer exists", async () => {
+    bindRow("slot-1", DEAD);
+
+    const { report, released } = await runWith({
+      stats: "filled",
+      slotIds: ["slot-1"],
+      boundSessions: { "slot-1": DEAD },
+      release: "ok",
+    });
+
+    // The slot is named, not merely counted: `byState: {bound: 1}` could not tell
+    // this sweeper what to release, which is why the field exists.
+    expect(released).toEqual(["slot-1"]);
+    expect(report.orphanSlotsReleased).toBe(1);
+    // And the row is unbound, not just the container gone. A row left `active` and
+    // bound is the api half of the same leak, still asserting a session that no
+    // longer exists.
+    expect(rowFor("slot-1")).toEqual({ status: "idle", session_guid: null });
+  });
+
+  // (b) The other side of the predicate. Without this the branch would be
+  // indistinguishable from "release every slot /stats mentions".
+  it("leaves a slot alone when the session it is bound to still exists", async () => {
+    seedSession(GUID, { state: "authenticated", auth: "valid", runner_id: "slot-1" });
+    bindRow("slot-1", GUID);
+
+    const { report, released } = await runWith({
+      stats: "filled",
+      slotIds: ["slot-1"],
+      boundSessions: { "slot-1": GUID },
+      release: "ok",
+    });
+
+    expect(released).toEqual([]);
+    expect(report.orphanSlotsReleased).toBe(0);
+    expect(rowFor("slot-1")?.session_guid).toBe(GUID);
+  });
+
+  // (c) The rolling-deploy case, and the reason the field is optional.
+  //
+  // **Paired with the same fixture carrying the field**, because a test that only
+  // asserts "nothing happened" passes just as happily against code that does
+  // nothing at all — which is the standing rule this repo keeps re-learning. The two
+  // halves differ by exactly the field, so deleting the branch turns the first half
+  // red and firing it unconditionally turns the second.
+  it("does nothing for an orchestrator that reports no boundSessions at all", async () => {
+    bindRow("slot-1", DEAD);
+
+    const withField = await runWith({
+      stats: "filled",
+      slotIds: ["slot-1"],
+      boundSessions: { "slot-1": DEAD },
+      release: "ok",
+    });
+    const withoutField = await runWith({ stats: "filled", slotIds: ["slot-1"], release: "ok" });
+
+    expect(withField.released).toEqual(["slot-1"]);
+    // Same pool, same dead session, one field missing: no release, no counter.
+    expect(withoutField.released).toEqual([]);
+    expect(withoutField.report.orphanSlotsReleased).toBe(0);
+  });
+
+  // (d) A 409 from `/release` means the slot is already gone or unbound — which is
+  // the state this branch wanted. The same tolerance `releaseForIdle` ships, and
+  // leaving the row behind because of it would strand a slot that was, in fact,
+  // free.
+  it("treats a conflict from /release as the slot already being gone", async () => {
+    bindRow("slot-1", DEAD);
+
+    const { report, released } = await runWith({
+      stats: "filled",
+      slotIds: ["slot-1"],
+      boundSessions: { "slot-1": DEAD },
+      release: "conflict",
+    });
+
+    expect(released).toEqual(["slot-1"]);
+    expect(report.orphanSlotsReleased).toBe(1);
+    expect(rowFor("slot-1")).toEqual({ status: "idle", session_guid: null });
+  });
+
+  // (e) Detection A: the erase-shaped leak. `runErase` removes the container, so
+  // the orchestrator no longer names the slot at all — and `slotIds: []` is how that
+  // looks from here. The row is the whole of the damage and it is this process's
+  // own, so no `/release` is called: there is nothing to release, and asking about
+  // a slot the orchestrator has already answered for would be inventing traffic.
+  it("clears a row an erase left bound to a session it deleted", async () => {
+    bindRow("slot-1", DEAD);
+
+    const { report, released } = await runWith({
+      stats: "filled",
+      slotIds: [],
+      release: "ok", // working, so a release attempted would be visible in `released`
+    });
+
+    expect(released).toEqual([]);
+    expect(report.phantomRowsCleaned).toBe(1);
+    // `releaseRunner`, not `removeRunner`: the row is freed, not deleted, so the
+    // slot stays known to `claimRunner` and can be re-learned by `syncPool`.
+    expect(rowFor("slot-1")).toEqual({ status: "idle", session_guid: null });
+  });
+
+  // (f) `erasing` is the erase machine's row and the machine's `/remove` owns the
+  // slot. A sweeper taking it would be two owners of one teardown, and the second
+  // one wins only because it started later.
+  it("leaves a session mid-erase its slot, in both views", async () => {
+    seedSession(GUID, { state: "erasing", runner_id: "slot-1" });
+    bindRow("slot-1", GUID);
+
+    const { report, released } = await runWith({
+      stats: "filled",
+      slotIds: ["slot-1"],
+      boundSessions: { "slot-1": GUID },
+      release: "ok",
+    });
+
+    expect(released).toEqual([]);
+    expect(report.orphanSlotsReleased).toBe(0);
+    expect(report.phantomRowsCleaned).toBe(0);
+    expect(rowFor("slot-1")?.session_guid).toBe(GUID);
+  });
+
+  // (g) The §0.9.10 harness shape, exactly: the orchestrator adopted a slot at cold
+  // start that was bound to a session this process has no row for at all. There is
+  // no `runners` row to inspect, which is exactly why the lockout was invisible —
+  // `syncPool` runs earlier in this same sweep under the same guard, so the row
+  // exists by the time the release is asked for.
+  it("heals an adopted orphan the api never had a row for", async () => {
+    expect(db.all(`SELECT id FROM runners`)).toEqual([]);
+
+    const { report, released } = await runWith({
+      stats: "filled",
+      slotIds: ["slot-1"],
+      boundSessions: { "slot-1": DEAD },
+      release: "ok",
+    });
+
+    expect(released).toEqual(["slot-1"]);
+    expect(report.orphanSlotsReleased).toBe(1);
+    // Idle, not deleted: the slot is a pool position that still exists, and the row
+    // is how the next `claimRunner` finds it.
+    expect(rowFor("slot-1")).toEqual({ status: "idle", session_guid: null });
+  });
+
+  // (h) The blip shape. "Cannot ask" is not "there is nothing", and this process
+  // has no way to tell a dead session from an unreachable orchestrator — so while
+  // `/stats` fails it acts on nothing at all. Both halves, because both are
+  // reachable from the same missing guard.
+  it("acts on nothing at all when the orchestrator cannot be asked", async () => {
+    bindRow("slot-1", DEAD);
+
+    const { report, released } = await runWith({ stats: "unreachable", release: "ok" });
+
+    expect(released).toEqual([]);
+    expect(report.orphanSlotsReleased).toBe(0);
+    expect(report.phantomRowsCleaned).toBe(0);
+    // Untouched, not merely unreleased: a row rewritten under an orchestrator this
+    // process cannot see is a live session's bookkeeping changed by a network fault.
+    expect(rowFor("slot-1")?.session_guid).toBe(DEAD);
+  });
+
+  // The other half of detection A's gate. `stats: "ok"` is the stub that reports a
+  // reachable orchestrator that names **no slots** — the pre-`slotIds` one, during a
+  // rolling deploy.
+  //
+  // Cleaning a row then would mean deciding a slot is not somebody's runner without
+  // knowing which slots the orchestrator has. It is the same "we do not know" as the
+  // unreachable case, reached by a different road, and the guard is the same line.
+  it("cleans no row when the orchestrator names no slots", async () => {
+    bindRow("slot-1", DEAD);
+
+    const { report, released } = await runWith({ stats: "ok", release: "ok" });
+
+    expect(released).toEqual([]);
+    expect(report.phantomRowsCleaned).toBe(0);
+    expect(rowFor("slot-1")?.session_guid).toBe(DEAD);
+  });
+
+  // The re-check immediately before the act, which is the difference between
+  // "not live when we looked" and "not live now".
+  //
+  // Both slots are orphans at detection time. The first `/release` is a round trip,
+  // and during it a session reappears owning the second slot's GUID. Acting on the
+  // earlier reading would dispossess a live session — which is the one failure this
+  // whole function must never have, and the reason it re-reads rather than trusting
+  // a value computed before an `await`.
+  it("re-checks liveness immediately before releasing a slot", async () => {
+    bindRow("slot-1", DEAD);
+    bindRow("slot-2", DEAD_TWO);
+
+    const { client, released } = orchestratorStub({
+      stats: "filled",
+      slotIds: ["slot-1", "slot-2"],
+      // Insertion order is preserved for string keys, so slot-1 is handled first and
+      // its release is the round trip that opens the window for slot-2.
+      boundSessions: { "slot-1": DEAD, "slot-2": DEAD_TWO },
+      release: "ok",
+      onRelease: (slotId) => {
+        if (slotId !== "slot-1") return;
+        seedSession(DEAD_TWO, { state: "authenticated", auth: "valid", runner_id: "slot-2" });
+      },
+    });
+
+    const report = await sweep(options(client), new PoolBinder(options(client)));
+
+    expect(released).toEqual(["slot-1"]);
+    expect(report.orphanSlotsReleased).toBe(1);
+    expect(rowFor("slot-2")?.session_guid).toBe(DEAD_TWO);
   });
 });
 

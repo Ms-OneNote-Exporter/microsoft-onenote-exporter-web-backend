@@ -10,6 +10,8 @@ import {
 import { Db } from "../src/db.js";
 import { SseHub } from "../src/sse.js";
 import { generateCsrfKey, hashSecret } from "../src/session.js";
+import { PoolBinder, sweep } from "../src/sweep.js";
+import { FakeOrchestrator } from "../mock/fake-orchestrator.js";
 
 /**
  * PLAN-v2 §11 extended by PLAN-v3 T7. The properties under test are that erase
@@ -23,8 +25,20 @@ const NOW = 1_700_000_000_000;
 
 let db: Db;
 
-/** Records the calls the machine makes, and can be told to fail any of them. */
-function makeDeps(options: { failAt?: string; boundSlot?: string | null } = {}) {
+/**
+ * Records the calls the machine makes, and can be told to fail any of them.
+ *
+ * `removeAnswers` covers the case `failAt` cannot reach: `failAt` **throws**, which
+ * is the transport failing outright, while the orchestrator's typed results are what
+ * a live server answers. Step 8 keys on the kind, so both have to be drivable.
+ */
+function makeDeps(
+  options: {
+    failAt?: string;
+    boundSlot?: string | null;
+    removeAnswers?: "ok" | "conflict" | "unreachable" | "unexpected";
+  } = {},
+) {
   const calls: string[] = [];
   const fail = (name: string) => (options.failAt === name ? new Error(`${name} failed`) : undefined);
 
@@ -51,7 +65,12 @@ function makeDeps(options: { failAt?: string; boundSlot?: string | null } = {}) 
       calls.push(`remove:${slotId}`);
       const e = fail("remove");
       if (e) throw e;
-      return { ok: true };
+      const answer = options.removeAnswers ?? "ok";
+      // The typed result, as the routes adapter now produces it. `unreachable` is
+      // what the real client answers for a transport failure, and step 8's rule is
+      // written against the kind rather than the boolean.
+      if (answer === "ok") return { ok: true };
+      return { ok: false, errorKind: answer };
     },
     async stats() {
       return { ok: true as const, value: { size: 0 } };
@@ -61,6 +80,26 @@ function makeDeps(options: { failAt?: string; boundSlot?: string | null } = {}) 
   const sse = new SseHub({ now: () => NOW });
 
   return { deps: { db, orchestrator, runner, sse } satisfies EraseDeps, calls, sse };
+}
+
+/**
+ * A `runners` row in the shape an erase leaves when it does not clean up: `active`,
+ * `session_guid` naming the session.
+ *
+ * The seeded row is the *third* host the machine spans. The api half of the erase
+ * is this row, and it is the half that leaked — three of them, `slot-1`/`slot-13`/
+ * `slot-14`, standing against an empty `sessions` table on the deployed host.
+ */
+function seedBoundRunner(slotId: string, guid: string): void {
+  db.registerRunner(slotId, "ctr", "active");
+  db.run(`UPDATE runners SET session_guid = ? WHERE id = ?`, guid, slotId);
+}
+
+function runnerRow(slotId: string): { status: string; session_guid: string | null } | undefined {
+  return db.get<{ status: string; session_guid: string | null }>(
+    `SELECT status, session_guid FROM runners WHERE id = ?`,
+    slotId,
+  );
 }
 
 function seedSession(guid = GUID, state = "authenticated", runnerId: string | null = null) {
@@ -230,6 +269,86 @@ describe("runErase", () => {
     const { deps } = makeDeps();
     expect((await runErase(deps, GUID)).ok).toBe(true);
     expect((await runErase(deps, GUID)).ok).toBe(true);
+  });
+});
+
+/**
+ * Step 8 — reclaiming the slot's local row.
+ *
+ * The machine's step 6 calls the orchestrator's `/remove` and step 7 deletes the
+ * session row. Between them, the `runners` row — the third host the erase spans —
+ * was left naming a slot and a session that no longer existed. Observed on the
+ * deployed host: `slot-1`, `slot-13` and `slot-14`, all `active`, all bound, with
+ * an empty `sessions` table. `EnsurePool` counts slots and `claimRunner` counts
+ * rows, so those three rows were capacity the pool believed in and sessions the
+ * database could not explain.
+ *
+ * What the rule keys on is the **error kind**, not the boolean. `conflict` and
+ * `unreachable` are the same `ok: false` and opposite instructions: one says the
+ * container is gone, the other says nobody knows.
+ */
+describe("runErase step 8", () => {
+  it("leaves no runner row bound to the session it erased", async () => {
+    seedSession(GUID, "authenticated", "slot-1");
+    seedBoundRunner("slot-1", GUID);
+    const { deps } = makeDeps({ removeAnswers: "ok" });
+
+    const outcome = await runErase(deps, GUID);
+
+    expect(outcome.ok).toBe(true);
+    // The session row is gone by step 7, so this query cannot be satisfied by the
+    // session side at all: it is asking only about `runners`.
+    expect(db.get(`SELECT id FROM runners WHERE session_guid = ?`, GUID)).toBeUndefined();
+    // Not merely unbound: the orchestrator removed the *slot*, so the row is a
+    // position that no longer exists. `releaseRunner` would leave a claimable row
+    // pointing at a slot the orchestrator has no record of.
+    expect(runnerRow("slot-1")).toBeUndefined();
+  });
+
+  it("removes the row when /remove answers conflict, because the slot is already gone", async () => {
+    seedSession(GUID, "authenticated", "slot-1");
+    seedBoundRunner("slot-1", GUID);
+    const { deps } = makeDeps({ removeAnswers: "conflict" });
+
+    await runErase(deps, GUID);
+
+    // A 409 is the outcome step 6 wanted — "already gone" and "gone" are the same
+    // place — so the row goes. This is the same tolerance `releaseForIdle` applies;
+    // the two disagreeing would mean a slot's fate depends on which caller noticed
+    // it first.
+    expect(runnerRow("slot-1")).toBeUndefined();
+  });
+
+  // Both halves, because the repo's own lesson is that asserting only "nothing bad
+  // happened" passes just as well against code that does nothing at all.
+  //
+  // First: the row **stays**, and stays bound. Second: it is not a permanent leak
+  // either — the sweeper reclaims it on the next tick, which is what makes
+  // retention a delay rather than the same bug in a new place.
+  it("retains the row when /remove is unreachable, and the sweeper then reclaims it", async () => {
+    seedSession(GUID, "authenticated", "slot-1");
+    seedBoundRunner("slot-1", GUID);
+    const { deps } = makeDeps({ removeAnswers: "unreachable" });
+
+    await runErase(deps, GUID);
+
+    // Half one. The container may be running: nobody told us otherwise, and a row
+    // that forgot about it would be a live container with no record on either side.
+    expect(runnerRow("slot-1")).toEqual({ status: "active", session_guid: GUID });
+    expect(db.getSession(GUID)).toBeUndefined();
+
+    // Half two — the reason retention is safe. The session row is gone, so this is
+    // the erase-shaped leak detection A exists to clean, and it is cleaned through
+    // the *real* fake orchestrator rather than a second hand-written stub, so the
+    // shape the sweeper reads is the one it reads in production.
+    const orchestrator = new FakeOrchestrator();
+    const report = await sweep(
+      { db, orchestrator, sse: new SseHub({ now: () => NOW }), now: () => NOW },
+      new PoolBinder({ db, orchestrator, sse: new SseHub({ now: () => NOW }), now: () => NOW }),
+    );
+
+    expect(report.phantomRowsCleaned).toBe(1);
+    expect(runnerRow("slot-1")).toEqual({ status: "idle", session_guid: null });
   });
 });
 

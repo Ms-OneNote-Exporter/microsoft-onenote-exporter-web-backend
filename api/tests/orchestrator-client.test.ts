@@ -247,4 +247,55 @@ describe("OrchestratorClient", () => {
     await c.stats();
     expect(seen.url).toBe("http://orchestrator:9100/stats");
   });
+
+  // The both-ends pin for `boundSessions`, the other half of which is
+  // `orchestrator/internal/pool`'s `TestStatsMarshalsBoundSessionsUnderItsJSONKey`.
+  //
+  // The two components share no code and this field crosses an HTTP boundary, so
+  // the name is a contract that only a literal on both sides can hold. If either
+  // side renames it, the sweep's orphan branch silently stops finding anything —
+  // and it would stop finding it *quietly*, because every other test would still
+  // pass with the field simply absent.
+  //
+  // The key's existence is asserted before its contents are read: a content
+  // assertion against an absent field is vacuously true, which is the failure mode
+  // this whole test exists to prevent.
+  it("reads boundSessions off the literal key the orchestrator marshals", async () => {
+    const body = JSON.stringify({
+      size: 2,
+      byState: { idle: 1, bound: 1 },
+      runnerTtlSeconds: 300,
+      slotIds: ["slot-1", "slot-2"],
+      boundSessions: { "slot-1": "3f2504e0-4f89-11d3-9a0c-0305e82c3301" },
+    });
+    // Asserted on the wire, before the client is involved at all.
+    expect("boundSessions" in (JSON.parse(body) as Record<string, unknown>)).toBe(true);
+
+    const c = client(stubFetch(200, body));
+    const result = await c.stats();
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.boundSessions).toEqual({
+      "slot-1": "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+    });
+  });
+
+  // The other direction of the rolling deploy: an orchestrator predating the field
+  // omits it entirely (`omitempty`), and that must read as "this orchestrator does
+  // not say" rather than as an empty pool with nothing bound.
+  it("reads an orchestrator that omits boundSessions as not saying, not as empty", async () => {
+    const c = client(
+      stubFetch(
+        200,
+        JSON.stringify({ size: 2, byState: { idle: 2 }, runnerTtlSeconds: 300, slotIds: ["slot-1"] }),
+      ),
+    );
+
+    const result = await c.stats();
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.boundSessions).toBeUndefined();
+  });
 });

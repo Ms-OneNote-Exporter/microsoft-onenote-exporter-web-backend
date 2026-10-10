@@ -163,6 +163,25 @@ export interface SweepReport {
    * window instead of one sweep interval.
    */
   authFailedReleased: number;
+  /**
+   * Slots released because the orchestrator held them for a session that is gone.
+   *
+   * The §0.9.10 lockout, counted: an orphan-bound slot counts toward `poolSize`, so
+   * one of them makes the pool look full, nothing is created, and every login 409s.
+   * Recovery was an orchestrator restart. A non-zero value here means this sweep
+   * broke that cycle, and every entry is a slot somebody could have been waiting for.
+   */
+  orphanSlotsReleased: number;
+  /**
+   * Rows cleaned because they named a session that no longer exists, for a slot no
+   * `/release` was made about.
+   *
+   * The api's own half of the same leak, and the one an ordinary erase produced:
+   * `runErase` removed the container and deleted the session row while leaving a
+   * `runners` row behind it, still `active`, still bound to the erased GUID.
+   * Observed live: three such rows against an empty `sessions` table.
+   */
+  phantomRowsCleaned: number;
 }
 
 /** Options for the sweeper. */
@@ -687,9 +706,16 @@ export class PoolBinder {
 /**
  * sweep applies every TTL once.
  *
- * Called on a timer and at boot. Each rule is independent and a failure in one is
- * logged and the rest continue, because the cost of a skipped cleanup is lower
- * than the cost of a sweeper that stops.
+ * **Called on a timer only.** `index.ts` installs the 30 s interval and nothing
+ * else: the first tick lands at about t+30s, and boot calls `reconcile`, not this.
+ * The docstring used to claim "and at boot", which was true of neither — and the
+ * difference is load-bearing now, because `reclaimOrphanBindings` is the only
+ * thing that heals a slot adopted bound at a cold start, so how soon after a
+ * restart the pool is usable again deserves an honest answer.
+ *
+ * Each rule is independent and a failure in one is logged and the rest continue,
+ * because the cost of a skipped cleanup is lower than the cost of a sweeper that
+ * stops.
  */
 export async function sweep(options: SweeperOptions, binder: PoolBinder): Promise<SweepReport> {
   const { db, sse } = options;
@@ -705,6 +731,8 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
     exportsHeld: 0,
     exportsStranded: 0,
     authFailedReleased: 0,
+    orphanSlotsReleased: 0,
+    phantomRowsCleaned: 0,
   };
 
   // Learn the pool's current membership, not just its size.
@@ -930,7 +958,209 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
     }
   }
 
+  // After the loop, never inside it. A session row deleted *by this very tick* — the
+  // absolute cap, or the ten-minute rule, each of which can leave a runner row
+  // behind pointing at a session that no longer exists — is the shape this is here
+  // to reclaim, and running it after the loop catches it in the same tick rather
+  // than making the next one responsible for cleaning up after this one.
+  const orphans = await reclaimOrphanBindings(db, options.orchestrator, log, stats);
+  report.orphanSlotsReleased += orphans.released;
+  report.phantomRowsCleaned += orphans.cleaned;
+
   return report;
+}
+
+/**
+ * reclaimOrphanBindings returns a slot bound to a session that no longer exists.
+ *
+ * ## The leak
+ *
+ * Two records describe the same fact and neither had a reconciler. The
+ * orchestrator's `runners`-equivalent is a slot in `StateBound`; this process's is
+ * a `runners` row with a `session_guid`. Either can outlive the session it names:
+ *
+ *   - **B — the orchestrator's view.** A slot stays bound until something releases
+ *     it. `EnsurePool` counts *slots*, so an orphan-bound slot is capacity the pool
+ *     believes it has and never refills. Observed on the deployed host: two such
+ *     slots on a pool of two, every login 409ing, and recovery was an orchestrator
+ *     restart — which is the one thing an operator is told not to do.
+ *   - **A — this process's own rows.** `runErase` removes the container and deletes
+ *     the session row, and used to leave the `runners` row `active` and bound to the
+ *     erased GUID. Observed live: three such rows, `sessions` empty.
+ *
+ * Both are reclaimed here, every sweep, through the **existing signed `/release`
+ * verb**. No new verb, no new authority: the api stays the session authority
+ * (ARCHITECTURE §4.9) and merely asks the orchestrator to give a slot back.
+ *
+ * ## One liveness predicate for both
+ *
+ * **live = a `sessions` row exists and it is not `erasing`.** One predicate on
+ * purpose — two spellings of "is this session alive" is how the two halves drift,
+ * and then a third shape is missed.
+ *
+ * `erasing` is the half that is easy to get backwards. Such a row is *not* dead: it
+ * belongs to the erase machine, and the machine's own `/remove` is what takes that
+ * slot, not this sweep — §11 owns an `erasing` row, exactly as the loop above
+ * does. So a session that has entered `erasing` **keeps** its slot here, and the
+ * only binding this function acts on is one whose session has no row at all.
+ *
+ * The plan states this both ways — `live = exists AND state <> 'erasing'`, and, in
+ * its risk table, that an `erasing` slot is "excluded from *dead*". The second is
+ * the one that decides here: read literally the first would make an `erasing` row
+ * the most reclaimable case of all, which is two owners of one teardown, with the
+ * loser being whichever started second.
+ *
+ * ## Why there is no age threshold
+ *
+ * Deliberately absent. "How long may a slot stay bound" would need a second clock,
+ * a number, and an answer for the session that legitimately sits bound for its
+ * whole twelve hours. Liveness needs no number, and it survives a restart of either
+ * process — which a timeout does not.
+ *
+ * ## Ordering dependencies, so this cannot be silently moved
+ *
+ *   - **It runs after the session loop**, so a row deleted this tick is caught this
+ *     tick. See the call site.
+ *   - **`syncPool` ran earlier in the same sweep**, under the same `stats.ok &&
+ *     slotIds !== undefined` guard. So a `runners` row exists for **every** slot the
+ *     orchestrator reports — including one this process adopted at boot and never
+ *     claimed, which is exactly the §0.9.10 shape: an orphan whose row has to exist
+ *     before its binding can be cleaned. Release → clean is never a clean with
+ *     nothing to clean.
+ */
+async function reclaimOrphanBindings(
+  db: Db,
+  orchestrator: OrchestratorApi,
+  log: SweeperLog,
+  stats: StatsResult,
+): Promise<{ released: number; cleaned: number }> {
+  // Nothing to work from. A failed `/stats` is **not** "no slots are bound": it is
+  // "we do not know", and the whole point of this function is that it acts on a
+  // *known* disagreement. An orchestrator outage must not turn a full pool into a
+  // release storm — nor, at the other end, strand a slot that was about to be freed.
+  if (!stats.ok) return { released: 0, cleaned: 0 };
+
+  let released = 0;
+  let cleaned = 0;
+
+  // ---- B: the orchestrator's view ---------------------------------------
+  //
+  // Read from the snapshot only. No `/stats` here — the value `sweep` already took
+  // is this tick's view, and a second call would be a second opinion taken after
+  // the session loop rather than before it.
+  //
+  // **Two passes, deliberately.** The first only *detects*; the second re-reads and
+  // acts. Collapsing them into one loop would make the re-check below unreachable —
+  // nothing would happen between a check and its own `/release` — and the check that
+  // cannot fail is not a check. What sits between them is every earlier entry's
+  // round trip, which is the whole window.
+  const orphans: { slotId: string; guid: string }[] = [];
+  for (const [slotId, guid] of Object.entries(stats.value.boundSessions ?? {})) {
+    if (!sessionOwnsSlot(db, guid)) orphans.push({ slotId, guid });
+  }
+
+  for (const { slotId, guid } of orphans) {
+    // **Re-check immediately before acting**, with a fresh read rather than the one
+    // above — which was taken before the earlier entries' `/release` calls, each of
+    // them a round trip. A session that has appeared in that window owns its slot:
+    // either a live one, or one the erase machine is part-way through and whose
+    // `/remove` is already in flight. The window is small and the cost of being
+    // wrong is a live session dispossessed, which is the one failure this must
+    // never have — so the cheap answer is to re-read and ask again rather than trust
+    // a value computed before an `await`.
+    if (sessionOwnsSlot(db, guid)) {
+      log.warn("a bound slot stopped looking orphaned mid-sweep; leaving it alone", {
+        slot: slotId,
+        session: guid,
+      });
+      continue;
+    }
+
+    const result = await orchestrator.release(slotId);
+    if (!result.ok && result.error.kind !== "conflict") {
+      // Retain the row. A container that may still exist must not be forgotten:
+      // forgetting it is how a slot ends up with no record on either side, and the
+      // next tick will ask again.
+      log.warn("orphan slot could not be released; retained for the next sweep", {
+        slot: slotId,
+        session: guid,
+        error: result.error.kind,
+      });
+      continue;
+    }
+    // A `conflict` is success. It means the slot is already gone or already
+    // unbound — precisely the state this branch wanted — and tolerating it is what
+    // `releaseForIdle` already does, so the two do not disagree about what a 409
+    // means.
+    released++;
+    // `releaseRunner`, not `removeRunner`: the orchestrator's slot is a pool
+    // *position*, not a container, and the row is what makes the next `claimRunner`
+    // able to find it. Removing the row would delete the slot from this process's
+    // view of the pool, and `syncPool` would only put it back on a later tick.
+    db.releaseRunner(slotId);
+    log.warn("released a slot bound to a session that no longer exists", {
+      slot: slotId,
+      session: guid,
+    });
+  }
+
+  // ---- A: this process's own rows ---------------------------------------
+  //
+  // Gated on `slotIds !== undefined` — the second half of the same
+  // `stats.ok && slotIds !== undefined` condition `syncPool` uses above, the first
+  // half being the early return. Not a formality: while this process cannot say
+  // which slots exist, cleaning a row for a slot the orchestrator may still be
+  // holding would release a live runner's bookkeeping under a container that keeps
+  // running.
+  if (stats.value.slotIds !== undefined) {
+    // The predicate of detection B, expressed in SQL so it can run over every row
+    // at once. `NOT EXISTS` with **no state filter**, which is not an oversight: a
+    // row naming a session that exists but is `erasing` is an owner, not an orphan,
+    // and the erase machine is the thing that frees it. `EXISTS` alone is what makes
+    // a mid-erase row survive this branch — the same exclusion the read above
+    // makes, so the two halves cannot disagree about which sessions are dead.
+    const phantom = db.all<{ id: string; session_guid: string }>(
+      `SELECT id, session_guid FROM runners
+        WHERE session_guid IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM sessions s WHERE s.guid = runners.session_guid
+          )`,
+    );
+    for (const row of phantom) {
+      // No `/release` for these. The orchestrator does not report the slot as
+      // bound — in the erase-shaped leak it has already removed it — so a release
+      // would be asking about a slot it has answered about and told us nothing
+      // about. The row is the whole of the damage, and it is this process's own.
+      db.releaseRunner(row.id);
+      cleaned++;
+      log.warn("cleared a runner row bound to a session that no longer exists", {
+        slot: row.id,
+        session: row.session_guid,
+      });
+    }
+  }
+
+  // The two counters are deliberately disjoint.
+  //
+  // `released` counts slots taken back from the orchestrator; `cleaned` counts rows
+  // that were phantoms in their own right. Detection B's `releaseRunner` is not
+  // counted a second time: in the §0.9.10 shape the row it cleans was created
+  // seconds earlier by `syncPool` in this same tick, and calling that a phantom row
+  // would inflate the number an operator reads as "how much leaked".
+  return { released, cleaned };
+}
+
+/**
+ * sessionOwnsSlot is the one definition of "this session still holds that slot".
+ *
+ * `state` is read rather than only existence checked so the reader can see *why*
+ * the row is here: a session in `erasing` is mid-teardown, its slot is still
+ * physically running, and the erase machine's `/remove` is the thing that takes it.
+ * Any row counts as an owner. A session with no row at all is the only binding the
+ * sweeper may reclaim, because only then is there nothing left to lose.
+ */
+function sessionOwnsSlot(db: Db, guid: string): boolean {
+  return db.get<{ state: string }>(`SELECT state FROM sessions WHERE guid = ?`, guid) !== undefined;
 }
 
 /**

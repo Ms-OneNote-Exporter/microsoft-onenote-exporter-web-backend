@@ -227,6 +227,18 @@ export class FakeOrchestrator {
       byState[slot.sessionGuid === null ? "idle" : "bound"] =
         (byState[slot.sessionGuid === null ? "idle" : "bound"] ?? 0) + 1;
     }
+    // The same shape the real one sends, derived from this file's own slot model
+    // rather than computed on demand from the caller's interest in it.
+    //
+    // It matters that the mock reports the field at all: `mock-runner.ts` came to
+    // hide a missing erase step because it implemented the flow itself, and a mock
+    // whose `stats` quietly omitted `boundSessions` would let the sweeper's orphan
+    // branch go unexercised in exactly the place it is supposed to be exercised.
+    // Sorted, to match the real response byte for byte.
+    const boundSessions: Record<string, string> = {};
+    for (const slot of this.#slots.values()) {
+      if (slot.sessionGuid !== null) boundSessions[slot.slotId] = slot.sessionGuid;
+    }
     return {
       ok: true,
       value: {
@@ -236,6 +248,12 @@ export class FakeOrchestrator {
         // The real orchestrator exposes these now, and the api seeds its pool from
         // them. Sorted so the fake matches the real response byte for byte.
         slotIds: this.slotIds().sort(),
+        // **Omitted, not empty**, when nothing is bound — the real `Stats` carries
+        // `omitempty`, and a fake that always sends the key would teach the api to
+        // read an all-idle pool differently from a real one. Conditional spread
+        // rather than `{ boundSessions }`, because `exactOptionalPropertyTypes`
+        // treats an explicit undefined as a different value from an absent key.
+        ...(Object.keys(boundSessions).length === 0 ? {} : { boundSessions }),
       },
     };
   }

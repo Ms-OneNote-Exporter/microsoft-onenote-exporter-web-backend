@@ -737,7 +737,32 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
       {
         db: deps.db,
         orchestrator: {
-          remove: async (slotId: string) => deps.orchestrator.remove(slotId),
+          // The client's **typed** result, mapped rather than flattened.
+          //
+          // The line this replaces was `remove: async (slotId) =>
+          // deps.orchestrator.remove(slotId)`, and the comment under it explained
+          // that "a typed failure is flattened rather than propagated" — which was
+          // the reason the machine's step 8 could not tell "the slot is already gone"
+          // from "nobody answered", and could therefore only ever remove the row or
+          // never touch it. With a boolean those are the same value. Step 8 keys on
+          // the kind now, and the row it leaves behind is the sweeper's only record
+          // of a container that may still be running.
+          //
+          // `unauthorized` and `pool-exhausted` cannot occur for `/remove` on a
+          // known slot, and both map to `unexpected` — the direction that keeps the
+          // row. Rather than widen the machine's vocabulary with values it cannot
+          // act on differently.
+          remove: async (slotId: string) => {
+            const result = await deps.orchestrator.remove(slotId);
+            if (result.ok) return { ok: true };
+            const kind =
+              result.error.kind === "conflict"
+                ? "conflict"
+                : result.error.kind === "unreachable"
+                  ? "unreachable"
+                  : "unexpected";
+            return { ok: false, errorKind: kind };
+          },
           // The erase machine only needs to know whether the orchestrator is
           // reachable, so a typed failure is flattened rather than propagated —
           // the machine reports "pool stats unavailable", not a TS error.

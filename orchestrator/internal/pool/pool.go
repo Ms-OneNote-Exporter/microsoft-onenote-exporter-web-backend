@@ -229,6 +229,41 @@ type Stats struct {
 	// mac's review, and he put the alternative's failure mode better than I did.
 	SlotIDs []string `json:"slotIds"`
 
+	// BoundSessions maps slot id -> the session GUID that slot is bound to.
+	//
+	// **A read surface, not a verb.** No new verb, no new input shape, nothing for
+	// §4.4's closed set to review: this is a field on an answer the api already
+	// asks for every 30 seconds.
+	//
+	// It exists because `/stats` could report `byState: {bound: 2}` — a *number* —
+	// and nothing anywhere could say which two. A slot held for a session that no
+	// longer existed was therefore indistinguishable from a slot doing work, and
+	// only the api can tell the difference: it is the session authority
+	// (PLAN-v3 §2.2 — this pool holds no session state and makes no authorisation
+	// decisions). This map is what lets it apply that judgement to a container it
+	// has no handle on.
+	//
+	// Observed on the deployed host, one incident, both halves at once: two slots
+	// on a pool of two held by sessions whose rows were gone. `EnsurePool` counts
+	// *slots*, so the pool looked full, created nothing, and every login 409'd
+	// until someone restarted the orchestrator — the §0.9.10 lockout. Nothing was
+	// wrong with either side's own records; the orchestrator's slots really were
+	// bound and the api's sessions really were gone, so only a reconciler spanning
+	// both could have seen it. Recovery was a restart, which is the one thing an
+	// operator is told not to do.
+	//
+	// Slot ids as keys and never container ids, for the reason `SlotIDs` gives:
+	// §2.1 restricts the api from holding container identities it cannot verify.
+	// The GUIDs are this system's own identifiers and cross nothing new — they are
+	// already in the container labels (`msout.session.guid`) and already stored
+	// api-side, which is what makes answering a GUID "is this still alive?" the
+	// only question left for the caller to ask.
+	//
+	// `omitempty`, so a pool with nothing bound marshals byte-for-byte as it did
+	// before this field existed. A consumer that diffs two `/stats` bodies must not
+	// see a key appear the moment the pool goes quiet.
+	BoundSessions map[string]string `json:"boundSessions,omitempty"`
+
 	// FillError is why the last pool top-up failed, when it did. Absent when the
 	// pool is healthy, so a consumer can tell "no fault" from "no information".
 	//
@@ -253,19 +288,43 @@ func (p *Pool) Stats() Stats {
 	slots := p.Slots()
 	byState := make(map[string]int, len(slots))
 	ids := make([]string, 0, len(slots))
+	// Left nil until a bound slot that records *which* session is found. `omitempty`
+	// drops a nil map and an empty one alike, so an all-idle pool marshals exactly as
+	// it did before this field existed — which is the point: an unchanged pool must
+	// not produce a changed response just because `Stats` learned a new trick.
+	var bound map[string]string
 	for _, s := range slots {
 		byState[string(s.State)]++
 		ids = append(ids, s.ID)
+		// `StateBound && SessionGUID != ""` and not `StateBound` alone. A bound slot
+		// that has lost its GUID — mid-recycle, or adopted from labels that never
+		// carried one — contributes nothing rather than an empty string. The api
+		// reads this as "slot X is held by session Y", and a blank Y names no
+		// session at all: its sweep would classify the slot as an orphan and release
+		// a runner somebody is using.
+		if s.State == StateBound && s.SessionGUID != "" {
+			if bound == nil {
+				bound = make(map[string]string, len(slots))
+			}
+			bound[s.ID] = s.SessionGUID
+		}
 	}
 	// Sorted, so two calls against an unchanged pool produce byte-identical output.
 	// An unstable order would make a diff of two /stats responses meaningless, and
 	// would let the api's view churn for no reason.
+	//
+	// `BoundSessions` inherits the same property without this function sorting
+	// anything: `encoding/json` emits map keys in sorted order. Stated here because
+	// the guarantee is load-bearing for the field above and it is a property of the
+	// encoder rather than of this code — nothing in `Stats` enforces it, and swapping
+	// the marshaller would quietly break it.
 	sort.Strings(ids)
 	stats := Stats{
 		Size:             len(slots),
 		ByState:          byState,
 		RunnerTTLSeconds: int(p.cfg.RunnerTTL.Seconds()),
 		SlotIDs:          ids,
+		BoundSessions:    bound,
 	}
 	if fault := p.LastFillFault(); fault != nil {
 		stats.FillError = fault.Error()

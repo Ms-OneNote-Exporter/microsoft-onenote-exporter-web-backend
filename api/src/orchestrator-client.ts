@@ -163,6 +163,24 @@ export interface OrchestratorStats {
   readonly slotIds?: readonly string[];
 
   /**
+   * Which slots are **bound**, and to which session: `{ "slot-1": "<guid>" }`.
+   *
+   * `byState` answers "how many are bound", which is not the same question. A slot
+   * held for a session that no longer existed was indistinguishable from a slot
+   * doing work, and only this process can tell them apart — it owns the session
+   * rows. Observed on the deployed host: two slots on a pool of two held by
+   * sessions whose rows were gone, so `EnsurePool` saw a full pool and every login
+   * 409'd until someone restarted the orchestrator.
+   *
+   * Optional for the same reason `slotIds` is: a rolling deploy briefly pairs this
+   * api with an orchestrator that predates the field. Absent means "this
+   * orchestrator does not say", which reads as "no orphans to look for" — today's
+   * behaviour, with no regression. The field is omitted entirely when nothing is
+   * bound, so an idle pool marshals exactly as it did before it existed.
+   */
+  readonly boundSessions?: Readonly<Record<string, string>>;
+
+  /**
    * Why the last pool top-up failed, when it did.
    *
    * Optional because an orchestrator predating the field simply does not report it.

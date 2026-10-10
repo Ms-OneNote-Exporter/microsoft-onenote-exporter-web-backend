@@ -366,10 +366,27 @@ async function main(): Promise<void> {
     void sweep(
       { db, orchestrator, sse, log: booted.log, now: () => Date.now() },
       binder,
-    ).catch((error: unknown) => {
-      // A failed sweep must not kill the process, and must not be silent either.
-      booted.log.error("sweep failed", { error: String(error) });
-    });
+    )
+      .then((report) => {
+        // The rest of the report is discarded with the promise, so a report whose
+        // counters are all zero says nothing — which is right. These two are
+        // different: they mean a slot was taken back from the orchestrator and a
+        // row untruthful about a session, neither of which a healthy pool has ever
+        // done. Logged because `void` above throws the object away, and without this
+        // the fix has no observable in production except the ones its own branch
+        // logs at `warn`. The per-slot detail is in those lines; this is the count
+        // an operator reads once per tick.
+        if (report.orphanSlotsReleased > 0 || report.phantomRowsCleaned > 0) {
+          booted.log.info("sweep reclaimed orphan bindings", {
+            slotsReleased: report.orphanSlotsReleased,
+            rowsCleaned: report.phantomRowsCleaned,
+          });
+        }
+      })
+      .catch((error: unknown) => {
+        // A failed sweep must not kill the process, and must not be silent either.
+        booted.log.error("sweep failed", { error: String(error) });
+      });
   }, SWEEP_INTERVAL_MS);
 
   // An interval keeps the event loop alive on its own; `unref` means a sweep

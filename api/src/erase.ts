@@ -48,10 +48,40 @@ export type EraseOutcome =
       readonly error: string;
     };
 
+/**
+ * How `/remove` failed, in the three shapes step 8 has to tell apart.
+ *
+ * Named rather than collapsed to `ok: boolean` because the two failures mean
+ * opposite things about the local row:
+ *
+ *   - `conflict` — the orchestrator says the slot is already gone or unknown. The
+ *     container it would have destroyed is not there, so the `runners` row that
+ *     names it is stale and must go.
+ *   - `unreachable` / `unexpected` — nobody knows. The container may be running
+ *     this very moment, and a row that forgot about it would be a container with
+ *     no record on either side, which is the one state nothing reconciles.
+ *
+ * `unauthorized` and `pool-exhausted` are not named: neither is possible for a
+ * `/remove` on a known slot, and mapping them onto `unexpected` keeps the row,
+ * which is the direction that cannot destroy anything.
+ */
+export type EraseRemoveErrorKind = "conflict" | "unreachable" | "unexpected";
+
+/** What `/remove` answered. The typed result, carried to step 8 rather than flattened. */
+export type EraseRemoveResult = { ok: boolean; errorKind?: EraseRemoveErrorKind };
+
 /** The orchestrator calls erase needs. */
 export interface EraserOrchestrator {
-  /** Stops and removes the runner bound to a session. */
-  remove(slotId: string): Promise<{ ok: boolean }>;
+  /**
+   * Stops and removes the runner bound to a session.
+   *
+   * Carries the **error kind**, not just success. The adapter in `routes.ts` used to
+   * flatten this to `{ ok }`, which is precisely what made step 8's decision
+   * impossible: with a boolean, "the slot is already gone" and "nobody answered" are
+   * the same value, and the row left behind is either a leak or a forgotten
+   * container depending on which one it was.
+   */
+  remove(slotId: string): Promise<EraseRemoveResult>;
   /** Reports pool occupancy, used to reclaim the slot. */
   stats(): Promise<{ ok: boolean; value: { size: number } }>;
 }
@@ -173,11 +203,21 @@ export async function runErase(deps: EraseDeps, sessionId: string): Promise<Eras
   // 6. Remove or recycle the container. §11: "force remove; if still failing, mark
   // the runner unhealthy and quarantine". The orchestrator force-removes; a second
   // failure here is recorded for the sweeper rather than retried inline.
+  //
+  // The **result** is kept, not just its success. Step 8 below is a different
+  // decision from step 6's, and it cannot be made from a boolean: the difference
+  // between "the slot is already gone" (a `runners` row naming it is stale — drop
+  // it) and "nobody answered" (the container may be running — keep the row) is the
+  // whole content of `errorKind`.
+  let removal: EraseRemoveResult | null = null;
   if (slotId !== null) {
     try {
-      await deps.orchestrator.remove(slotId);
+      removal = await deps.orchestrator.remove(slotId);
       note("container-removed");
     } catch (error) {
+      // A throw is the transport failing outright, which is `unreachable`'s shape.
+      // `removal` stays null and step 8 reads it as "retain", which is the direction
+      // that cannot destroy a record of a live container.
       note("container-removed", error);
     }
   } else {
@@ -202,11 +242,57 @@ export async function runErase(deps: EraseDeps, sessionId: string): Promise<Eras
     note("row-deleted", error);
   }
 
-  // 8. Reclaim the slot. Local bookkeeping: the orchestrator has already removed
-  // the container, and it refills the pool on its own tick. Recorded as part of
-  // container removal rather than as a separate step, because there is nothing to
-  // do here that can fail.
+  // 8. Reclaim the slot. This is the local half of step 6, and it used to be
+  // nothing at all: the machine called `/remove` and deleted the session row, and
+  // never touched the `runners` row that still named the slot and still carried the
+  // erased GUID. Observed live on the deployed host: three such rows — `slot-1`,
+  // `slot-13`, `slot-14` — against an empty `sessions` table, each of them
+  // `active` and bound to a session nobody could name any more.
   //
+  // The rule is the **error kind**, not the boolean:
+  //
+  //   - `ok`, or `conflict` → the orchestrator's slot is gone, so the row naming it
+  //     is stale: `removeRunner`. A `conflict` counts, because "already gone" *is*
+  //     the outcome this step wanted; it is the same tolerance `releaseForIdle`
+  //     applies, and the two disagreeing would make a slot's fate depend on which
+  //     caller happened to notice it first.
+  //   - `unreachable` / `unexpected` / a throw → **retain the row.** The container
+  //     may be running: forgetting it here would leave a live container with no
+  //     record on either side, which is a strictly worse shape than the one this
+  //     fixes, and nothing reconciles it. The sweep's `reclaimOrphanBindings`
+  //     reclaims it within one tick (≤30 s) once the orchestrator answers again and
+  //     the session row is confirmed gone — so retention is a delay, not a leak.
+  //
+  // `slotId === null` does nothing: there was never a slot, so there is no row to
+  // reconcile. That case is already recorded as `container-removed` above.
+  //
+  // Recorded as part of container removal rather than as its own `EraseStep`,
+  // because the list is the machine's contract with its retry record and adding an
+  // entry would mean inventing a step name for a decision rather than an action.
+  if (slotId !== null) {
+    const removed = removal !== null && (removal.ok || removal.errorKind === "conflict");
+    if (removed) {
+      try {
+        deps.db.removeRunner(slotId);
+      } catch (error) {
+        // Local SQLite, so this is not expected — but throwing out of the machine
+        // would abandon the steps after this one, and the next sweep reclaims a row
+        // left behind for exactly this reason.
+        log.warn("erase: runner row could not be removed", {
+          session: sessionId,
+          slot: slotId,
+          error: String(error),
+        });
+      }
+    } else {
+      log.warn("erase: runner row retained for the sweeper to reclaim", {
+        session: sessionId,
+        slot: slotId,
+        error: removal === null ? "unreachable" : removal.errorKind ?? "unreachable",
+      });
+    }
+  }
+
   // The caller is responsible for the eighth thing erase must do, which has no
   // server-side action at all: expiring the cookies. See `expireCookieHeaders`.
 

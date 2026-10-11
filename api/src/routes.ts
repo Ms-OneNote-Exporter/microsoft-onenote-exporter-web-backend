@@ -773,6 +773,22 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
         },
         runner: deps.eraseRunner,
         sse: deps.sse,
+        // The machine's only diagnostic. Every step is attempted even after an
+        // earlier one fails, and the first failure is logged and reported —
+        // §11's "alert on repeats" is written against that line. Without a logger
+        // the default is a no-op, so a failed erase answers 500 with `failedAt`
+        // and leaves no trace in `docker compose logs api` at all. Observed on the
+        // deployed host: an erase against an already-dead runner, whose steps 2-4
+        // all transport-failed, logged nothing.
+        //
+        // An adapter, not `request.log` itself: `EraseDeps.log` is message-first
+        // (`SweeperLog`'s shape — the machine must not know which logger it has),
+        // and pino is fields-first. Handing pino straight in compiles and then
+        // emits the line without its session/step/error — the silence this fixes,
+        // one level in.
+        log: {
+          warn: (message, fields) => request.log.warn(fields ?? {}, message),
+        },
       } satisfies EraseDeps,
       session.guid,
     );

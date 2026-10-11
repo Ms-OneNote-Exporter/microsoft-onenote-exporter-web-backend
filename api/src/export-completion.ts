@@ -206,6 +206,22 @@ export async function completeExport(
     progress: input.progress,
     startedAt: input.finishedAt,
     finishedAt: input.finishedAt,
+    // **The three counts that used to die here.** They arrived on the runner's
+    // terminal frame, decided `partial` versus `done` on line 157, and were then
+    // dropped: the row said *that* something was lost and nothing about *what*.
+    // The user's own walk is the case this fixes — 29 pages, 8 assets, 1 page
+    // failed — and the terminal card rendered the only sentence it had, "the
+    // export stopped before it finished", which is false: it finished, and lost
+    // one page.
+    //
+    // Passed on the terminal path only, and deliberately not on the four
+    // `unpublishable*` paths above: those record `state: "failed"` with
+    // `progress: null` and an error string, and a reader is told nothing was
+    // written rather than told a count. Inventing zeros there would make "we
+    // wrote no pages" look like "nothing failed".
+    failedSections: input.failedSections,
+    failedPages: input.failedPages,
+    failedGroups: input.failedGroups,
   });
 
   if (recorded) {

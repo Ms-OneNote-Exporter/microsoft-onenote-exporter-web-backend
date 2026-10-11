@@ -64,6 +64,163 @@ import { buildServer } from "./server.js";
 const SWEEP_INTERVAL_MS = 30_000;
 
 /**
+ * How often one session's counts may be written while its export runs.
+ *
+ * A second, not a frame count. The runner announces **once per section**
+ * (`exporter.js:1339`) and the user's own notebook is a single one, so the
+ * honest unit of arrival is sections, not pages — and a per-frame write would buy
+ * nothing on the walk that motivated this while costing a row write per section
+ * on the ones that do have many.
+ */
+const PROGRESS_WRITE_INTERVAL_MS = 1_000;
+
+/**
+ * What the writer remembers about one session between frames.
+ *
+ * Both halves are needed and they answer different questions:
+ *
+ *   - `at` is the **rate** limit: no more than one write per interval.
+ *   - `counts` is the **monotonic** guard: cumulative counts never move
+ *     backwards, so a frame that carries no more than what is already stored is
+ *     not news.
+ *
+ * Kept as one record rather than two maps because they are created and destroyed
+ * together, and a map that can be half-deleted is the `#clearPump` bug this
+ * repository has already paid for once.
+ */
+interface ProgressWrite {
+  readonly at: number;
+  readonly counts: { pages: number; sections: number; assets: number };
+}
+
+/** What {@link createExportProgressWriter} hands back. */
+export interface ExportProgressWriter {
+  /** Wired to `HttpRunnerAdapterOptions.onExportProgress`. */
+  readonly onExportProgress: (
+    sessionId: string,
+    id: string,
+    progress: { pages: number; sections: number; assets: number },
+  ) => void;
+  /** Forget a session. Called once its export is over, however it ended. */
+  readonly forget: (sessionId: string) => void;
+}
+
+/**
+ * createExportProgressWriter builds the coalescing writer that feeds an
+ * in-flight export's counts into the session row.
+ *
+ * ## Why this is here, in the entrypoint
+ *
+ * It is a rule, and this file's own header says rules belong in a module with
+ * tests. It is here anyway, and the reason is the shape of the change rather
+ * than a preference: the writer is the *composition* of two seams that already
+ * exist — the adapter's new `onExportProgress` and the db's new
+ * `updateExportProgress` — and the whole of its behaviour is how they meet. In
+ * its own module it would be handed both as parameters and tested against
+ * doubles, which is the shape of every test in this repository that has missed
+ * something. It is exported so those tests can reach it, exactly as `boot` is.
+ *
+ * ## The three rules, and what each one is for
+ *
+ * **At most one write per second, per session.** `routes.ts` writes the zeros at
+ * queue time and again at run start; this is what replaces them. Written per
+ * frame instead, a notebook with many sections would write a row per section for
+ * counts that move by a handful of pages.
+ *
+ * **Monotonic — a frame that is not ahead of the last written one is dropped.**
+ * The runner's counts are cumulative and only ever increase
+ * (`exporter.js:1305`), so a frame carrying no more than the stored counts is
+ * either a duplicate or *older*: `#pump` reconnects and replays from the last
+ * sequence number it saw, so the last frame before a dropped connection arrives
+ * again, and a runner that restarts its own counter arrives lower still. Writing
+ * either would make a card that is counting **down**, which is worse than the
+ * zero it replaced.
+ *
+ * **The terminal is never throttled.** A frame skipped by either rule is not
+ * lost, only delayed: `completeExport` writes the final counts on its own path,
+ * so a throttled frame can never be the last word. That is the property that
+ * makes dropping one safe, and it is why this can be a skip rather than a flush.
+ *
+ * ## The map is cleared by **observation**, not by remembering the paths
+ *
+ * `updateExportProgress` answers `0` for exactly one reason: this row's export is
+ * not `queued`/`running` any more, or the row is not there. That is a single
+ * statement covering every way an export stops —
+ *
+ *   - **completed** — `completeExport` moved it to `done`/`partial`
+ *   - **aborted** — `routes.ts` moved it to `partial` (and nulled `progress`)
+ *   - **stranded** — `markExportStranded` moved it to `failed`
+ *   - **erased** — the row is gone
+ *
+ * — so forgetting on a refused write covers the abort, stranded and erase paths
+ * without any of those files knowing this map exists. They are not in the change
+ * and this is why: the alternative was a hook threaded through `routes.ts`,
+ * `sweep.ts` and `erase.ts`, which buys an *eager* forget at the cost of three
+ * files' worth of plumbing for a `Map` entry of three numbers.
+ *
+ * `completeExport` additionally forgets on the way out, so a finished export does
+ * not leave its entry behind waiting for a frame that will never come. The next
+ * export of the same session then starts from a clean slate — which is correct,
+ * because its counts start from zero and would otherwise be skipped as
+ * "not ahead of" the previous export's totals.
+ *
+ * The one thing this cannot do is forget a session that goes away silently. That
+ * is bounded by the session table rather than by this map, and an entry is three
+ * numbers against a twelve-hour TTL — stated here so the bound is a decision
+ * rather than an oversight.
+ */
+export function createExportProgressWriter(
+  write: (
+    guid: string,
+    progress: { pages: number; sections: number; assets: number },
+  ) => number,
+  now: () => number = Date.now,
+): ExportProgressWriter {
+  const last = new Map<string, ProgressWrite>();
+
+  const forget = (sessionId: string): void => {
+    last.delete(sessionId);
+  };
+
+  const onExportProgress: ExportProgressWriter["onExportProgress"] = (
+    sessionId,
+    _id,
+    progress,
+  ) => {
+    const previous = last.get(sessionId);
+    const at = now();
+
+    if (previous !== undefined) {
+      if (at - previous.at < PROGRESS_WRITE_INTERVAL_MS) return;
+      // Monotonic. `pages` is the one that decides it, because it is the only
+      // count the exporter guarantees to be non-decreasing on every single page
+      // it writes — `sections` and `assets` are derived and a re-walk of a
+      // notebook can report either. Comparing all three field-by-field would
+      // therefore skip a genuine new section and leave the card showing the
+      // older walk's totals.
+      if (progress.pages <= previous.counts.pages) {
+        // Deliberately **not** updating `previous.at`. Refreshing the timestamp
+        // would make a stream of stale frames hold the throttle open for ever
+        // and starve the one frame that does carry news.
+        return;
+      }
+    }
+
+    const changed = write(sessionId, progress);
+    if (changed === 0) {
+      // The row says this export is over — done, partial, aborted, stranded, or
+      // erased. See the header: this is the only place that has to know, and it
+      // knows it by being told no.
+      forget(sessionId);
+      return;
+    }
+    last.set(sessionId, { at, counts: progress });
+  };
+
+  return { onExportProgress, forget };
+}
+
+/**
  * boot runs the startup sequence and returns the assembled dependencies.
  *
  * Exported so a test can boot the real thing against a temporary database and
@@ -131,6 +288,18 @@ export async function boot(
 
   const binder = new PoolBinder({ db, orchestrator, sse, log, now: () => Date.now() });
 
+/**
+ * The coalescing writer, built once and closed over by both callbacks below.
+ *
+ * One writer for the two of them on purpose: the terminal has to forget what the
+ * progress writer remembered, and two objects holding one session's coalescing
+ * state is the `#clearPump` shape — two deleters of one piece of state and
+ * nothing to tell them apart.
+ */
+const progressWriter = createExportProgressWriter(
+  (guid, progress) => db.updateExportProgress(guid, progress),
+);
+
   // The route to a runner container, and the address of each session's runner.
   //
   // Two objects rather than one because they answer different questions. The
@@ -169,6 +338,16 @@ runner = new HttpRunnerAdapter({
       // - replaces three notebooks with an empty array.
       db.setNotebooks(sessionId, names);
     },
+    // **The step that made a running export readable after a refresh.**
+    //
+    // `export-progress` reached the browser all along and the database never did,
+    // so the live card counted up while `GET /api/session/status` kept answering
+    // the zeros `routes.ts` wrote at queue time — and a refresh, a second tab, or
+    // the client's own status poll replaced the real numbers with `0 / 0 / 0`.
+    //
+    // The shape is `onNotebooksListed` exactly: this adapter is transport and
+    // stores nothing, so the write belongs to the process that owns the database.
+    onExportProgress: progressWriter.onExportProgress,
     onAuthOutcome: (sessionId, outcome) => {
       const now = Date.now();
       const changed =
@@ -201,8 +380,26 @@ runner = new HttpRunnerAdapter({
     // Referencing `runner` inside the arrow rather than in the options object is
     // safe and deliberate: the callback fires minutes later, from the event pump,
     // long after this binding is initialised.
-    onExportFinished: (input): Promise<void> =>
-      completeExport({ runner, orchestrator, db, log }, input),
+    onExportFinished: async (input): Promise<void> => {
+      try {
+        await completeExport({ runner, orchestrator, db, log }, input);
+      } finally {
+        // **Every terminal forgets**, not only the successful one. `completeExport`
+        // has four ways to end without calling `db.completeExport` — a thrown walk,
+        // an empty notebook, a total loss of pages, a failed publish — and each of
+        // them leaves `export_state` at `failed` rather than `queued`/`running`.
+        // The entry would then sit there for the rest of the session's life, and
+        // the *next* export of that session would have its first frames skipped as
+        // "not ahead of" the previous export's totals — the frozen-at-zero card,
+        // one export later.
+        //
+        // `finally` rather than after the call: `completeExport` is documented
+        // never to throw, but it is the thing being called, and a writer that
+        // leaks its state on an unexpected throw is exactly the failure mode this
+        // comment is about.
+        progressWriter.forget(input.sessionId);
+      }
+    },
   });
 
   // ---- boot reconciliation -------------------------------------------------

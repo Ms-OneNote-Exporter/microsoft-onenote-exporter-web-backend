@@ -72,6 +72,15 @@ import { isValidGuid, readAccount, readCredentialBytes, passwordFrom } from "./c
 const KEEPALIVE_MS = 15_000;
 
 /**
+ * How often an export in flight re-publishes the last counts it was told.
+ *
+ * Deliberately the same figure as `KEEPALIVE_MS`, and for the same reason: both
+ * exist so that nothing about a running export goes quiet for longer than one
+ * poll interval, and two constants for one idea is how they drift apart.
+ */
+const PROGRESS_HEARTBEAT_MS = 15_000;
+
+/**
  * The packages, loaded lazily.
  *
  * Lazy so that `/healthz` answers on a container whose Chromium is missing, and
@@ -441,6 +450,54 @@ export function buildApp(
     const { runExport } = await packages();
     let packageTerminalEmitted = false;
     let exportDoneNotebook: string | undefined;
+    /**
+     * The last counts the package reported, and the heartbeat's whole vocabulary.
+     *
+     * `null` until the first `export-progress`, and the heartbeat publishes
+     * **nothing** until then. That is the line this whole mechanism must not
+     * cross: before any frame there are no measured counts, and publishing
+     * `{0, 0, 0}` on a timer would be inventing a measurement the exporter never
+     * made — the exact lie the api's `progress: null` ("unknown") exists to avoid
+     * being confused with.
+     */
+    let lastProgress: { pages: number; sections: number; assets: number } | null = null;
+
+    /**
+     * The heartbeat: re-publish the last known counts while the walk runs.
+     *
+     * ## What it is for, stated honestly
+     *
+     * The exporter announces **once per section** (`exporter.js:1339`, after
+     * every page in that section — "the counts move a lot inside a long
+     * section"). So a notebook of one section produces exactly one frame,
+     * seconds before its terminal, and a notebook of many produces one per
+     * section with silence between them.
+     *
+     * This keeps the walk *visibly* alive across those gaps and keeps the api's
+     * snapshot fresh, using the api's own existing vocabulary — no new route, no
+     * new event type, no package change.
+     *
+     * ## What it cannot do
+     *
+     * **It cannot invent counts inside a section.** It re-publishes what the
+     * exporter last said, so a single-section notebook still shows one real
+     * update however long the section takes. Making *that* live is a per-page
+     * cadence in `@msout/microsoft-onenote-export-notebook` — a publish cycle,
+     * not a fix, and explicitly out of scope here.
+     *
+     * The api's coalescing writer treats a repeated frame as news-free and skips
+     * the database write, which is the correct reading: the numbers did not
+     * move. The heartbeat's value is on the wire and in the liveness signal, not
+     * in the row.
+     */
+    const heartbeat = setInterval(() => {
+      if (lastProgress === null) return;
+      hub.publish(guid, { type: "export-progress", id, progress: lastProgress });
+    }, PROGRESS_HEARTBEAT_MS);
+    // `unref` so a heartbeat cannot by itself be the reason the process refuses to
+    // exit. `clearInterval` below is what actually stops it; this is the belt to
+    // that braces, and it is the same reasoning as the sweeper interval's.
+    heartbeat.unref();
 
     void (async () => {
       try {
@@ -473,10 +530,18 @@ export function buildApp(
                 hub.publish(guid, { type: "export-started", id });
                 break;
               case "export-progress":
+                // Recorded before publishing, so the heartbeat's very first tick
+                // — which can land while a section is still running — has
+                // something measured to re-publish rather than nothing.
+                lastProgress = (e.progress ?? { pages: 0, sections: 0, assets: 0 }) as {
+                  pages: number;
+                  sections: number;
+                  assets: number;
+                };
                 hub.publish(guid, {
                   type: "export-progress",
                   id,
-                  progress: (e.progress ?? { pages: 0, sections: 0, assets: 0 }) as never,
+                  progress: lastProgress as never,
                 });
                 break;
               case "export-log":
@@ -547,6 +612,11 @@ export function buildApp(
           walkFailed: true,
         });
       } finally {
+        // Stopped with the export, never left running: a heartbeat that outlived
+        // its walk would re-publish the final counts every fifteen seconds for
+        // the rest of the session — a live-looking card over an export that
+        // finished minutes ago, indistinguishable from one still going.
+        clearInterval(heartbeat);
         claimed.release();
       }
     })();

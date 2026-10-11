@@ -1004,6 +1004,24 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
         partialReason: null,
         id: exportId,
         notebook,
+        // **Superseded by the first `export-progress` frame, and deliberately so.**
+        //
+        // These zeros are not the api's guess at how far the walk has got — they
+        // are the *starting* value, written because `export_state` is replaced
+        // whole and a card that renders `progress: null` has nothing to show. The
+        // runner's adapter now hands every frame to `db.updateExportProgress`,
+        // which overwrites this key and nothing else, so the first frame after
+        // the walk begins replaces them within about a second.
+        //
+        // Named here because the symptom this plan exists to fix was precisely
+        // this line being the *last* writer of all. It is still a zero; it is no
+        // longer a zero for the length of the walk. What it cannot become, and
+        // what no amount of writing here can fix, is a count **inside** a
+        // section: the exporter announces once per section (`exporter.js:1339`),
+        // so a single-section notebook — the one the user measured, 29 pages —
+        // shows these zeros until its one section closes. That is a package
+        // cadence, not an api gap; the runner's heartbeat re-publishes the last
+        // known counts between sections, and cannot invent one in the middle.
         progress: { pages: 0, sections: 0, assets: 0 },
         startedAt: now(),
         finishedAt: null,

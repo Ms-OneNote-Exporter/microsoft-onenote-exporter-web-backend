@@ -44,6 +44,15 @@ function orchestratorStub(opts: {
    */
   boundSessions?: Record<string, string>;
   /**
+   * What `/stats` reports as `deadSlots`: slot ids whose container died.
+   *
+   * Omitted from the response when undefined, for the same reason as
+   * `boundSessions` above — the stub then stands in for an orchestrator predating
+   * the field, which is the rolling-deploy case this branch's `!== undefined` guard
+   * exists for and the one test (d) pins.
+   */
+  deadSlots?: string[];
+  /**
    * Runs inside the `/release` handler, before the answer is returned.
    *
    * Exists so a test can produce the window the pre-act liveness re-check exists
@@ -128,6 +137,10 @@ function orchestratorStub(opts: {
               // orchestrator with nothing bound does not send the key at all, and a
               // stub that always sent `{}` would make that case unreachable.
               ...(opts.boundSessions === undefined ? {} : { boundSessions: opts.boundSessions }),
+              // Same rule, same reason. A stub that always sent `deadSlots: []` would
+              // make "this orchestrator predates the field" unreachable, which is the
+              // half of the pair that has to stay working.
+              ...(opts.deadSlots === undefined ? {} : { deadSlots: opts.deadSlots }),
             }),
           );
         }
@@ -1533,5 +1546,258 @@ describe("sweep exportsStranded", () => {
 
     expect(report.exportsStranded).toBe(0);
     expect(db.getSession(GUID)?.state).toBe("authenticated");
+  });
+});
+/**
+ * Tests for the dead-runner fix: a session in state='exporting' whose runner
+ * container died while its row was still intact.
+ *
+ * ## The gap this closes
+ *
+ * The suite above repairs an exporting session with **no** runner id. This one is
+ * the shape that branch deliberately cannot reach, and it was the one that actually
+ * wedged sessions: `runner_id` set, a `runners` row saying the slot was bound, and
+ * both records *true* — of a container that no longer existed. Nothing was
+ * inconsistent, so nothing was repairable by a reconciler comparing two records. The
+ * export's own runner is the only writer of `export-done`, so the walk could never
+ * finish, and `POST /api/export` refused every future export with a 409 until the
+ * 12-hour absolute cap erased the session.
+ *
+ * The orchestrator is the only side that can see the container is gone; this process
+ * is the only side that can act on it. `deadSlots` is the whole conversation.
+ */
+describe("sweep exportsRunnerDied", () => {
+  const RUNNING =
+    '{"state":"running","id":"art1","notebook":"NB","progress":null,"startedAt":1,"finishedAt":null}';
+
+  /** The exported session, plus a `runners` row that says its slot is bound. */
+  function seedExportingOnDeadSlot(guid = GUID, slotId = "slot-1"): void {
+    seedRunners(1);
+    db.run(`UPDATE runners SET status = 'active', session_guid = ? WHERE id = ?`, guid, slotId);
+    seedSession(guid, {
+      state: "exporting",
+      runner_id: slotId,
+      export_state: RUNNING,
+    });
+  }
+
+  const rowFor = (slotId: string) =>
+    db.get<{ status: string; session_guid: string | null }>(
+      `SELECT status, session_guid FROM runners WHERE id = ?`,
+      slotId,
+    );
+
+  // (a) The whole repair, in one tick.
+  //
+  // The `runner_id` assertion is the regression this branch exists for: `releaseRunner`
+  // frees the `runners` row and does **not** null `sessions.runner_id`, so a repair
+  // that released the slot without clearing the session's binding would leave it
+  // pointing at a slot the orchestrator has already given back — claimable by someone
+  // else, and believed by this session until the cap.
+  it("releases the slot, clears the binding and ends the export in one tick", async () => {
+    seedExportingOnDeadSlot();
+    const frames = watch(sse, GUID);
+
+    const { client, released } = orchestratorStub({
+      stats: "filled",
+      slotIds: ["slot-1"],
+      deadSlots: ["slot-1"],
+      release: "ok",
+    });
+    const report = await sweep(options(client), new PoolBinder(options(client)));
+
+    // Named, once. "A release happened" and "a release happened for that slot" are
+    // different assertions.
+    expect(released).toEqual(["slot-1"]);
+    expect(report.exportsRunnerDied).toBe(1);
+
+    const session = db.getSession(GUID)!;
+    // **The regression assertion.** `markExportStranded` requires `runner_id IS NULL`,
+    // so without this the repair is a no-op on the row that matters.
+    expect(session.runner_id).toBeNull();
+    expect(session.state).toBe("authenticated");
+    expect(session.idle_expires_at).toBe(now + TTL.authenticatedIdle);
+
+    const parsed = JSON.parse(session.export_state!);
+    expect(parsed.state).toBe("failed");
+    // Not the default string: this runner was not released, it disappeared, and the
+    // two are different failures told to a user staring at a frozen card.
+    expect(parsed.error).toBe("the runner disappeared before this export finished");
+    expect(parsed.id).toBe("art1");
+
+    // And the slot is claimable again. A `runners` row left `active` is invisible to
+    // `claimRunner`'s `WHERE status = 'idle' AND session_guid IS NULL`, so ending the
+    // wedged export that way would wedge the slot instead.
+    expect(rowFor("slot-1")).toEqual({ status: "idle", session_guid: null });
+
+    // The browser is told, because the one writer that would have ended the progress
+    // card is the thing that died.
+    const events = frames();
+    expect(events.length).toBe(1);
+    expect(events[0].type).toBe("session-status");
+    expect(events[0].data).toEqual({ state: "authenticated" });
+  });
+
+  // (b) The false-positive guard, and the reason the list is narrow evidence rather
+  // than "the slot looks busy". Everything is the same except that the runner is alive.
+  it("holds a live runner, and releases nothing", async () => {
+    seedExportingOnDeadSlot();
+
+    const { client, released } = orchestratorStub({
+      stats: "filled",
+      slotIds: ["slot-1"],
+      deadSlots: [],
+      release: "ok",
+    });
+    const report = await sweep(options(client), new PoolBinder(options(client)));
+
+    expect(released).toEqual([]);
+    expect(report.exportsRunnerDied).toBe(0);
+    // Held, as it must be: an export in flight is not an idle session.
+    expect(report.exportsHeld).toBe(1);
+    expect(report.exportsStranded).toBe(0);
+    expect(db.getSession(GUID)?.state).toBe("exporting");
+    expect(db.getSession(GUID)?.runner_id).toBe("slot-1");
+    expect(rowFor("slot-1")?.session_guid).toBe(GUID);
+  });
+
+  // (c) A release that fails for any reason other than a conflict.
+  //
+  // **The row is retained, whole.** Clearing it here would orphan the slot: not
+  // released on the orchestrator's side, not bound on this one, and the next session
+  // to claim something takes a container that is still running. The cost of being
+  // wrong in this direction is that the session stays wedged for one more sweep
+  // interval; the cost of the other direction is somebody else's runner.
+  it("retains the row when the release fails for a reason other than a conflict", async () => {
+    seedExportingOnDeadSlot();
+    const frames = watch(sse, GUID);
+
+    const { client, released } = orchestratorStub({
+      stats: "filled",
+      slotIds: ["slot-1"],
+      deadSlots: ["slot-1"],
+      release: "unreachable",
+    });
+    const report = await sweep(options(client), new PoolBinder(options(client)));
+
+    expect(released).toEqual(["slot-1"]);
+    expect(report.exportsRunnerDied).toBe(0);
+    // Untouched, not merely unreleased: state, binding and the in-flight export are
+    // all still what they were, so the next sweep tries again.
+    const session = db.getSession(GUID)!;
+    expect(session.state).toBe("exporting");
+    expect(session.runner_id).toBe("slot-1");
+    expect(JSON.parse(session.export_state!).state).toBe("running");
+    expect(rowFor("slot-1")?.session_guid).toBe(GUID);
+    // Nothing announced, because nothing changed that a browser could see.
+    expect(frames().length).toBe(0);
+  });
+
+  // A 409 is not a failure: it means the slot is already gone or already unbound,
+  // which is exactly the state this branch wanted. The same tolerance
+  // `releaseForIdle` ships, so the two cannot disagree about what a 409 means.
+  it("treats a conflict from /release as the slot already being gone", async () => {
+    seedExportingOnDeadSlot();
+
+    const { client } = orchestratorStub({
+      stats: "filled",
+      slotIds: ["slot-1"],
+      deadSlots: ["slot-1"],
+      release: "conflict",
+    });
+    const report = await sweep(options(client), new PoolBinder(options(client)));
+
+    expect(report.exportsRunnerDied).toBe(1);
+    expect(db.getSession(GUID)?.runner_id).toBeNull();
+    expect(db.getSession(GUID)?.state).toBe("authenticated");
+  });
+
+  // (d) The rolling deploy, and the reason the field is optional.
+  //
+  // **Paired with the same fixture carrying the field**, because a test that only
+  // asserts "nothing happened" passes just as happily against code that does nothing
+  // at all — which is the standing rule this repo keeps re-learning. The two halves
+  // differ by exactly the field, so deleting the branch turns the first red and
+  // firing it unconditionally turns the second.
+  it("does nothing for an orchestrator that reports no deadSlots at all", async () => {
+    seedExportingOnDeadSlot();
+    const runWith = async (opts: Parameters<typeof orchestratorStub>[0]) => {
+      const { client, released } = orchestratorStub(opts);
+      const report = await sweep(options(client), new PoolBinder(options(client)));
+      return { report, released };
+    };
+
+    const withField = await runWith({
+      stats: "filled",
+      slotIds: ["slot-1"],
+      deadSlots: ["slot-1"],
+      release: "ok",
+    });
+    // Same pool, same dead runner, one field missing. A fresh session, because the
+    // first run repaired the only one.
+    seedExportingOnDeadSlot(OTHER, "slot-1");
+    const withoutField = await runWith({
+      stats: "filled",
+      slotIds: ["slot-1"],
+      release: "ok",
+    });
+
+    expect(withField.report.exportsRunnerDied).toBe(1);
+    expect(withoutField.released).toEqual([]);
+    expect(withoutField.report.exportsRunnerDied).toBe(0);
+    expect(db.getSession(OTHER)?.runner_id).toBe("slot-1");
+    expect(db.getSession(OTHER)?.state).toBe("exporting");
+  });
+
+  // (f) "Cannot ask" is not "there is none". This process cannot tell a dead runner
+  // from an unreachable orchestrator, and while it cannot ask it acts on nothing at
+  // all — the guard is the same line the orphan pass uses, for the same reason.
+  it("acts on nothing at all when the orchestrator cannot be asked", async () => {
+    seedExportingOnDeadSlot();
+
+    const { client, released } = orchestratorStub({ stats: "unreachable", release: "ok" });
+    const report = await sweep(options(client), new PoolBinder(options(client)));
+
+    expect(released).toEqual([]);
+    expect(report.exportsRunnerDied).toBe(0);
+    expect(db.getSession(GUID)?.state).toBe("exporting");
+    expect(db.getSession(GUID)?.runner_id).toBe("slot-1");
+  });
+
+  // A finished export is not a dead one. `markExportStranded`'s `ELSE` arm is the
+  // data-loss guard — session `80837b89` is `partial` with a real `artifact_id`, a
+  // working download whose state was wrongly `exporting` — and this is the caller
+  // that must not be able to defeat it.
+  it("keeps a finished partial export byte-for-byte through this caller too", async () => {
+    const partialState = JSON.stringify({
+      state: "partial",
+      partialReason: "quota",
+      id: "artifact123",
+      notebook: "NB",
+      progress: null,
+      startedAt: 1234567890,
+      finishedAt: 1234567900,
+    });
+    // An exporting session on the dead slot, whose walk turned out to have produced a
+    // downloadable partial before the container went.
+    seedExportingOnDeadSlot();
+    db.run(
+      `UPDATE sessions SET export_state = ?, artifact_id = 'artifact123' WHERE guid = ?`,
+      partialState,
+      GUID,
+    );
+
+    const { client } = orchestratorStub({
+      stats: "filled",
+      slotIds: ["slot-1"],
+      deadSlots: ["slot-1"],
+      release: "ok",
+    });
+    const report = await sweep(options(client), new PoolBinder(options(client)));
+
+    expect(report.exportsRunnerDied).toBe(1);
+    expect(db.getSession(GUID)?.state).toBe("authenticated");
+    expect(db.getSession(GUID)?.export_state).toBe(partialState);
+    expect(db.getSession(GUID)?.artifact_id).toBe("artifact123");
   });
 });

@@ -207,6 +207,52 @@ type Pool struct {
 	// and the other never clears at all. See Stats.FillError.
 	lastFillErr      error
 	fillFailureCount int
+
+	// deadStreak counts, per bound slot, the consecutive sweeps in which the
+	// Engine reported that slot's container as **not running**.
+	//
+	// It exists because one such observation is not yet proof. Docker 26.x can
+	// answer an inspect for a container that has just been stopped — or one a
+	// `recycle` is mid-way through replacing — with a state that is about to
+	// change, and acting on it would have the api release a slot out from under a
+	// runner that is coming back. So a stopped container is reported on the
+	// **second** consecutive observation and not before, which costs one sweep
+	// interval (30 s) on the case this exists to catch and buys the false positive
+	// back.
+	//
+	// Cleared by any running observation, and by a 404 — the Engine cannot be
+	// about to start a container it says does not exist.
+	deadStreak map[string]int
+
+	// deadBound is the set of bound slots whose container the Engine has been seen
+	// to have lost, for `Stats` to report as `deadSlots`.
+	//
+	// A **report, not a transition.** Nothing here moves a slot between states, and
+	// no container is acted on: the pool still believes it is serving the session
+	// until the api — the only side that can tell a dead runner from a busy one,
+	// because it owns the session rows (PLAN-v3 §2.2) — comes back and releases
+	// the slot through the existing `/release` verb. Without this field that
+	// release never comes: a session wedged in `state: 'exporting'` whose
+	// container died keeps its row, and `POST /api/export` refuses every future
+	// export with a 409 until the 12-hour absolute cap, because the sweeper skips
+	// `exporting` sessions to protect live ones and the runner that would have
+	// finished the export is the thing that died.
+	deadBound map[string]deadBoundRunner
+}
+
+// deadBoundRunner is one recorded "this bound slot's container is not running".
+//
+// The container id is kept because the slot outlives its containers: without it a
+// slot given a fresh container would still be reported dead on the evidence of the
+// one that left, which is the mirror image of the bug this reports.
+type deadBoundRunner struct {
+	// ContainerID is the container the observation was about.
+	ContainerID string
+	// State is what the Engine said — its `State.Status`, `"exited"` or `"dead"` —
+	// or `absent` when the inspect answered 404 and the container does not exist
+	// at all. Reported because "the container is gone" and "the container stopped"
+	// are different failures and an operator acts on them differently.
+	State string
 }
 
 // New returns a pool. It does not touch Docker; call Reconcile or EnsurePool.
@@ -221,8 +267,10 @@ func New(cfg *config.Config, docker Daemon, log *slog.Logger) *Pool {
 		now:    time.Now,
 		//nolint:gosec // G404: not used for anything security-bearing. Slot
 		// selection only; every decision it affects is re-checked under mu.
-		rnd:   rand.New(rand.NewSource(time.Now().UnixNano())),
-		slots: make(map[string]*Slot, cfg.PoolSize),
+		rnd:        rand.New(rand.NewSource(time.Now().UnixNano())),
+		slots:      make(map[string]*Slot, cfg.PoolSize),
+		deadStreak: make(map[string]int),
+		deadBound:  make(map[string]deadBoundRunner),
 	}
 }
 
@@ -294,6 +342,36 @@ type Stats struct {
 	// see a key appear the moment the pool goes quiet.
 	BoundSessions map[string]string `json:"boundSessions,omitempty"`
 
+	// DeadSlots are the bound slots whose container the Engine has been seen to
+	// have lost. Slot ids, for the same reason `BoundSessions` uses them: §2.1
+	// restricts the api from holding container identities it cannot verify, and a
+	// slot name is how it asks for a slot rather than a handle it can address one
+	// with.
+	//
+	// **A read surface, like `BoundSessions` above, and not a verb.** No input, no
+	// new authority, nothing for §4.4's closed set to review: a field on an answer
+	// the api already asks for every 30 seconds.
+	//
+	// It exists for the one disagreement neither side's own records can see. A
+	// session in `state: 'exporting'` whose runner container died is not stranded
+	// by anything the api knows: its row is intact, its `runner_id` still names a
+	// slot, and `runners` still says the slot is bound. So `routes.ts`'s guard
+	// (`export_state.state IN ('queued','running')`) refuses every future export
+	// with a 409, while the api's sweeper deliberately skips `exporting` sessions
+	// to protect live ones — and the component that would have finished the export
+	// is the thing that died. Only the orchestrator can see the container is gone,
+	// because only it holds the Engine; only the api can act on it, because only it
+	// holds the session rows. This list is the whole of the conversation between
+	// them.
+	//
+	// Before it, the only relief was `TTL.absolute` — up to 12 hours of a session
+	// that cannot export, from one runner that exited.
+	//
+	// `omitempty`, on the same terms as `BoundSessions`: a pool with nothing dead
+	// marshals byte-for-byte as it did before this field existed, and absence is
+	// read as "none", never as "unknown".
+	DeadSlots []string `json:"deadSlots,omitempty"`
+
 	// FillError is why the last pool top-up failed, when it did. Absent when the
 	// pool is healthy, so a consumer can tell "no fault" from "no information".
 	//
@@ -355,12 +433,41 @@ func (p *Pool) Stats() Stats {
 		RunnerTTLSeconds: int(p.cfg.RunnerTTL.Seconds()),
 		SlotIDs:          ids,
 		BoundSessions:    bound,
+		// Read outside the loop above and under its own lock, because `deadBound`
+		// is written by `Sweep` from the maintenance goroutine while this runs on a
+		// request handler. Sorted by the same argument as `ids`: two calls against an
+		// unchanged pool must produce byte-identical output.
+		DeadSlots: p.DeadBoundSlots(),
 	}
 	if fault := p.LastFillFault(); fault != nil {
 		stats.FillError = fault.Error()
 		stats.FillFailures = p.fillFailures()
 	}
 	return stats
+}
+
+// DeadBoundSlots returns the bound slots `Sweep` has observed dead, sorted.
+//
+// Nil when there are none, which is what `omitempty` needs to drop the key: an
+// empty slice would marshal as `null` for a caller that has not seen the field
+// before, and a response that changes shape when the pool is quiet is exactly
+// what `SlotIDs`'s and `BoundSessions`' `omitempty` exist to prevent.
+//
+// Exported because `Stats` builds its own answer and the maintenance goroutine
+// writes the observations; the two must reach the same list without either
+// holding the other's lock.
+func (p *Pool) DeadBoundSlots() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.deadBound) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(p.deadBound))
+	for id := range p.deadBound {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // LastFillFault returns why the most recent pool top-up could not create a
@@ -880,6 +987,29 @@ func (p *Pool) EnsurePool(ctx context.Context) error {
 // than sessions: an **idle** slot is removed after `SlotIdleTimeout`, and `Reconcile`
 // replaces rather than adopts a container already past `RunnerTTL`, since adopting
 // one would attach a fresh budget to a browser tree of unknown vintage.
+//
+// ## The third rule, added: is a bound runner still there?
+//
+// The two clocks above are about *lifetime*. Neither can notice that a bound slot's
+// container stopped existing while the pool still counted it, and that is the shape
+// that wedged a session: a runner died mid-export, the row stayed
+// `state: 'exporting'` with its `runner_id` intact, and nothing anywhere could say
+// so. The api's sweeper skips `exporting` sessions *on purpose* — that branch is
+// what stops a long export losing its runner to the idle TTL — so its own records
+// are all consistent and all wrong, and `POST /api/export` refused every future
+// export with a 409 until the 12-hour absolute cap erased the session.
+//
+// So each bound slot with a container is inspected, and what the Engine says is
+// recorded for `Stats` to report as `deadSlots`. **A report, not a transition:**
+// no slot state changes, no container is acted on, and no binding is touched. The
+// api holds the session rows (PLAN-v3 §2.2) and is the only side that can tell a
+// dead runner from a busy one, so the pool tells it what it saw and gets out of
+// the way.
+//
+// Deliberately **not** the healthcheck. An unhealthy runner is a Chromium that is
+// alive and failing its own probes — restarting one is a different decision, with
+// a different blast radius, and one nothing here is authorised to take. `Running`
+// is a question the Engine answers about the container itself.
 func (p *Pool) Sweep(ctx context.Context) error {
 	now := p.now()
 
@@ -897,6 +1027,12 @@ func (p *Pool) Sweep(ctx context.Context) error {
 				}
 			}
 		case StateBound:
+			// **Before** the expiry bookkeeping below, which `continue`s for a slot
+			// with no recorded expiry. That is the slot shape this exists for: a
+			// session whose cap this pool was never told, holding a container that
+			// has since died. Skipping it would leave the one case unreported.
+			p.observeBoundRunner(ctx, slot)
+
 			// Recycle on the **session's** expiry.
 			//
 			// A zero expiry means this slot never recorded one. Recycle on container age
@@ -914,7 +1050,132 @@ func (p *Pool) Sweep(ctx context.Context) error {
 			}
 		}
 	}
+
+	// Records about slots that are no longer bound, or that hold a different
+	// container, describe a world that has moved on. Dropped here rather than being
+	// left to expire on their own, because the api acts on this list: a stale entry
+	// would have it release a slot that has since been recycled, and the whole point
+	// of reporting is that the report is about the pool as it is now.
+	p.pruneDeadBound()
+
 	return nil
+}
+
+// observeBoundRunner records whether a bound slot's container is still running.
+//
+// Three outcomes, and the difference between them is the whole design:
+//
+//   - **404.** The Engine says the container does not exist. That is proof, not
+//     suspicion — the only thing that could make it false is the api handing us a
+//     container id that is not this slot's, which no caller can do (`SlotIDs` keys
+//     everything by slot). Recorded at once, with no debounce.
+//   - **Any other error.** A transport failure, a 5xx, a timeout: we do not know.
+//     Unknown is not dead, and a daemon that is briefly unreachable must not be
+//     read as a pool full of corpses — that would have the api release every bound
+//     slot during one bad minute. Logged at warn, and the streak is left as it was,
+//     because an answer that is not an observation neither confirms nor clears one.
+//   - **The container is not running.** Proof of death, but not proof of *death*:
+//     Docker 26.x will answer an inspect for a container another path is mid-way
+//     through replacing with a state that is about to change, so a single
+//     observation is counted and only the second consecutive one is reported.
+//
+// The recorded observation is cleared by any running answer, so a slot that
+// recovers is not reported dead on the strength of a past observation. Nothing
+// else is touched: no state, no container, no binding.
+func (p *Pool) observeBoundRunner(ctx context.Context, slot Slot) {
+	// No container id, no observation — and this is load-bearing rather than
+	// defensive. `slot.ContainerID` is assigned at the *end* of `start`, and `Claim`
+	// binds a slot before it creates, so a claim on a containerless slot spends its
+	// whole create-and-ready window looking exactly like this. Inspecting the empty
+	// string would ask the Engine about a container named "", get a 404, and report
+	// a live claim's slot dead — during the one window where the claim is being
+	// served.
+	if slot.ContainerID == "" {
+		return
+	}
+
+	ctr, err := p.docker.InspectContainer(ctx, slot.ContainerID)
+	if err != nil {
+		if !dockerapi.IsNotFound(err) {
+			p.log.Warn("sweep: inspect of a bound runner failed, leaving the slot as it is",
+				"slot", slot.ID, "container", slot.ContainerID, "error", err)
+			return
+		}
+		// Gone, not stopped: no debounce, and the streak goes with it — the Engine
+		// cannot be about to start a container it says does not exist.
+		p.recordDeadBound(slot, "absent")
+		return
+	}
+
+	if ctr.State.Running {
+		p.mu.Lock()
+		delete(p.deadStreak, slot.ID)
+		delete(p.deadBound, slot.ID)
+		p.mu.Unlock()
+		return
+	}
+
+	p.mu.Lock()
+	p.deadStreak[slot.ID]++
+	consecutive := p.deadStreak[slot.ID]
+	p.mu.Unlock()
+	if consecutive < 2 {
+		return
+	}
+	p.recordDeadBound(slot, ctr.State.Status)
+}
+
+// recordDeadBound files one "this bound slot's runner is gone" observation, and
+// says so once per container.
+//
+// Once, because the list is swept every 30 seconds for the life of the process and
+// the slot stays in it until something changes — a repeat of the same observation
+// is not new information, and a line that repeats forever is how a real one gets
+// scrolled past. `warn`, because a bound slot with no runner is a session's export
+// that is not going to finish, and it is the only side of the pool that can say so.
+func (p *Pool) recordDeadBound(slot Slot, observed string) {
+	p.mu.Lock()
+	previous, known := p.deadBound[slot.ID]
+	// Overwritten rather than merged: the slot's container may have changed between
+	// observations, and the current one is the one this report is about.
+	p.deadBound[slot.ID] = deadBoundRunner{ContainerID: slot.ContainerID, State: observed}
+	// A container that provably does not exist needs no second observation, so the
+	// streak is cleared here rather than being left to accumulate against a slot
+	// that will never produce another one.
+	delete(p.deadStreak, slot.ID)
+	p.mu.Unlock()
+
+	// Already reported for this container: nothing new to say.
+	if known && previous.ContainerID == slot.ContainerID {
+		return
+	}
+	p.log.Warn("dead bound runner observed",
+		"slot", slot.ID,
+		"container", slot.ContainerID,
+		"state", observed,
+		"session", slot.SessionGUID,
+	)
+}
+
+// pruneDeadBound drops observations that no longer describe the pool: a slot that
+// is no longer bound, or whose container id has changed.
+//
+// Read here, at the end of the sweep, rather than from the snapshot the loop
+// iterates: the loop works on the pool as it was when the sweep began, so a slot
+// released or recycled by an earlier iteration would still look bound to its old
+// container. That is the difference between this list and a record, and the api
+// acts on it by releasing slots.
+func (p *Pool) pruneDeadBound() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for id, dead := range p.deadBound {
+		slot, ok := p.slots[id]
+		if ok && slot.State == StateBound && slot.ContainerID == dead.ContainerID {
+			continue
+		}
+		delete(p.deadBound, id)
+		delete(p.deadStreak, id)
+	}
 }
 
 // Reconcile compares the pool against the Docker daemon at boot.

@@ -608,6 +608,85 @@ describe("WAL mode", () => {
       const row = db.getSession(GUID)!;
       expect(row.state).toBe("authenticated");
     });
+
+    // The caller's own `error`, through the same data-loss guard.
+    //
+    // The sweeper's dead-runner branch names a different cause than the default
+    // string does — nothing released that runner, it died — and it is the *only*
+    // caller that passes one. Asserted against a `partial` row rather than a
+    // `running` one, because the interesting half is what the argument does **not**
+    // change: the `ELSE export_state` arm must still leave a finished, downloadable
+    // result untouched whatever string it is handed.
+    it("takes a caller's error, and still spares a finished export with it", () => {
+      const partialState = JSON.stringify({
+        state: "partial",
+        partialReason: "quota",
+        id: "artifact123",
+        notebook: "Notebook",
+        progress: null,
+        startedAt: 1234567890,
+        finishedAt: 1234567900,
+      });
+
+      db.createSession({
+        guid: GUID,
+        secretHash: hashSecret("A".repeat(43)),
+        csrfKey: generateCsrfKey(),
+        now: NOW,
+        expiresAt: NOW + 43_200_000,
+      });
+      db.run(
+        `UPDATE sessions SET state = 'exporting', runner_id = NULL,
+                         export_state = ?, artifact_id = 'artifact123'
+                       WHERE guid = ?`,
+        partialState,
+        GUID,
+      );
+
+      const changed = db.markExportStranded({
+        guid: GUID,
+        now: NOW + 1000,
+        idleExpiresAt: NOW + 50_000,
+        error: "the runner disappeared before this export finished",
+      });
+
+      expect(changed).toBe(true);
+
+      const row = db.getSession(GUID)!;
+      expect(row.state).toBe("authenticated");
+      expect(row.export_state).toBe(partialState);
+      expect(row.artifact_id).toBe("artifact123");
+    });
+
+    // And the error string itself reaches the row when the export *was* in flight —
+    // otherwise the guard half above would pass against a statement that dropped the
+    // argument on the floor.
+    it("writes the caller's error into a running export_state", () => {
+      db.createSession({
+        guid: GUID,
+        secretHash: hashSecret("A".repeat(43)),
+        csrfKey: generateCsrfKey(),
+        now: NOW,
+        expiresAt: NOW + 43_200_000,
+      });
+      db.run(
+        `UPDATE sessions SET state = 'exporting', runner_id = NULL,
+                         export_state = ? WHERE guid = ?`,
+        '{"state":"running","id":"artifact123","notebook":"Notebook"}',
+        GUID,
+      );
+
+      db.markExportStranded({
+        guid: GUID,
+        now: NOW + 1000,
+        idleExpiresAt: NOW + 50_000,
+        error: "the runner disappeared before this export finished",
+      });
+
+      const parsed = JSON.parse(db.getSession(GUID)!.export_state!);
+      expect(parsed.state).toBe("failed");
+      expect(parsed.error).toBe("the runner disappeared before this export finished");
+    });
   });
 });
 

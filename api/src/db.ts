@@ -417,8 +417,27 @@ export class Db {
    *
    * Returns true when a row was changed, so a caller can distinguish "reset"
    * from "no-op".
+   *
+   * ## Why `error` is an argument
+   *
+   * Because the cause is not always this branch's. A session can reach
+   * `state: 'exporting'` with a runner it never had — the slot was released before
+   * the export began — and it can reach it with a runner that *died under it*, which
+   * is a different failure with a different remedy, and one a user staring at a
+   * frozen progress card is entitled to be told about in words. The default is the
+   * original string, so every existing caller and every existing assertion on the
+   * stored `export_state` is byte-identical; only the new caller passes one.
+   *
+   * The guard is on the SQL either way. `state = 'exporting' AND runner_id IS NULL`
+   * is what makes this safe to call twice, and the `ELSE export_state` arm is still
+   * the data-loss guard for a session whose export already finished.
    */
-  markExportStranded(input: { readonly guid: string; readonly now: number; readonly idleExpiresAt: number }): boolean {
+  markExportStranded(input: {
+    readonly guid: string;
+    readonly now: number;
+    readonly idleExpiresAt: number;
+    readonly error?: string;
+  }): boolean {
     return (
       this.run(
         `UPDATE sessions
@@ -438,11 +457,38 @@ export class Db {
          WHERE guid = ? AND state = 'exporting' AND runner_id IS NULL`,
         input.now,
         input.idleExpiresAt,
-        "the runner was released before this export finished",
+        input.error ?? "the runner was released before this export finished",
         input.now,
         input.guid,
       ) > 0
     );
+  }
+
+  /**
+   * clearSessionRunner drops a session's binding to a runner slot.
+   *
+   * ## Why this is its own statement, and why it exists
+   *
+   * `releaseRunner` frees the `runners` row and **does not** touch
+   * `sessions.runner_id`. That is correct for every ordinary release, where the
+   * caller's next statement is the one that unbinds the session — but it meant that
+   * an api that released a dead runner's slot had *released a slot it still claimed*.
+   *
+   * `sessions.runner_id` is the api's only statement of which slot a session holds,
+   * so a row left pointing at a slot the orchestrator has already given back is a
+   * slot the pool will hand to somebody else while this session still believes it
+   * owns a runner. On a two-slot pool that is the lockout: `claimRunner` cannot
+   * offer a row that is still `active`, so the session that kept its phantom
+   * binding is the one that can never get another.
+   *
+   * It is one statement on purpose. `state` is **not** written here: this says "you
+   * hold no slot", not "your session is over". The state reset belongs to
+   * `markExportStranded`, which carries the guards — and which requires
+   * `runner_id IS NULL` to fire at all, so the two statements have to stay in that
+   * order for the repair to happen.
+   */
+  clearSessionRunner(guid: string): void {
+    this.run(`UPDATE sessions SET runner_id = NULL WHERE guid = ?`, guid);
   }
 
   /**

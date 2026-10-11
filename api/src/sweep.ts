@@ -156,6 +156,21 @@ export interface SweepReport {
    */
   exportsStranded: number;
   /**
+   * Exports ended because their runner's container died, and whose state was reset.
+   *
+   * Distinct from `exportsStranded` above, which is the same repair for a session
+   * that had **no** runner row: this one had a runner id and a `runners` row, both
+   * intact, both naming a slot whose container the orchestrator had seen die. That
+   * is the shape nothing could see — the api skips `exporting` sessions to protect
+   * live ones, and the api's own records were all consistent and all wrong.
+   *
+   * Counted because the two are different repairs for different failures, and an
+   * operator reading "one stranded export" would look for the other one: a row with
+   * no `runner_id` is a bookkeeping gap this sweep closed itself, while a row that
+   * pointed at a dead container is a runner that exited mid-walk.
+   */
+  exportsRunnerDied: number;
+  /**
    * Runners released because the session's login was refused.
    *
    * Counted because 'a session went idle' and 'a login was rejected' look identical from
@@ -715,6 +730,49 @@ export class PoolBinder {
     this.#db.releaseRunner(session.runner_id);
     return true;
   }
+
+  /**
+   * releaseForDeadRunner gives back a slot whose runner the orchestrator has seen die.
+   *
+   * The same verb and the same tolerance as the three above — a `conflict` means the
+   * slot is already gone or unbound, which is precisely the state this caller wanted,
+   * so it is success — but it is **not** a copy of any of them: it writes nothing to
+   * the session row.
+   *
+   * ## Why the session row is left alone
+   *
+   * Every caller above owns the session's fate and writes it here. This one does not.
+   * The caller is the sweep's dead-runner branch, and its job is two more statements
+   * in a fixed order: `clearSessionRunner` (which unsticks the slot from this
+   * session) and then `markExportStranded` (which resets the state, behind a
+   * `state = 'exporting'` guard). Writing `state = 'authenticated'` from here would
+   * consume that guard before it was ever tested, so the second statement would
+   * change nothing and the repair would fail silently — leaving the session
+   * refusing every future export, which is the defect the branch exists to remove.
+   *
+   * `releaseRunner` **is** called, and it is what keeps the slot claimable: the
+   * orchestrator's slot is a pool position, and a `runners` row left `active` is
+   * invisible to `claimRunner`'s `WHERE status = 'idle' AND session_guid IS NULL`.
+   * So without it this repair would end the wedged export and wedge the slot
+   * instead — the same outage, one field over.
+   */
+  async releaseForDeadRunner(session: SessionRow): Promise<boolean> {
+    if (session.runner_id === null) return false;
+    const released = await this.#orchestrator.release(session.runner_id);
+    if (!released.ok && released.error.kind !== "conflict") {
+      // Retain everything. The caller's `continue` is what makes that stick: clearing
+      // the row after a release that may not have happened orphans the slot — freed
+      // on neither side, and re-claimable by whoever gets there next.
+      this.#log.warn("release of a dead runner's slot failed, retained for the next sweep", {
+        session: session.guid,
+        runner: session.runner_id,
+        error: released.error.kind,
+      });
+      return false;
+    }
+    this.#db.releaseRunner(session.runner_id);
+    return true;
+  }
 }
 
 /**
@@ -744,6 +802,7 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
     skippedErasing: 0,
     exportsHeld: 0,
     exportsStranded: 0,
+    exportsRunnerDied: 0,
     authFailedReleased: 0,
     orphanSlotsReleased: 0,
     phantomRowsCleaned: 0,
@@ -768,6 +827,19 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
   // shrunk leaves rows behind — which is what §2.5's reconciler is for, and it
   // means a slot released mid-session is not deleted out from under it.
   const stats = await options.orchestrator.stats();
+  // **Which slots the orchestrator has seen lose their runner**, taken from the
+  // snapshot this tick already has rather than from a second `/stats`. One opinion
+  // per tick: a second call would be a second opinion taken after the session loop,
+  // and this branch's whole safety argument rests on the list matching the state the
+  // loop is walking.
+  //
+  // `stats.ok` first, then the field. A failed `/stats` is "we do not know", never
+  // "none are dead" — treating an orchestrator outage as a clean bill of health is
+  // how a reachable-but-wrong reading becomes a silent one. And `deadSlots === undefined`
+  // is the rolling deploy: an orchestrator that predates the field reports nothing,
+  // which is read as `[]`.
+  const deadSlots =
+    stats.ok && stats.value.deadSlots !== undefined ? stats.value.deadSlots : [];
   if (stats.ok && stats.value.slotIds !== undefined) {
     const pool = syncPool(db, stats.value.slotIds);
     if (pool.added > 0) {
@@ -912,6 +984,73 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
         // (App.tsx:293). Not `export-aborted`, which renders as "Export stopped
         // early" — a user-action framing that is false here, and the same pushback
         // routes.ts:1152 records for a quota or disk abort.
+        sse.emit(session.guid, "session-status", { state: "authenticated" });
+      }
+      continue;
+    }
+
+    // **An export whose runner died under it is stranded too — and this sweep could
+    // not see it.**
+    //
+    // The branch above repairs a session with no runner at all. This one repairs the
+    // shape that branch cannot reach: the session has a `runner_id`, a `runners` row
+    // says that slot is bound, and both records are *true* — of a container that no
+    // longer exists. The runner is the only writer of `export-done` /
+    // `export-partial`, so there is no one left to finish the walk, and yet:
+    //
+    //   - `export_state` still says `queued`/`running`, so `POST /api/export` refuses
+    //     every future export with a 409.
+    //   - `state` is still `exporting`, so the hold branch below skips the session
+    //     and its idle deadline never applies.
+    //
+    // Up to 12 hours, from one container that exited. Only the orchestrator holds the
+    // Engine and can see it; only this process holds the session rows and can act on
+    // it. `deadSlots` is the whole conversation between them, and it is deliberately
+    // narrow evidence: a slot the orchestrator says lost its container, named by
+    // slot id rather than by a container identity this process is not allowed to
+    // hold (§2.1).
+    //
+    // Placed **between** the stranded branch and the export hold. Before the hold, or
+    // the hold `continue`s past it and the session keeps its 409; after the stranded
+    // branch would read as a widening of that one, which this is not — that branch's
+    // `runner_id IS NULL` is deliberate and its own comment says so.
+    if (
+      session.state === "exporting" &&
+      session.runner_id !== null &&
+      deadSlots.includes(session.runner_id)
+    ) {
+      // Order is the whole repair. The slot goes first: `clearSessionRunner` is what
+      // `markExportStranded`'s `runner_id IS NULL` guard tests, so without it the
+      // second statement is a no-op and nothing changes — and, worse, the api keeps
+      // claiming a slot the orchestrator has handed back, which on a two-slot pool is
+      // the lockout one field over.
+      if (!(await binder.releaseForDeadRunner(session))) {
+        // Any release failure that is not a conflict. **Continue with the row intact.**
+        // Clearing it anyway would orphan the slot: not released on the orchestrator's
+        // side, not bound on this one, and the next claimable session to arrive takes
+        // a container somebody is still using.
+        continue;
+      }
+      db.clearSessionRunner(session.guid);
+      const changed = db.markExportStranded({
+        guid: session.guid,
+        now,
+        idleExpiresAt: now + TTL.authenticatedIdle,
+        // The user's own cause, not this branch's. The default string says the runner
+        // was *released*; nothing released it. It was killed, and the card the browser
+        // is showing is frozen on a walk that can never be resumed.
+        error: "the runner disappeared before this export finished",
+      });
+      if (changed) {
+        report.exportsRunnerDied++;
+        log.warn("export reset; its runner's container died", {
+          session: session.guid,
+          slot: session.runner_id,
+        });
+        // Same event as the branch above and for the same reason: the frontend is
+        // SSE-only, and the one writer that would have ended the progress card is
+        // precisely what died. `session-status` tells the client to re-read the
+        // snapshot (App.tsx:293).
         sse.emit(session.guid, "session-status", { state: "authenticated" });
       }
       continue;

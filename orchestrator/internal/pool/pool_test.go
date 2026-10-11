@@ -1920,3 +1920,299 @@ func TestAnAbortedClaimIsLoggedWithItsPhase(t *testing.T) {
 		t.Errorf("an aborted claim logged nothing naming the cancellation:\n%s", lines.String())
 	}
 }
+
+// ---- dead bound runners ------------------------------------------------------
+//
+// A bound slot whose container died used to be invisible to both sides. The api's
+// sweeper skips `exporting` sessions on purpose — that branch is what stops a long
+// export losing its runner to the idle TTL — so a session whose runner exited
+// mid-export kept its row, its `runner_id` and a `runners` row saying the slot was
+// bound, and every future export was refused with a 409 until the 12-hour absolute
+// cap. Nothing was inconsistent; everything was useless. Only the orchestrator can
+// see the container is gone, so `Sweep` reports what the Engine said and the api
+// acts on it.
+
+const deadRunnerGUID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+
+// boundSlotOn installs one bound slot backed by a container the fake owns.
+func boundSlotOn(p *Pool, d *fakeDaemon, slotID, guid string, running bool) *fakeContainer {
+	t.Helper()
+	ctr := d.add(slotID, running, map[string]string{
+		"msout.role":         "runner",
+		"msout.slot.id":      slotID,
+		"msout.session.guid": guid,
+	})
+	p.slots[slotID] = &Slot{
+		ID: slotID, State: StateBound, ContainerID: ctr.id,
+		CreatedAt: p.now(), SessionGUID: guid,
+		// An hour out, so the expiry branch below the observation is not what
+		// these tests are exercising.
+		SessionExpiresAt: p.now().Add(time.Hour),
+	}
+	return ctr
+}
+
+// A container the Engine says does not exist is reported on the **first** sweep.
+//
+// No debounce, and the asymmetry with the not-running case below is the point: a
+// 404 is the Engine answering a question it cannot be wrong about, while a stopped
+// container is a state another path may still be changing.
+func TestSweepReportsABoundSlotWhoseContainerIsGone(t *testing.T) {
+	cfg := testConfig(t, 1)
+	d := newFakeDaemon()
+	p := New(cfg, d, discardLog())
+	now := time.Now()
+	p.now = func() time.Time { return now }
+
+	ctr := boundSlotOn(p, d, "slot-1", deadRunnerGUID, true)
+	// Removed behind the pool's back — an operator's `docker rm`, a prune, or a
+	// daemon whose store did not survive. Whatever caused it, the slot still holds
+	// the id and the Engine still says the container is not there.
+	if err := d.RemoveContainer(t.Context(), ctr.id); err != nil {
+		t.Fatalf("remove container: %v", err)
+	}
+
+	if err := p.Sweep(t.Context()); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	if got := p.DeadBoundSlots(); len(got) != 1 || got[0] != "slot-1" {
+		t.Fatalf("dead bound slots = %v, want [slot-1] on the first sweep", got)
+	}
+	// Through `/stats` too, because that is how the api will actually read it.
+	if got := p.Stats().DeadSlots; len(got) != 1 || got[0] != "slot-1" {
+		t.Errorf("Stats().DeadSlots = %v, want [slot-1]", got)
+	}
+	// **A report, not a transition.** The slot is untouched: the api is the only
+	// side that can tell a dead runner from a busy one, so the pool does not
+	// unbind, replace or destroy anything on the strength of an observation.
+	slot := p.slots["slot-1"]
+	if slot.State != StateBound || slot.SessionGUID != deadRunnerGUID || slot.ContainerID != ctr.id {
+		t.Errorf("slot after the report = %+v, want bound to %s with container %s",
+			slot, deadRunnerGUID, ctr.id)
+	}
+}
+
+// An inspect that fails for any other reason is **not** death.
+//
+// Transport failure, 5xx, timeout: the pool does not know, and unknown is not dead.
+// Reading it as dead would have the api release every bound slot during one bad
+// minute of Engine trouble — turning a blip into an outage in the direction that
+// destroys work.
+func TestSweepDoesNotReportABoundSlotWhoseInspectFailed(t *testing.T) {
+	cfg := testConfig(t, 1)
+	d := newFakeDaemon()
+	p := New(cfg, d, discardLog())
+	now := time.Now()
+	p.now = func() time.Time { return now }
+
+	ctr := boundSlotOn(p, d, "slot-1", deadRunnerGUID, true)
+	d.failNext("inspect", errors.New("docker engine (/var/run/docker.sock): dial unix: connection refused"))
+
+	if err := p.Sweep(t.Context()); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	if got := p.DeadBoundSlots(); len(got) != 0 {
+		t.Errorf("dead bound slots = %v, want none: an inspect that failed is not an "+
+			"observation, and the api releases every slot it is told about", got)
+	}
+	slot := p.slots["slot-1"]
+	if slot.State != StateBound || slot.ContainerID != ctr.id {
+		t.Errorf("slot = %+v, want untouched: a daemon we could not reach has changed nothing", slot)
+	}
+}
+
+// The debounce: running is never reported, and a stopped container is reported on
+// the **second** consecutive sweep.
+//
+// Docker 26.x answers an inspect for a container that has just been stopped — or
+// one a `recycle` is mid-way through replacing — with a state that is about to
+// change. One observation of "not running" would then have the api release a slot
+// out from under a runner that is coming back, so the first is counted and thrown
+// away. The cost is one sweep interval (30 s) on the case this exists for.
+func TestSweepReportsAStoppedBoundRunnerOnlyOnTheSecondSweep(t *testing.T) {
+	cfg := testConfig(t, 1)
+	d := newFakeDaemon()
+	p := New(cfg, d, discardLog())
+	now := time.Now()
+	p.now = func() time.Time { return now }
+
+	ctr := boundSlotOn(p, d, "slot-1", deadRunnerGUID, true)
+
+	if err := p.Sweep(t.Context()); err != nil {
+		t.Fatalf("first sweep: %v", err)
+	}
+	if got := p.DeadBoundSlots(); len(got) != 0 {
+		t.Fatalf("dead bound slots = %v on a running container, want none", got)
+	}
+
+	// The runner exits.
+	if err := d.StopContainer(t.Context(), ctr.id, 0); err != nil {
+		t.Fatalf("stop container: %v", err)
+	}
+
+	if err := p.Sweep(t.Context()); err != nil {
+		t.Fatalf("second sweep: %v", err)
+	}
+	if got := p.DeadBoundSlots(); len(got) != 0 {
+		t.Fatalf("dead bound slots = %v after one observation of a stopped container, "+
+			"want none: Docker 26.x can report a just-stopped container in a state "+
+			"that is about to change", got)
+	}
+
+	if err := p.Sweep(t.Context()); err != nil {
+		t.Fatalf("third sweep: %v", err)
+	}
+	if got := p.DeadBoundSlots(); len(got) != 1 || got[0] != "slot-1" {
+		t.Errorf("dead bound slots = %v, want [slot-1] on the second consecutive "+
+			"observation", got)
+	}
+}
+
+// An idle slot with a dead container is **not** reported, however dead it is.
+//
+// The api releases whatever appears in this list, and an idle slot belongs to
+// nobody — there is no session whose `runner_id` could name it, so a report would
+// be a slot released on the api's initiative rather than on a session's. The
+// liveness check exists to end an *export*; it is not a reaper for the pool.
+// Swept twice, so the assertion is about the state filter rather than about the
+// debounce happening to hide it.
+func TestSweepDoesNotReportAnIdleSlotWithADeadContainer(t *testing.T) {
+	cfg := testConfig(t, 1)
+	d := newFakeDaemon()
+	p := New(cfg, d, discardLog())
+	now := time.Now()
+	p.now = func() time.Time { return now }
+
+	ctr := d.add("slot-1", false, map[string]string{"msout.role": "runner", "msout.slot.id": "slot-1"})
+	p.slots["slot-1"] = &Slot{
+		ID: "slot-1", State: StateIdle, ContainerID: ctr.id, CreatedAt: now,
+	}
+
+	for i := 0; i < 2; i++ {
+		if err := p.Sweep(t.Context()); err != nil {
+			t.Fatalf("sweep %d: %v", i+1, err)
+		}
+	}
+
+	if got := p.DeadBoundSlots(); len(got) != 0 {
+		t.Errorf("dead bound slots = %v, want none: an idle slot is bound to no "+
+			"session, and the api must not release slots it does not own", got)
+	}
+}
+
+// A bound slot with **no container id** is skipped without an inspect.
+//
+// Load-bearing, not defensive: `Claim` binds a slot *before* it creates, and
+// `slot.ContainerID` is only assigned at the end of `start`, so a claim in flight
+// looks exactly like this for its whole create-and-ready window. Inspecting the
+// empty string would ask the Engine about a container named "", get a 404 — the
+// strongest possible evidence of death — and report a live claim's slot dead
+// during the one moment the claim is being served.
+//
+// Asserted on the daemon's call log, not on the report: a slot that is skipped
+// and a slot that is inspected-and-found-fine produce the same empty report, and
+// only one of them is the behaviour being pinned here.
+func TestSweepSkipsABoundSlotWithNoContainer(t *testing.T) {
+	cfg := testConfig(t, 1)
+	d := newFakeDaemon()
+	p := New(cfg, d, discardLog())
+	now := time.Now()
+	p.now = func() time.Time { return now }
+
+	// One claim in flight — bound, no container id — and one bound slot whose
+	// container is provably gone. Exactly one inspect may happen, and it must be
+	// the one that finds a container: if the containerless slot were inspected it
+	// would be reported dead too.
+	p.slots["slot-1"] = &Slot{
+		ID: "slot-1", State: StateBound, SessionGUID: deadRunnerGUID,
+		CreatedAt: now, SessionExpiresAt: now.Add(time.Hour),
+	}
+	boundSlotOn(p, d, "slot-2", "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", true)
+	if err := d.RemoveContainer(t.Context(), p.slots["slot-2"].ContainerID); err != nil {
+		t.Fatalf("remove container: %v", err)
+	}
+
+	if err := p.Sweep(t.Context()); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	if got := d.callsFor("inspect"); len(got) != 1 {
+		t.Errorf("inspect calls = %d, want 1: a bound slot with no container id is a "+
+			"claim in flight, and inspecting it would report a live claim dead", len(got))
+	}
+	if got := p.DeadBoundSlots(); len(got) != 1 || got[0] != "slot-2" {
+		t.Errorf("dead bound slots = %v, want [slot-2] only", got)
+	}
+}
+
+// The report has to be findable in a log, and name the three things an operator
+// needs: which slot, which container, and what the Engine actually said.
+func TestSweepLogsADeadBoundRunnerWithItsSlotContainerAndState(t *testing.T) {
+	cfg := testConfig(t, 1)
+	d := newFakeDaemon()
+
+	var lines bytes.Buffer
+	p := New(cfg, d, slog.New(slog.NewJSONHandler(&lines, nil)))
+	now := time.Now()
+	p.now = func() time.Time { return now }
+
+	ctr := boundSlotOn(p, d, "slot-1", deadRunnerGUID, true)
+	if err := d.StopContainer(t.Context(), ctr.id, 0); err != nil {
+		t.Fatalf("stop container: %v", err)
+	}
+	// Twice: the first observation is the debounce, the second is the report.
+	for i := 0; i < 2; i++ {
+		if err := p.Sweep(t.Context()); err != nil {
+			t.Fatalf("sweep %d: %v", i+1, err)
+		}
+	}
+
+	var found bool
+	for _, line := range strings.Split(strings.TrimSpace(lines.String()), "\n") {
+		if !strings.Contains(line, "dead bound runner observed") {
+			continue
+		}
+		found = true
+		var entry struct {
+			Level     string `json:"level"`
+			Slot      string `json:"slot"`
+			Container string `json:"container"`
+			State     string `json:"state"`
+		}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("log line is not JSON: %v (%s)", err, line)
+		}
+		if entry.Level != "WARN" {
+			t.Errorf("level = %q, want WARN: a bound slot with no runner is an export "+
+				"that will not finish, and it has to be findable in a wall of INFO lines",
+				entry.Level)
+		}
+		if entry.Slot != "slot-1" {
+			t.Errorf("slot = %q, want slot-1: the api releases by slot, not by container", entry.Slot)
+		}
+		if entry.Container != ctr.id {
+			t.Errorf("container = %q, want %q: `docker ps -a` is what an operator checks",
+				entry.Container, ctr.id)
+		}
+		if entry.State != "exited" {
+			t.Errorf("state = %q, want the Engine's own `exited`: the line exists so "+
+				"the difference between a stopped and an absent container is readable", entry.State)
+		}
+	}
+	if !found {
+		t.Errorf("a dead bound runner logged nothing:\n%s", lines.String())
+	}
+
+	// Once, not once per sweep. The slot stays in the list until something changes,
+	// and a line that repeats every 30 seconds for the life of the process is how
+	// a real one gets scrolled past.
+	if err := p.Sweep(t.Context()); err != nil {
+		t.Fatalf("fourth sweep: %v", err)
+	}
+	if got := strings.Count(lines.String(), "dead bound runner observed"); got != 1 {
+		t.Errorf("the dead-runner line was logged %d times, want 1: it is not new "+
+			"information after the first time, and it repeats for the life of the slot", got)
+	}
+}

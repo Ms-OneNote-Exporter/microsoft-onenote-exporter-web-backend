@@ -216,6 +216,29 @@ export interface OrchestratorStats {
   readonly boundSessions?: Readonly<Record<string, string>>;
 
   /**
+   * Bound slots whose container the orchestrator has seen die: `["slot-1"]`.
+   *
+   * `boundSessions` says a slot is *held*; nothing said whether the runner behind it
+   * was still there. So a session whose export died with its container kept its row,
+   * its `runner_id` and a `runners` row that all agreed the slot was fine — and
+   * `POST /api/export` refused every future export with a 409 until the 12-hour
+   * absolute cap, because the sweeper skips `exporting` sessions to protect live
+   * ones. Only the orchestrator holds the Engine, so it is the only side that can
+   * see this; only this process holds the session rows, so it is the only side that
+   * can act on it.
+   *
+   * Optional for the same reason `slotIds` is: a rolling deploy briefly pairs this
+   * api with an orchestrator that predates the field, and during that window the
+   * absence is treated as `[]` — "this orchestrator reports none dead", which is
+   * today's behaviour, with no regression. The field is omitted entirely when
+   * nothing is dead, so a healthy pool marshals exactly as it did before it existed.
+   *
+   * Slot ids, never container ids: §2.1 restricts the api from holding container
+   * identities it cannot verify, and a slot name is how it asks for a slot.
+   */
+  readonly deadSlots?: readonly string[];
+
+  /**
    * Why the last pool top-up failed, when it did.
    *
    * Optional because an orchestrator predating the field simply does not report it.

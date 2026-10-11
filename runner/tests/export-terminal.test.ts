@@ -29,6 +29,11 @@
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+// Taken from `node:timers` rather than the global on purpose: a fake clock
+// replaces `globalThis.setTimeout`, and the bounded read below needs a bound that
+// is real. Importing the module sidesteps the fake entirely, which is what makes
+// it safe to fake the heartbeat's clock and still be able to fail a hanging read.
+import { setTimeout as realSetTimeout } from "node:timers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { runExport } from "@msout/microsoft-onenote-export-notebook";
@@ -270,5 +275,255 @@ describe("the export terminal", () => {
     expect(terminals[0]!.notebook).toBe("MS is great");
     // And no internals on the wire — the cause belongs in the api's log.
     expect(JSON.stringify(terminals[0])).not.toContain("Chromium");
+  });
+});
+
+/**
+ * The heartbeat: the last known counts, re-published while the walk runs.
+ *
+ * ## What it is and what it is not
+ *
+ * The exporter announces **once per section** (`exporter.js:1339`), so "MS is
+ * great" — one section — produced exactly one frame in the last far-side run,
+ * seconds before its terminal, and "The Complete Notebook" (also one section,
+ * 29 pages) is the same shape. The api now persists every frame, so that frame is
+ * not lost; what is still missing is anything at all between it and the terminal.
+ *
+ * The heartbeat fills that gap by re-publishing the counts the exporter **last
+ * reported**, on the api's existing vocabulary. It cannot invent counts inside a
+ * section — there are none to invent — and the comment on it says so, because a
+ * heartbeat that fabricated a live-looking count would be the exact lie this
+ * change exists to remove.
+ *
+ * Driven through `app.inject` rather than a socket so the fake clock can own the
+ * interval: fifteen seconds of real time per assertion is not a test suite.
+ */
+describe("the export heartbeat", () => {
+  const HEARTBEAT_MS = 15_000;
+
+  const started: Array<{ app: Awaited<ReturnType<typeof buildApp>>; close: () => Promise<void> }> =
+    [];
+
+  /**
+   * Fake **only** the interval.
+   *
+   * Fifteen seconds of real time per assertion is not a test suite, and the
+   * heartbeat's interval is the whole mechanism — so it is the only thing that has
+   * to move. Everything else stays real, which is what lets the route's dynamic
+   * `import()` of the mocked package resolve and the assertions read a real
+   * socket: faking `setImmediate` too stalls the connection mid-handshake, and
+   * the failure is a test timeout that says nothing about the heartbeat.
+   */
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    for (const entry of started.splice(0)) await entry.close();
+  });
+
+  /** Starts the export through the real route, over a real socket. */
+  async function start(): Promise<string> {
+    const app = buildApp({
+      dataRoot,
+      port: 0,
+      host: "127.0.0.1",
+      token: TOKEN,
+      credentialBodyLimit: 4096,
+      ringSize: 64,
+    } as never);
+    const address = await app.listen({ port: 0, host: "127.0.0.1" });
+    started.push({ app, close: () => app.close() });
+
+    const response = await fetch(`${address}/sessions/${GUID}/exports`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-runner-token": TOKEN },
+      body: JSON.stringify({ id: ID, notebook: "The Complete Notebook" }),
+    });
+    if (response.status !== 202) {
+      throw new Error(`export route answered ${response.status}: ${await response.text()}`);
+    }
+    return address;
+  }
+
+  /**
+   * Every frame the hub holds for this session, read back through the real route.
+   *
+   * `/events?since=0` replays the ring, so this is what a client would have
+   * received rather than an internal collection — and the replay is written the
+   * moment the connection is accepted, so one read is enough.
+   */
+  async function frames(address: string): Promise<Array<Record<string, unknown>>> {
+    const controller = new AbortController();
+    let text = "";
+    try {
+      const response = await fetch(`${address}/events?guid=${GUID}&since=0`, {
+        signal: controller.signal,
+        headers: { "x-runner-token": TOKEN },
+      });
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+
+      /**
+       * One read, bounded in **real** time.
+       *
+       * The route writes the whole replay **before** it subscribes, so a session
+       * with history answers at once. A session with *no* history writes nothing
+       * and simply holds the stream open — so an unbounded read would hang on
+       * exactly the case worth testing rather than fail on it. `realSetTimeout`
+       * is what makes the bound real under a fake clock.
+       */
+      const next = (): Promise<{ text: string } | "timeout" | "end"> =>
+        Promise.race([
+          reader
+            .read()
+            .then(({ value, done }) =>
+              done ? "end" : { text: decoder.decode(value, { stream: true }) },
+            )
+            // The read that loses the race is still outstanding; the abort below
+            // rejects it, and it must not reach the process as an unhandled one.
+            .catch(() => "end"),
+          new Promise<"timeout">((resolve) => realSetTimeout(() => resolve("timeout"), 250)),
+        ]);
+
+      for (;;) {
+        const chunk = await next();
+        if (chunk === "timeout" || chunk === "end") break;
+        text += chunk.text;
+        // A complete frame is a `\n\n`, and the replay ends on one because
+        // `formatSse` terminates every event with a blank line.
+        if (text.endsWith("\n\n")) break;
+      }
+    } catch {
+      // An abort is the normal way out of a stream that never ends.
+    }
+    controller.abort();
+
+    const out: Array<Record<string, unknown>> = [];
+    for (const frame of text.split("\n\n")) {
+      if (frame.trim() === "" || frame.startsWith(":")) continue;
+      for (const line of frame.split("\n")) {
+        if (!line.startsWith("data: ")) continue;
+        try {
+          out.push(JSON.parse(line.slice("data: ".length)) as Record<string, unknown>);
+        } catch {
+          // A frame that is not JSON is nothing this test is about.
+        }
+      }
+    }
+    return out;
+  }
+
+  it("re-publishes the last known counts, in the api's own vocabulary", async () => {
+    // One section, one frame — the whole shape this exists for. The walk then
+    // hangs, because a real one is still running while the gaps are open.
+    vi.mocked(runExport).mockImplementation((options: Record<string, unknown>) => {
+      const onEvent = options.onEvent as (e: Record<string, unknown>) => void;
+      onEvent({ type: "export-started", id: ID });
+      onEvent({
+        type: "export-progress",
+        id: ID,
+        progress: { pages: 29, sections: 1, assets: 8 },
+      });
+      return new Promise(() => {}) as never;
+    });
+
+    const address = await start();
+    expect((await frames(address)).filter((f) => f.type === "export-progress")).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(HEARTBEAT_MS);
+
+    const progress = (await frames(address)).filter((f) => f.type === "export-progress");
+    expect(progress).toHaveLength(2);
+    // **The same counts, and the same shape the api already maps.** A heartbeat
+    // with its own field names would be a second contract for one piece of
+    // information, which is how a client ends up reading a field nobody writes.
+    expect(progress[1]).toEqual({
+      type: "export-progress",
+      id: ID,
+      progress: { pages: 29, sections: 1, assets: 8 },
+    });
+  });
+
+  it("keeps going, and tracks a newer frame when one arrives", async () => {
+    // A notebook of several sections: one frame per section, silence between. The
+    // heartbeat's job is the silence; this asserts it does not fill the gap with
+    // a count it made up while a section is still running.
+    let section = 1;
+    vi.mocked(runExport).mockImplementation((options: Record<string, unknown>) => {
+      const onEvent = options.onEvent as (e: Record<string, unknown>) => void;
+      onEvent({
+        type: "export-progress",
+        id: ID,
+        progress: { pages: section * 5, sections: section, assets: section },
+      });
+      section += 1;
+      return new Promise(() => {}) as never;
+    });
+
+    const address = await start();
+    await vi.advanceTimersByTimeAsync(HEARTBEAT_MS);
+    await vi.advanceTimersByTimeAsync(HEARTBEAT_MS);
+
+    // One frame from the package, then the heartbeat re-publishing it.
+    const progress = (await frames(address)).filter((f) => f.type === "export-progress");
+    expect(progress).toHaveLength(3);
+    // Every one of them carries the counts the exporter actually reported. A
+    // heartbeat that invented a rising count here would be a card moving while
+    // nothing was exported — the exact lie the api's `progress: null` exists to
+    // keep it from telling.
+    for (const frame of progress) {
+      expect(frame.progress).toEqual({ pages: 5, sections: 1, assets: 1 });
+    }
+  });
+
+  it("publishes nothing before the first frame, rather than inventing a zero", async () => {
+    // Before any `export-progress` there are no *measured* counts, and `{0,0,0}`
+    // on a timer is a measurement nobody made. This is the api's `progress: null`
+    // ("unknown") rule arriving from the other side, and getting it wrong here
+    // would put the card's frozen zeros back on a cadence.
+    // A section that has not closed yet: the exporter has said nothing at all, so
+    // there are no measured counts to re-publish. `export-started` is published so
+    // the ring is not empty and the read below is answerable.
+    vi.mocked(runExport).mockImplementation((options: Record<string, unknown>) => {
+      const onEvent = options.onEvent as (e: Record<string, unknown>) => void;
+      onEvent({ type: "export-started", id: ID });
+      return new Promise(() => {}) as never;
+    });
+
+    const address = await start();
+    await vi.advanceTimersByTimeAsync(HEARTBEAT_MS * 3);
+
+    const published = (await frames(address)).filter((f) => f.type === "export-progress");
+    // Before any `export-progress` there are no *measured* counts, and `{0,0,0}`
+    // on a timer is a measurement nobody made. This is the api's `progress: null`
+    // ("unknown") rule arriving from the other side, and getting it wrong here
+    // would put the card's frozen zeros back on a cadence.
+    expect(published).toHaveLength(0);
+  });
+
+  it("stops with the export, so a finished walk does not look live", async () => {
+    vi.mocked(runExport).mockImplementation(async (options: Record<string, unknown>) => {
+      const onEvent = options.onEvent as (e: Record<string, unknown>) => void;
+      onEvent({ type: "export-progress", id: ID, progress: { pages: 29, sections: 1, assets: 8 } });
+      onEvent({ type: "export-done", id: ID, notebook: "The Complete Notebook" });
+      return packageStats({ totalPages: 29, totalSections: 1, totalAssets: 8, failedPages: 1 });
+    });
+
+    const address = await start();
+    // Let the detached export settle so its `finally` has run.
+    await vi.advanceTimersByTimeAsync(0);
+
+    const before = (await frames(address)).filter((f) => f.type === "export-progress").length;
+    await vi.advanceTimersByTimeAsync(HEARTBEAT_MS * 4);
+
+    const after = (await frames(address)).filter((f) => f.type === "export-progress").length;
+    // One from the package, none from the clock. A heartbeat that outlived its
+    // walk would re-publish the final counts for the rest of the session — a
+    // live-looking card over an export that finished minutes ago, and
+    // indistinguishable from one still going.
+    expect(before).toBe(1);
+    expect(after).toBe(1);
   });
 });

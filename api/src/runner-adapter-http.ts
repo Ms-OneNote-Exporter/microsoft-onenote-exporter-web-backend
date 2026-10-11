@@ -208,6 +208,50 @@ export interface HttpRunnerAdapterOptions {
    */
   readonly onNotebooksListed?: (sessionId: string, names: readonly string[]) => void;
   /**
+   * Called once per `export-progress` frame, with the counts-so-far.
+   *
+   * Present for the same reason as `onNotebooksListed`, and missing for the same
+   * length of time: `export-progress` was published to the SSE hub and
+   * **discarded** — the browser saw the numbers move while a refresh read a row
+   * that still said `{pages: 0, sections: 0, assets: 0}`, because the api wrote
+   * that zero once at queue time and never again until the walk ended. The card
+   * said "0 pages, 0 sections, 0 assets so far" for the whole export because the
+   * only thing feeding it was a stream a refresh discards.
+   *
+   * ## The adapter stays db-free
+   *
+   * A narrow callback, not a `Db` handle, for the reason `onAuthOutcome` and
+   * `onNotebooksListed` are callbacks: this module is transport. It knows the
+   * runner's wire format and nothing about storage, and the moment it opens its
+   * own statements there is a second implementation of "where does a session's
+   * state live" in the component whose whole job is to know nothing else.
+   *
+   * ## It fires once per frame, not once per subscriber
+   *
+   * `#handleFrame` runs on the pump, before any hub delivery, so the count is a
+   * property of the frame and not of how many browsers are attached. Two
+   * subscribers must not double a database write, and neither must the runner's
+   * own frame count be mistaken for the callback's.
+   *
+   * ## **A throw here is a reconnect loop**
+   *
+   * `#handleFrame` is called inside `#pump`'s `try`. A rejection there is caught
+   * by the pump's backoff handler, the stream is dropped, and the pump
+   * reconnects — and on reconnect it **replays from the last sequence number it
+   * saw**, which re-delivers this same frame, which throws again. The result is
+   * a silent, permanent loop: the session looks like it is logging in while no
+   * further event for it is ever delivered.
+   *
+   * So it is wrapped exactly the way `#finishExport` is — caught here, logged,
+   * never propagated — and a test feeds a throwing callback and asserts the
+   * stream survives and the *next* frame still arrives.
+   */
+  readonly onExportProgress?: (
+    sessionId: string,
+    id: string,
+    progress: { pages: number; sections: number; assets: number },
+  ) => void;
+  /**
    * Called when an export reaches a terminal outcome, with the truth about it.
    *
    * ## This is the callback that was missing, and it is why the export never arrived
@@ -312,6 +356,9 @@ export class HttpRunnerAdapter implements RunnerAdapter {
   readonly #onNotebooksListed:
     | ((sessionId: string, names: readonly string[]) => void)
     | undefined;
+  readonly #onExportProgress:
+    | ((sessionId: string, id: string, progress: { pages: number; sections: number; assets: number }) => void)
+    | undefined;
   readonly #onExportFinished: ((input: ExportFinishedInput) => Promise<void> | void) | undefined;
   readonly #now: () => number;
   /**
@@ -363,6 +410,7 @@ export class HttpRunnerAdapter implements RunnerAdapter {
     this.#sse = options.sse;
     this.#onAuthOutcome = options.onAuthOutcome;
     this.#onNotebooksListed = options.onNotebooksListed;
+    this.#onExportProgress = options.onExportProgress;
     this.#onExportFinished = options.onExportFinished;
     this.#now = options.now ?? Date.now;
     this.#timeoutMs = options.timeoutMs ?? 15_000;
@@ -595,6 +643,45 @@ export class HttpRunnerAdapter implements RunnerAdapter {
       // timeout, so this only has to outlast the *archiving* of what it produced.
       timeoutMs: 30 * 60 * 1000,
     });
+  }
+
+  /**
+   * reportProgress hands one frame's counts to the writer, and cannot be stopped
+   * by it.
+   *
+   * The try/catch is the whole method. Everything above it — the callback
+   * injected, whatever it was handed — is out of this class's control, and the
+   * one thing that must not happen is an exception escaping into `#pump`'s
+   * `try`: it would drop the stream, the pump would reconnect, the reconnect
+   * would replay the same frame from `since`, and the session would spin on that
+   * frame for ever with no further event delivered. That is not a crash, which
+   * is what makes it dangerous.
+   *
+   * Reported rather than swallowed, because a silently dead writer is precisely
+   * the bug this callback was added to fix — the card frozen at zero — and it
+   * would look identical from the outside.
+   */
+  #reportProgress(
+    sessionId: string,
+    id: string,
+    progress: { pages: number; sections: number; assets: number },
+  ): void {
+    const callback = this.#onExportProgress;
+    if (callback === undefined) return;
+    try {
+      callback(sessionId, id, progress);
+    } catch (cause: unknown) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      console.error(
+        JSON.stringify({
+          level: "error",
+          msg: "recording an export's progress failed",
+          session: sessionId,
+          id,
+          err: detail,
+        }),
+      );
+    }
   }
 
   /**
@@ -1049,6 +1136,7 @@ export class HttpRunnerAdapter implements RunnerAdapter {
       raw,
       this.#onAuthOutcome,
       this.#onNotebooksListed,
+      (sessionId, id, progress) => this.#reportProgress(sessionId, id, progress),
       (input, terminal) => this.#finishExport(input, terminal),
       this.#now,
     );
@@ -1086,6 +1174,12 @@ export const unsupportedChallenge =
  * implementations of one contract meet and every serious bug in this project has
  * been at exactly this line. An event whose shape does not match is dropped
  * rather than passed through as `unknown`.
+ *
+ * Four injected callbacks rather than a `Db`, for the one reason this whole file
+ * is db-free: transport decides what the runner said, and somebody else decides
+ * what to remember about it. Each of them is an *observation* — "a login
+ * finished", "a listing finished", "these are the counts", "this export is over"
+ * — and none of them is a place this module gets to write.
  */
 function publish(
   sse: SseHub,
@@ -1093,6 +1187,11 @@ function publish(
   raw: Record<string, unknown>,
   onAuthOutcome?: (sessionId: string, outcome: "authenticated" | "failed") => void,
   onNotebooksListed?: (sessionId: string, names: readonly string[]) => void,
+  onExportProgress?: (
+    sessionId: string,
+    id: string,
+    progress: { pages: number; sections: number; assets: number },
+  ) => void,
   onExportFinished?: (input: ExportFinishedInput, terminal: ExportTerminal) => void,
   now: () => number = Date.now,
 ): "published" | "dropped" | "challenge-code" {
@@ -1235,14 +1334,24 @@ function publish(
         const p = (
           typeof raw.progress === "object" && raw.progress !== null ? raw.progress : {}
         ) as Record<string, unknown>;
-        sse.emit(sessionId, "export-progress", {
-          id,
-          progress: {
-            pages: typeof p.pages === "number" ? (p.pages as number) : 0,
-            sections: typeof p.sections === "number" ? (p.sections as number) : 0,
-            assets: typeof p.assets === "number" ? (p.assets as number) : 0,
-          },
-        });
+        const counts = {
+          pages: typeof p.pages === "number" ? (p.pages as number) : 0,
+          sections: typeof p.sections === "number" ? (p.sections as number) : 0,
+          assets: typeof p.assets === "number" ? (p.assets as number) : 0,
+        };
+        // **Recorded before the emit, deliberately** — the same order
+        // `#finishExport` exists to enforce for the terminal, for the same
+        // reason. The client's status refresh is what makes the counts survive a
+        // reload, and a refresh issued off this frame reads the row; emitting
+        // first is how the card shows 29 pages and the status endpoint still
+        // answers zeros for the seconds between.
+        //
+        // It cannot throw out of here: `#reportProgress` catches. A throw would
+        // land in `#pump`'s `try`, drop the stream, and be replayed on every
+        // reconnect — an infinite loop on one frame, with no further event for
+        // the session ever delivered.
+        onExportProgress?.(sessionId, id, counts);
+        sse.emit(sessionId, "export-progress", { id, progress: counts });
       } else if (type === "export-done") {
         const failedSections = num("failedSections");
         const failedPages = num("failedPages");

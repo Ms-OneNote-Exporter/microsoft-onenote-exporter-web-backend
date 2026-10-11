@@ -42,6 +42,14 @@ function finished(overrides: Partial<ExportFinishedInput> = {}): ExportFinishedI
     notebook: "Notebook",
     progress: { pages: 12, sections: 3, assets: 40 },
     finishedAt: NOW + 5_000,
+    // Zeros rather than omitted, and the reason is worth recording: `tests/` is
+    // not in `tsconfig.json`, so a missing required field here transpiles fine
+    // and reaches `lost = undefined + undefined + undefined` — `NaN`, which
+    // answers `NaN > 0` as false and so quietly reads as "nothing failed". The
+    // type checker that would have caught it never sees this file.
+    failedSections: 0,
+    failedPages: 0,
+    failedGroups: 0,
     ...overrides,
   };
 }
@@ -187,6 +195,68 @@ describe("a partial export", () => {
     // Still published. §8.2 preserves what is on disk, so a partial vault is a
     // vault the user may want — labelled, not withheld.
     expect(h.order).toContain("record");
+  });
+
+  /**
+   * The walk the user measured, as a fixture.
+   *
+   * "The Complete Notebook", 29 pages, 8 assets, **one page failed**. The counts
+   * come off the runner's `export-done` frame, `partial` is computed from them in
+   * `runner-adapter-http.ts`, and they arrived here — and were then dropped on the
+   * floor. So the row said `state: "partial"` and nothing about *what* was
+   * partial, and the card's only honest option was the sentence it shipped with,
+   * "the export stopped before it finished", which is false: it finished, and lost
+   * a page.
+   */
+  it("records what was lost, because `partial` alone says nothing about what", async () => {
+    const h = harness();
+
+    await completeExport(
+      h.deps,
+      finished({
+        notebook: "The Complete Notebook",
+        partial: true,
+        progress: { pages: 29, sections: 1, assets: 8 },
+        failedSections: 0,
+        failedPages: 1,
+        failedGroups: 0,
+      }),
+    );
+
+    // The three counts, carried to the writer under their own names. This is the
+    // whole test: before it, `completeExport` was called with the counts absent,
+    // `Db.completeExport` had no parameter for them, and `auth.ts` had no field to
+    // read them out of — three closed parsers in a row, each dropping a key the
+    // one before it had written.
+    expect(h.complete()).toMatchObject({
+      partial: true,
+      progress: { pages: 29, sections: 1, assets: 8 },
+      failedSections: 0,
+      failedPages: 1,
+      failedGroups: 0,
+    });
+    // And the archive is still published — a partial vault is a vault.
+    expect(h.order).toEqual(["stage", "finalize", "record"]);
+  });
+
+  it("records measured zeros on a clean export, rather than leaving the field out", async () => {
+    const h = harness();
+
+    await completeExport(
+      h.deps,
+      finished({ failedSections: 0, failedPages: 0, failedGroups: 0 }),
+    );
+
+    // A terminal is the one moment where "nothing failed" is a *measurement*
+    // rather than an absence, and the snapshot publishes the field as `null`
+    // when it is absent — so a client must not have to tell those apart by
+    // guessing. `export-completion-db.test.ts` asserts the row; this asserts the
+    // call that produces it.
+    expect(h.complete()).toMatchObject({
+      failedSections: 0,
+      failedPages: 0,
+      failedGroups: 0,
+    });
   });
 });
 

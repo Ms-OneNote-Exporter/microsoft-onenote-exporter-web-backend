@@ -253,6 +253,13 @@ export class MockRunner implements RunnerAdapter, RunnerEraseControl {
       progress: { pages, sections, assets },
       startedAt: Date.now(),
       finishedAt: Date.now(),
+      // The mock always produces a successful export, so all three are zero —
+      // and passed rather than omitted because this call stands in for
+      // `export-completion.ts`'s, which carries the real ones. A mock that
+      // omitted a field the production call passes would stop standing in for it.
+      failedSections: 0,
+      failedPages: 0,
+      failedGroups: 0,
     });
     // The new export-done now includes counts of failed items and notebookNotFound.
     // The mock always produces a successful export, so all failure counts are zero.

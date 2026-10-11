@@ -193,6 +193,23 @@ export interface SessionSnapshot {
     readonly id: string | null;
     readonly notebook: string | null;
     readonly progress: { pages: number; sections: number; assets: number } | null;
+    /**
+     * How much was **lost**, or null when the export says nothing about it.
+     *
+     * `progress` is what was written; this is what was not. The walk the user
+     * measured reports 29 pages and 8 assets *and* 1 failed page, so a card with
+     * only the first two renders a number that reads as success — and the
+     * frontend's `partial` branch was reduced to saying the export "stopped
+     * before it finished", which is false of an export that completed and lost a
+     * page.
+     *
+     * `null`, never `{0, 0, 0}`, when the export recorded no failures field: a
+     * zero would say "measured, and nothing was lost", which is a claim, and
+     * absence is not one. This is the same rule `progress` follows and for the
+     * same reason — a zero that was never measured is a different fact from a
+     * measured zero.
+     */
+    readonly failed: { pages: number; sections: number; groups: number } | null;
     readonly startedAt: string | null;
     readonly finishedAt: string | null;
   };
@@ -214,6 +231,15 @@ export interface StoredExportState {
   id: string | null;
   notebook: string | null;
   progress: { pages: number; sections: number; assets: number } | null;
+  /**
+   * See SessionSnapshot.export.failed — and note the field **names**: the stored
+   * key is `groups` here because the frontend reads `failed.groups`, and a
+   * parser that renamed it to `failedGroups` on the way through would produce a
+   * closed-parsed snapshot with a key nothing consumes. A closed parser drops
+   * unnamed keys silently, which is how a count can be written to SQLite,
+   * read back by nobody, and pass every test that only checks the event.
+   */
+  failed: { pages: number; sections: number; groups: number } | null;
   startedAt: number | null;
   finishedAt: number | null;
 }
@@ -312,6 +338,7 @@ export function buildSnapshot(
       id: exportState?.id ?? null,
       notebook: exportState?.notebook ?? null,
       progress: exportState?.progress ?? null,
+      failed: exportState?.failed ?? null,
       startedAt: exportState?.startedAt === null || exportState?.startedAt === undefined
         ? null
         : iso(exportState.startedAt),
@@ -419,10 +446,53 @@ export function parseExportState(raw: string | null): StoredExportState | null {
       id: parsed.id ?? null,
       notebook: parsed.notebook ?? null,
       progress: parsed.progress ?? null,
+      // **All three or none.** Read, not trusted: a stored `failed` that is not
+      // an object of three numbers is not something to half-decode. `{pages: 1}`
+      // with the other two missing would have to become either `{pages: 1,
+      // sections: 0, groups: 0}` — inventing two measured zeros — or a null
+      // that throws away a real count, and the first is the kind of quiet lie
+      // this whole field exists to remove.
+      //
+      // Absent on every row written before this field existed, and on the paths
+      // that do not record failures at all (queued, the start-failure write, the
+      // abort's `progress: null`). All of those correctly read as `null`.
+      failed: parseFailedCounts(parsed.failed),
       startedAt: parsed.startedAt ?? null,
       finishedAt: parsed.finishedAt ?? null,
     };
   } catch {
     return null;
   }
+}
+
+/**
+ * parseFailedCounts reads the `$.failed` block, or reports that there is none.
+ *
+ * Separate from `parseExportState` because the rule is different from every
+ * other leaf's: absence is a normal state here (`null`) and a half-present
+ * object is not (also `null`). See the call site for why the alternative — pad
+ * the missing fields with zeros — is the failure mode worth naming.
+ */
+function parseFailedCounts(
+  raw: unknown,
+): { pages: number; sections: number; groups: number } | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const f = raw as Record<string, unknown>;
+  const pages = f.pages;
+  const sections = f.sections;
+  const groups = f.groups;
+  if (
+    typeof pages !== "number" ||
+    !Number.isFinite(pages) ||
+    typeof sections !== "number" ||
+    !Number.isFinite(sections) ||
+    typeof groups !== "number" ||
+    !Number.isFinite(groups)
+  ) {
+    return null;
+  }
+  // `Number.isFinite` rather than `typeof`, because `NaN` and `Infinity` are both
+  // `typeof "number"` — and a card rendering "NaN pages failed" is exactly the
+  // failure this field was added to stop.
+  return { pages, sections, groups };
 }

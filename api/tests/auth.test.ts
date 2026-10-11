@@ -366,6 +366,12 @@ describe("parseExportState", () => {
       id: null,
       notebook: null,
       progress: null,
+      // **Null, not `{0, 0, 0}`.** A queued export has recorded no failures
+      // because nothing has failed yet, which is a different fact from "nothing
+      // failed", and this is the same rule `progress` follows. The assertion is
+      // `toEqual` on the whole object precisely so a field added to the closed
+      // parser cannot pass here by being silently dropped on the way out.
+      failed: null,
       startedAt: null,
       finishedAt: null,
     });
@@ -502,6 +508,116 @@ describe("export error in the snapshot", () => {
     );
     // Always present, so a client never branches on a missing key.
     expect(snapshot.export.error).toBeNull();
+  });
+});
+
+// ---- what was lost: the three counts that used to die in `completeExport` ---
+
+describe("failed counts in the snapshot", () => {
+  it("carries what the walk lost", () => {
+    // The user's own walk, verbatim: 29 pages, 8 assets, **1 page failed**. The
+    // counts arrived on the runner's terminal frame, decided `partial`, and were
+    // written to SQLite and read by nobody — `buildSnapshot`'s `export` literal
+    // had no `failed` key, so a closed parser dropped it on the way through.
+    // The card's only sentence left was "the export stopped before it finished",
+    // which is false of an export that completed and lost one page.
+    const session = seed(GUID, {
+      state: "authenticated",
+      export_state: JSON.stringify({
+        state: "partial",
+        partialReason: null,
+        id: "x".repeat(43),
+        notebook: "The Complete Notebook",
+        progress: { pages: 29, sections: 1, assets: 8 },
+        failed: { pages: 1, sections: 0, groups: 0 },
+        startedAt: NOW - 229_000,
+        finishedAt: NOW,
+      }),
+    });
+    const snapshot = buildSnapshot(
+      session,
+      NOW,
+      { state: "loaded", items: ["The Complete Notebook"] },
+      PUBLIC_ORIGIN,
+    );
+
+    expect(snapshot.export.state).toBe("partial");
+    expect(snapshot.export.progress).toEqual({ pages: 29, sections: 1, assets: 8 });
+    expect(snapshot.export.failed).toEqual({ pages: 1, sections: 0, groups: 0 });
+  });
+
+  it("is null when the export recorded no failures — never a made-up zero", () => {
+    // A running or queued export has recorded no failures because nothing has
+    // failed yet, which is a different fact from "nothing failed". `{0, 0, 0}`
+    // would be a claim, and the frontend would render "0 failed" as though it had
+    // been measured.
+    // `guid` is the primary key, so the two cases get two sessions; reusing one
+    // would be a UNIQUE violation and an error that says nothing about the assert.
+    for (const [index, exportState] of [
+      JSON.stringify({ state: "running", progress: { pages: 3, sections: 1, assets: 0 } }),
+      JSON.stringify({ state: "queued", progress: { pages: 0, sections: 0, assets: 0 } }),
+    ].entries()) {
+      const snapshot = buildSnapshot(
+        seed(index === 0 ? GUID : OTHER_GUID, { state: "exporting", export_state: exportState }),
+        NOW,
+        { state: "idle", items: [] },
+        PUBLIC_ORIGIN,
+      );
+      expect(snapshot.export.failed, exportState).toBeNull();
+    }
+  });
+
+  it("is null rather than half-decoded when the stored block is not three numbers", () => {
+    // Reading `pages` out of `{pages: 1}` and padding the rest with zeros would
+    // invent two measurements. Dropping the whole thing loses a real count, which
+    // is the lesser of the two and is what `null` says.
+    for (const failed of [
+      { pages: 1 },
+      { pages: 1, sections: 0 },
+      "1 failed page",
+      1,
+      null,
+      { pages: "1", sections: 0, groups: 0 },
+      { pages: Number.NaN, sections: 0, groups: 0 },
+    ]) {
+      // Built as a literal rather than seeded: `buildSnapshot` takes the row, and
+      // seeding one row per case would collide on `guid` seven times over.
+      const row: SessionRow = {
+        guid: GUID,
+        secret_hash: "",
+        csrf_key: "",
+        runner_id: null,
+        runner_url: null,
+        state: "exporting",
+        auth_state: "valid",
+        created_at: NOW,
+        expires_at: NOW + TTL,
+        idle_expires_at: null,
+        last_activity_at: NOW,
+        notebooks: null,
+        notebook: "Work",
+        artifact_id: null,
+        artifact_partial: 0,
+        export_state: JSON.stringify({
+          state: "running",
+          progress: { pages: 1, sections: 1, assets: 0 },
+          failed,
+        }),
+      };
+      const snapshot = buildSnapshot(row, NOW, { state: "idle", items: [] }, PUBLIC_ORIGIN);
+      expect(snapshot.export.failed, JSON.stringify(failed)).toBeNull();
+    }
+  });
+
+  it("reads every key off the stored block, so a rename cannot pass", () => {
+    // `groups`, not `failedGroups`: the frontend reads `failed.groups`, and a
+    // parser that renamed it would publish a snapshot whose one new field is
+    // `undefined` — a closed parser dropping a key silently, which is how a count
+    // can be written and read by nobody and pass every test that checks the event.
+    const parsed = parseExportState(
+      JSON.stringify({ state: "partial", failed: { pages: 2, sections: 3, groups: 4 } }),
+    );
+    expect(parsed?.failed).toEqual({ pages: 2, sections: 3, groups: 4 });
   });
 
   it("caps a stored error that is far too long", () => {

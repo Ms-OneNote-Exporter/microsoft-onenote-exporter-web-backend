@@ -610,3 +610,246 @@ describe("WAL mode", () => {
     });
   });
 });
+
+/**
+ * The writer that makes the export card tell the truth while it runs.
+ *
+ * ## The bug these exist for
+ *
+ * `export_state.progress` was written twice — zeroed at queue time, zeroed again
+ * at run start — and never again until `completeExport` wrote the final numbers
+ * at the *end*. So the card said "0 pages, 0 sections, 0 assets so far" for the
+ * whole walk, live and after a refresh, on every notebook.
+ *
+ * ## Why the assertions are about the **row**
+ *
+ * The frontend already renders `snapshot.export.progress`, and the SSE stream
+ * already carried the counts — so a test that asserted "the event arrived" would
+ * pass today and say nothing. What was missing was the write, and the write is
+ * only visible here.
+ */
+describe("updateExportProgress", () => {
+  /**
+   * A session mid-walk, with the zeros `routes.ts` writes at run start.
+   *
+   * Takes a guid because two of these tests below seed one row per case and
+   * `guid` is the primary key — reusing it would be a UNIQUE violation and an
+   * error that says nothing about what is being asserted.
+   */
+  function seedRunning(state = "running", guid = GUID): void {
+    seedSession(guid, { state: "exporting" });
+    db.run(
+      `UPDATE sessions SET export_state = ? WHERE guid = ?`,
+      JSON.stringify({
+        state,
+        partialReason: null,
+        id: "A".repeat(43),
+        notebook: "The Complete Notebook",
+        progress: { pages: 0, sections: 0, assets: 0 },
+        startedAt: NOW,
+        finishedAt: null,
+      }),
+      guid,
+    );
+  }
+
+  it("writes the counts and reports one row changed", () => {
+    seedRunning();
+
+    const changed = db.updateExportProgress(GUID, { pages: 29, sections: 1, assets: 8 });
+
+    expect(changed).toBe(1);
+    const parsed = JSON.parse(db.getSession(GUID)!.export_state!);
+    expect(parsed.progress).toEqual({ pages: 29, sections: 1, assets: 8 });
+  });
+
+  it("stores the counts as an object, not as a JSON string", () => {
+    // The whole change is silent without this. `json_set` treats a bound
+    // parameter as SQL *text*, so `json_set(s,'$.progress', ?)` with
+    // `JSON.stringify(progress)` stores `"{\"pages\":29}"` — a string where the
+    // contract says an object. No error, the row looks written, and every read
+    // of `.pages` in the frontend is `undefined`, which renders as the very
+    // zeros this method exists to replace.
+    seedRunning();
+
+    db.updateExportProgress(GUID, { pages: 29, sections: 1, assets: 8 });
+
+    const raw = JSON.parse(db.getSession(GUID)!.export_state!) as { progress: unknown };
+    expect(typeof raw.progress).toBe("object");
+    expect(raw.progress).not.toBeNull();
+  });
+
+  it("preserves the rest of export_state, and the rest of the row", () => {
+    // `json_set` on one path, not a re-serialisation. A method that rebuilt the
+    // object from a partial read would drop `id` — and `id` is what
+    // `POST /api/export/abort/:id` matches the session against, so an abort
+    // would answer 404 "no such export" for an export that is running.
+    seedRunning();
+    db.run(
+      `UPDATE sessions SET artifact_id = NULL, artifact_partial = 0 WHERE guid = ?`,
+      GUID,
+    );
+
+    db.updateExportProgress(GUID, { pages: 12, sections: 3, assets: 40 });
+
+    const row = db.getSession(GUID)!;
+    const parsed = JSON.parse(row.export_state!);
+    expect(parsed.state).toBe("running");
+    expect(parsed.id).toBe("A".repeat(43));
+    expect(parsed.notebook).toBe("The Complete Notebook");
+    expect(parsed.startedAt).toBe(NOW);
+    expect(parsed.finishedAt).toBeNull();
+    expect(parsed.partialReason).toBeNull();
+    // And nothing outside the JSON moved either.
+    expect(row.artifact_id).toBeNull();
+    expect(row.state).toBe("exporting");
+  });
+
+  it("writes over a queued export too, not only a running one", () => {
+    // The queue write (`routes.ts`) and the run-start write both leave
+    // `queued`→`running`, and a frame can land between them. Refusing `queued`
+    // would drop the first counts of every export.
+    seedRunning("queued");
+
+    expect(db.updateExportProgress(GUID, { pages: 1, sections: 1, assets: 1 })).toBe(1);
+    expect(JSON.parse(db.getSession(GUID)!.export_state!).progress).toEqual({
+      pages: 1,
+      sections: 1,
+      assets: 1,
+    });
+  });
+
+  it("refuses a finished export, so a replayed frame cannot move the card backwards", () => {
+    // `#pump` reconnects and replays from the last sequence number it saw, so the
+    // frame before a dropped connection arrives again — after the terminal. An
+    // unguarded write would put the counts back to 12 while the state went to
+    // `running` and the download link vanished.
+    for (const [index, terminal] of ["done", "partial", "failed"].entries()) {
+      const guid = `${index}-${GUID}`;
+      seedSession(guid, { state: "authenticated" });
+      db.run(
+        `UPDATE sessions SET export_state = ? WHERE guid = ?`,
+        JSON.stringify({
+          state: terminal,
+          id: "A".repeat(43),
+          notebook: "The Complete Notebook",
+          progress: { pages: 29, sections: 1, assets: 8 },
+          startedAt: NOW,
+          finishedAt: NOW + 1000,
+        }),
+        guid,
+      );
+
+      const changed = db.updateExportProgress(guid, { pages: 3, sections: 1, assets: 1 });
+
+      expect(changed, terminal).toBe(0);
+      expect(JSON.parse(db.getSession(guid)!.export_state!).progress, terminal).toEqual({
+        pages: 29,
+        sections: 1,
+        assets: 8,
+      });
+    }
+  });
+
+  it("reports 0 for a session that is no longer there", () => {
+    seedRunning();
+    db.run(`DELETE FROM sessions WHERE guid = ?`, GUID);
+
+    // The change count is the *only* signal the wiring gets that this session's
+    // export is over, so a vanished row has to read the same way as a finished
+    // one: zero.
+    expect(db.updateExportProgress(GUID, { pages: 29, sections: 1, assets: 8 })).toBe(0);
+  });
+
+  it("writes nothing for a null progress", () => {
+    // `null` means "unknown", not "measured zero". Overwriting good counts with
+    // it is the one update that makes the card lie backwards, and `routes.ts`
+    // nulls `progress` deliberately on abort.
+    seedRunning();
+    db.updateExportProgress(GUID, { pages: 29, sections: 1, assets: 8 });
+
+    expect(db.updateExportProgress(GUID, null)).toBe(0);
+    expect(JSON.parse(db.getSession(GUID)!.export_state!).progress).toEqual({
+      pages: 29,
+      sections: 1,
+      assets: 8,
+    });
+  });
+
+  it("does not throw on a malformed export_state column", () => {
+    // `json_set` throws on malformed JSON, and this is called from the event pump,
+    // where a throw tears the stream down and loses every later event for the
+    // session. `markExportStranded` hit exactly this and carries `json_valid` for
+    // the same reason.
+    for (const [index, corrupt] of ["not valid json {", "NULL"].entries()) {
+      const guid = `${index + 10}-${GUID}`;
+      seedSession(guid, { state: "exporting" });
+      db.run(
+        `UPDATE sessions SET export_state = ? WHERE guid = ?`,
+        corrupt === "NULL" ? null : corrupt,
+        guid,
+      );
+
+      expect(() =>
+        db.updateExportProgress(guid, { pages: 1, sections: 1, assets: 1 }),
+      ).not.toThrow();
+      expect(db.updateExportProgress(guid, { pages: 1, sections: 1, assets: 1 })).toBe(0);
+    }
+  });
+});
+
+describe("completeExport's failure counts", () => {
+  it("persists what was lost, so a partial terminal says what", () => {
+    // The walk the user measured, verbatim: 29 pages, 8 assets, **1 page failed**.
+    // These three numbers arrived on the runner's terminal frame, decided
+    // `partial`, and were then dropped on the floor — so the row said *that*
+    // something was lost and nothing about *what*, and the card's only sentence
+    // was "the export stopped before it finished", which is false: it finished.
+    seedSession(GUID, { state: "exporting" });
+
+    const recorded = db.completeExport({
+      guid: GUID,
+      artifactId: "A".repeat(43),
+      partial: true,
+      partialReason: null,
+      notebook: "The Complete Notebook",
+      progress: { pages: 29, sections: 1, assets: 8 },
+      startedAt: NOW,
+      finishedAt: NOW + 229_000,
+      failedSections: 0,
+      failedPages: 1,
+      failedGroups: 0,
+    });
+
+    expect(recorded).toBe(true);
+    const parsed = JSON.parse(db.getSession(GUID)!.export_state!);
+    expect(parsed.state).toBe("partial");
+    expect(parsed.progress).toEqual({ pages: 29, sections: 1, assets: 8 });
+    expect(parsed.failed).toEqual({ pages: 1, sections: 0, groups: 0 });
+  });
+
+  it("records measured zeros rather than omitting the field on a clean export", () => {
+    // A terminal is the one moment where "zero pages failed" is a *measured* zero
+    // rather than an absence, so the field is always present — a client must
+    // never have to tell "nothing failed" apart from "nothing was said".
+    seedSession(GUID, { state: "exporting" });
+
+    db.completeExport({
+      guid: GUID,
+      artifactId: "A".repeat(43),
+      partial: false,
+      partialReason: null,
+      notebook: "MS is great",
+      progress: { pages: 7, sections: 3, assets: 2 },
+      startedAt: NOW,
+      finishedAt: NOW + 1000,
+      failedSections: 0,
+      failedPages: 0,
+      failedGroups: 0,
+    });
+
+    const parsed = JSON.parse(db.getSession(GUID)!.export_state!);
+    expect(parsed.state).toBe("done");
+    expect(parsed.failed).toEqual({ pages: 0, sections: 0, groups: 0 });
+  });
+});

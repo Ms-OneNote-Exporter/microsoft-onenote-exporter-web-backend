@@ -446,6 +446,82 @@ export class Db {
   }
 
   /**
+   * updateExportProgress writes an in-flight export's counts-so-far.
+   *
+   * ## Why this existed at all
+   *
+   * **The export card read "0 pages, 0 sections, 0 assets so far" for the entire
+   * walk.** `export_state.progress` was written twice — zeroed at queue time and
+   * zeroed again at run start (`routes.ts`) — and never again until the export
+   * finished. `completeExport` wrote the real numbers at the *end*, minutes or
+   * hours too late for a card that is asking "how far along is this?".
+   *
+   * The frontend already rendered the field; nothing behind it was ever fed. The
+   * same shape as every other bug in this project one level out: the event
+   * arrived, the handler ran, the frame reached the browser, and the assertion
+   * that mattered — **what is in the row** — was never made.
+   *
+   * ## `json_set`, and why the bind is wrapped in `json()`
+   *
+   * `json_set` treats a bound parameter as a **SQL text value**, not as JSON. So
+   * `json_set(s, '$.progress', '{"pages":3}')` stores the *string*
+   * `"{\"pages\":3}"`, and the snapshot then carries
+   * `progress: "{\"pages\":3}"` — a string where the contract says an object, and
+   * a card that renders nothing because every read of `.pages` is undefined. It
+   * is silent: no error, and the row looks written.
+   *
+   * So the object is bound as `JSON.stringify(progress)` — raw objects are not
+   * bindable in `node:sqlite` at all — and wrapped in SQLite's `json()` in the
+   * SQL, which is the only thing that re-reads it as JSON. Verified rather than
+   * assumed; the two spellings differ only in the quotes they leave behind.
+   *
+   * ## The guard is the one `markExportStranded` already uses
+   *
+   * `json_valid(export_state)` and `state IN ('queued','running')`. Both halves
+   * earn their place:
+   *
+   *   - The `#pump` replays from the last sequence number it saw, so a **late
+   *     frame carrying older counts can arrive after the terminal** — on a
+   *     reconnect, a runner rebind, or the ring buffer answering a `since`
+   *     below the eviction point. Without the state guard that frame would
+   *     rewrite a `done` export as a `running` one, and the card would go
+   *     backwards: counts reset to zero, download link gone.
+   *   - `json_valid` because `json_set` and `json_extract` both **throw** on
+   *     malformed JSON, and this is called from the event pump, where a throw
+   *     tears down the stream and loses every later event for the session.
+   *
+   * ## A null progress writes nothing
+   *
+   * `null` means "unknown", not "measured zero" — a zero that was never measured
+   * is a different fact (see `routes.ts`'s abort path, which nulls it on
+   * purpose). Writing `null` over a good set of counts would be the one update
+   * that makes the card lie backwards.
+   *
+   * Returns the **change count**, and that is the whole reason it is a number
+   * rather than the `boolean` its two neighbours return: `0` is the observation
+   * "this row's export is no longer in flight, or is not there any more", which
+   * is exactly the signal the wiring uses to stop coalescing for a session
+   * (see `index.ts`). A boolean would have thrown that away.
+   */
+  updateExportProgress(
+    guid: string,
+    progress: { pages: number; sections: number; assets: number } | null,
+  ): number {
+    if (progress === null) return 0;
+    return this.run(
+      // `json(...)` rather than the bare parameter — see the note above. Without
+      // it the counts are stored as a JSON *string* and nothing reads them.
+      `UPDATE sessions
+          SET export_state = json_set(export_state, '$.progress', json(?))
+        WHERE guid = ?
+          AND json_valid(export_state)
+          AND json_extract(export_state, '$.state') IN ('queued', 'running')`,
+      JSON.stringify(progress),
+      guid,
+    );
+  }
+
+  /**
    * completeExport records a finished export: the terminal `export_state`, the
    * artifact that now belongs to the session, and the return to `authenticated`.
    *
@@ -487,6 +563,24 @@ export class Db {
    * Returns whether a row changed, so a caller can distinguish "recorded" from
    * "ignored" — a late `export-done` for a session already erased is expected and
    * must not be logged as a failure.
+   *
+   * ## Why the failure counts are persisted
+   *
+   * `failedSections` / `failedPages` / `failedGroups` were carried all the way
+   * from the runner's terminal frame, used once to decide `partial` versus
+   * `done`, and then **thrown away**. So the walk the user measured — 29 pages, 8
+   * assets, **1 page failed** — recorded `state: "partial"` with nothing on the
+   * wire that said *what* was partial, and the card's only honest option was the
+   * one it shipped with: "the export stopped before it finished", which is false.
+   * The walk completed.
+   *
+   * They are written under `$.failed` as `{pages, sections, groups}` — the same
+   * three names the snapshot publishes, because this module and `auth.ts` must
+   * not be able to disagree about the spelling of a field neither of them owns.
+   *
+   * Always written, including as zeros: a terminal is the one moment where "zero
+   * pages failed" is a **measured** zero rather than an absence, and a client
+   * that had to tell those apart would be guessing.
    */
   completeExport(input: {
     readonly guid: string;
@@ -497,6 +591,9 @@ export class Db {
     readonly progress: { pages: number; sections: number; assets: number } | null;
     readonly startedAt: number;
     readonly finishedAt: number;
+    readonly failedSections: number;
+    readonly failedPages: number;
+    readonly failedGroups: number;
   }): boolean {
     return (
       this.run(
@@ -519,6 +616,11 @@ export class Db {
           progress: input.progress,
           startedAt: input.startedAt,
           finishedAt: input.finishedAt,
+          failed: {
+            pages: input.failedPages,
+            sections: input.failedSections,
+            groups: input.failedGroups,
+          },
         }),
         input.guid,
       ) > 0

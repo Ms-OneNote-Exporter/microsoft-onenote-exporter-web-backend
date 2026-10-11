@@ -184,6 +184,12 @@ function adapterFor(
     addressFor?: (id: string) => string | null;
     /** Stand-in for `index.ts`'s `db.setNotebooks` wiring. */
     onNotebooksListed?: (sessionId: string, names: readonly string[]) => void;
+    /** Stand-in for `index.ts`'s progress writer. */
+    onExportProgress?: (
+      sessionId: string,
+      id: string,
+      progress: { pages: number; sections: number; assets: number },
+    ) => void;
     /** Stand-in for `index.ts`'s `completeExport` wiring. */
     onExportFinished?: (input: ExportFinishedInput) => Promise<void> | void;
     now?: () => number;
@@ -196,6 +202,9 @@ function adapterFor(
     ...(overrides.onNotebooksListed === undefined
       ? {}
       : { onNotebooksListed: overrides.onNotebooksListed }),
+    ...(overrides.onExportProgress === undefined
+      ? {}
+      : { onExportProgress: overrides.onExportProgress }),
     ...(overrides.onExportFinished === undefined
       ? {}
       : { onExportFinished: overrides.onExportFinished }),
@@ -1067,6 +1076,330 @@ describe("the notebook list is persisted, not just published", () => {
     // The row is gone, so there is nothing left that could name a notebook — which is
     // the point of `deleteSession` destroying the row at all.
     expect(db.getSession(SESSION)).toBeUndefined();
+  });
+});
+
+/**
+ * The in-flight counts, and the writer that remembers them.
+ *
+ * ## The same bug, one field along
+ *
+ * The block above is about a **finished** export never reaching the database.
+ * This one is about a **running** one: `export-progress` was published to the hub
+ * and discarded, so the browser watched the card count up while
+ * `GET /api/session/status` kept answering the zeros `routes.ts` wrote at queue
+ * time — and every refresh, every second tab and the client's own status poll
+ * replaced real numbers with `0 / 0 / 0`.
+ *
+ * ## Why the adapter tests *the seam* and not just the callback
+ *
+ * "The adapter calls the callback" is the easy half and it is already implied by
+ * the existing progress test. The half that actually decides what the user sees
+ * is what the **writer** does with a frame it has already been handed — in
+ * particular that it does not write a frame whose counts are older than the ones
+ * already stored, because `#pump` replays from its last sequence number on every
+ * reconnect. So the monotonic and rate-limit cases are driven *through the
+ * adapter* with the real writer attached, and assert on what reached the write
+ * function. Asserting the callback in isolation would leave the replay case
+ * untested and it is the one that can make the card count down.
+ */
+describe("an export's live counts are handed on, not just published", () => {
+  /** A runner frame of the given type, with the runner's own wire format. */
+  function frame(seq: number, payload: Record<string, unknown>): string {
+    return `id: ${seq}\ndata: ${JSON.stringify(payload)}\n\n`;
+  }
+
+  it("calls the callback once per export-progress frame, with the session, id and counts", async () => {
+    const runner = await fakeRunner();
+    const seen: Array<[string, string, { pages: number; sections: number; assets: number }]> = [];
+    const adapter = adapterFor(runner, {
+      onExportProgress: (sessionId, id, progress) => seen.push([sessionId, id, progress]),
+    });
+
+    runner.sseFrames = [
+      frame(1, {
+        type: "export-progress",
+        id: "artifact-id",
+        progress: { pages: 12, sections: 3, assets: 40 },
+      }),
+    ];
+
+    const sub = subscribe(runner.sse);
+    await adapter.listNotebooks(SESSION);
+    await sub.received();
+    adapter.stopAll();
+
+    expect(seen).toEqual([
+      [SESSION, "artifact-id", { pages: 12, sections: 3, assets: 40 }],
+    ]);
+  });
+
+  it("never fires it for another event type", async () => {
+    // Every other frame in this suite's vocabulary carries no counts: firing the
+    // callback for `export-log` would write a row per line of exporter output,
+    // and firing it for `export-done` would race `completeExport` for the same
+    // key.
+    const runner = await fakeRunner();
+    const seen: string[] = [];
+    const adapter = adapterFor(runner, {
+      onExportProgress: (_sessionId, id) => seen.push(id),
+    });
+
+    runner.sseFrames = [
+      frame(1, { type: "export-started", id: "artifact-id" }),
+      frame(2, { type: "export-log", id: "artifact-id", line: "exported page 1/29" }),
+      frame(3, { type: "export-progress", id: "artifact-id", progress: { pages: 1 } }),
+      frame(4, { type: "notebooks-listed", notebooks: [{ name: "Work" }] }),
+      frame(5, { type: "login-success" }),
+    ];
+
+    const sub = subscribe(runner.sse);
+    await adapter.listNotebooks(SESSION);
+    await sub.received(4);
+    adapter.stopAll();
+
+    expect(seen).toEqual(["artifact-id"]);
+  });
+
+  it("fires once per frame however many browsers are attached", async () => {
+    // `#handleFrame` runs on the pump, before any delivery, so the callback
+    // counts frames and not subscribers. Two tabs on one session must not double
+    // a database write — and the test that cannot distinguish those two is a
+    // test that would pass either way.
+    const runner = await fakeRunner();
+    let calls = 0;
+    const adapter = adapterFor(runner, {
+      onExportProgress: () => {
+        calls += 1;
+      },
+    });
+
+    runner.sseFrames = [
+      frame(1, {
+        type: "export-progress",
+        id: "artifact-id",
+        progress: { pages: 12, sections: 3, assets: 40 },
+      }),
+    ];
+
+    // Two independent subscribers, exactly as two browser tabs would be.
+    const first = subscribe(runner.sse);
+    const second = subscribe(runner.sse);
+    await adapter.listNotebooks(SESSION);
+    await first.received();
+    await second.received();
+    adapter.stopAll();
+
+    expect(calls).toBe(1);
+    // Both saw it — the assertion above is about the writer, not about delivery.
+    expect(framesFrom(first.res).some((f) => f.type === "export-progress")).toBe(true);
+    expect(framesFrom(second.res).some((f) => f.type === "export-progress")).toBe(true);
+  });
+
+  it("survives a callback that throws, and delivers the next frame", async () => {
+    // **The load-bearing one.** `#handleFrame` runs inside `#pump`'s `try`, and
+    // the pump's catch drops the stream, backs off and reconnects — replaying
+    // from the last sequence number it saw, which re-delivers the frame that
+    // threw. A throw here is therefore not a crash: it is a session that spins on
+    // one frame for ever and never receives another event again, with every log
+    // line saying the right thing.
+    const runner = await fakeRunner();
+    let calls = 0;
+    const adapter = adapterFor(runner, {
+      onExportProgress: () => {
+        calls += 1;
+        throw new Error("the writer is on fire");
+      },
+    });
+
+    runner.sseFrames = [
+      frame(1, {
+        type: "export-progress",
+        id: "artifact-id",
+        progress: { pages: 1, sections: 1, assets: 1 },
+      }),
+      // A different type, so its arrival is proof the pump is still consuming
+      // rather than proof that it re-delivered the first frame.
+      frame(2, { type: "export-log", id: "artifact-id", line: "still alive" }),
+    ];
+
+    const sub = subscribe(runner.sse);
+    await adapter.listNotebooks(SESSION);
+    const events = await sub.received(2);
+    adapter.stopAll();
+
+    expect(calls).toBe(1);
+    // The frame *after* the one that threw is still delivered, which is the whole
+    // claim: an uncaught throw here would have dropped the stream, and this event
+    // would never exist.
+    expect(events.map((e) => e.type)).toContain("export-log");
+  });
+
+  it("skips a replayed older frame and writes a genuinely newer one", async () => {
+    // The real coalescing writer, not a double, driven through the adapter over
+    // real frames. `#pump` reconnects and replays from `since`, so the last frame
+    // before a dropped connection arrives **again** — and it carries older counts.
+    // Writing it would make the card count down, which is a worse lie than the
+    // zeros this replaced.
+    const { createExportProgressWriter } = await import("../src/index.js");
+    const runner = await fakeRunner();
+    const writes: Array<{ pages: number; sections: number; assets: number }> = [];
+    let clock = 1_000_000;
+    const writer = createExportProgressWriter(
+      (_guid, progress) => {
+        writes.push(progress);
+        return 1;
+      },
+      () => (clock += 2_000), // comfortably past the one-second rate limit
+    );
+    const adapter = adapterFor(runner, { onExportProgress: writer.onExportProgress });
+
+    runner.sseFrames = [
+      frame(1, {
+        type: "export-progress",
+        id: "artifact-id",
+        progress: { pages: 12, sections: 3, assets: 40 },
+      }),
+      // The replay: the same numbers the runner had when the stream dropped.
+      frame(1, {
+        type: "export-progress",
+        id: "artifact-id",
+        progress: { pages: 12, sections: 3, assets: 40 },
+      }),
+      // And an older one still, which is what a runner restarting its own
+      // counter looks like.
+      frame(0, {
+        type: "export-progress",
+        id: "artifact-id",
+        progress: { pages: 2, sections: 1, assets: 5 },
+      }),
+      frame(2, {
+        type: "export-progress",
+        id: "artifact-id",
+        progress: { pages: 29, sections: 1, assets: 8 },
+      }),
+    ];
+
+    const sub = subscribe(runner.sse);
+    await adapter.listNotebooks(SESSION);
+    await sub.received(4);
+    adapter.stopAll();
+
+    expect(writes).toEqual([
+      { pages: 12, sections: 3, assets: 40 },
+      { pages: 29, sections: 1, assets: 8 },
+    ]);
+  });
+
+  it("writes at most one frame per second, and skips a throttled frame rather than queueing it", async () => {
+    // The runner announces once per **section**, so a burst inside one second is
+    // not a burst — it is one export moving fast. And the frame that is skipped is
+    // not lost: `completeExport` writes the final counts on its own path, which is
+    // why a drop is safe here and would not be if the terminal went through the
+    // same throttle.
+    const { createExportProgressWriter } = await import("../src/index.js");
+    const runner = await fakeRunner();
+    const writes: number[] = [];
+    const writer = createExportProgressWriter(
+      (_guid, progress) => {
+        writes.push(progress.pages);
+        return 1;
+      },
+      // Frozen: every frame arrives in the same millisecond, so only the rate
+      // limit can be what is doing the skipping.
+      () => 5_000,
+    );
+    const adapter = adapterFor(runner, { onExportProgress: writer.onExportProgress });
+
+    runner.sseFrames = [
+      frame(1, { type: "export-progress", id: "a", progress: { pages: 1 } }),
+      frame(2, { type: "export-progress", id: "a", progress: { pages: 2 } }),
+      frame(3, { type: "export-progress", id: "a", progress: { pages: 3 } }),
+    ];
+
+    const sub = subscribe(runner.sse);
+    await adapter.listNotebooks(SESSION);
+    await sub.received(3);
+    adapter.stopAll();
+
+    expect(writes).toEqual([1]);
+  });
+
+  it("forgets a session the database refuses, so the next export of it starts clean", async () => {
+    // `updateExportProgress` answers 0 for exactly one reason: this row's export
+    // is not `queued`/`running` any more, or the row is gone. Done, partial,
+    // aborted, stranded and erased all read that way, so this one return value is
+    // what ends the coalescing without any of those paths knowing it exists.
+    const { createExportProgressWriter } = await import("../src/index.js");
+    const runner = await fakeRunner();
+    let refused = false;
+    const writes: number[] = [];
+    // The clock moves, so what is being observed here is the **refusal** and not
+    // the rate limit: with a frozen clock every later frame is throttled away and
+    // the test would pass for the wrong reason.
+    let clock = 1_000;
+    const writer = createExportProgressWriter(
+      (_guid, progress) => {
+        if (refused) return 0;
+        writes.push(progress.pages);
+        return 1;
+      },
+      () => (clock += 2_000),
+    );
+    const adapter = adapterFor(runner, { onExportProgress: writer.onExportProgress });
+
+    runner.sseFrames = [
+      frame(1, { type: "export-progress", id: "a", progress: { pages: 29 } }),
+    ];
+    const sub = subscribe(runner.sse);
+    await adapter.listNotebooks(SESSION);
+    await sub.received();
+    adapter.stopAll();
+    expect(writes).toEqual([29]);
+
+    // The export finishes: `completeExport` has moved the row to `done`, so a
+    // later frame for this session is refused — and that refusal is the only
+    // signal the writer gets that the export is over.
+    refused = true;
+    writer.onExportProgress(SESSION, "a", { pages: 40, sections: 2, assets: 9 });
+    expect(writes).toEqual([29]);
+
+    // A second export of the same session starts from zero, and its first frame
+    // must not be skipped as "not ahead of" the first export's 40 pages. A writer
+    // that had forgotten nothing would drop it, and the card would sit at the
+    // *previous* export's totals for its whole run.
+    refused = false;
+    writer.onExportProgress(SESSION, "b", { pages: 1, sections: 1, assets: 1 });
+    expect(writes).toEqual([29, 1]);
+  });
+
+  it("forgets on the terminal, so a next export is not compared against the last one's totals", async () => {
+    // The eager half. `onExportFinished` calls `forget` in its `finally`, because
+    // `completeExport` has four endings that never reach `db.completeExport` — a
+    // thrown walk, an empty notebook, a total loss of pages, a failed publish —
+    // and each of those leaves `export_state` at `failed`, not `running`. Without
+    // the forget, the entry survives the whole session and the second export's
+    // first frames are skipped as "not ahead of".
+    const { createExportProgressWriter } = await import("../src/index.js");
+    const writes: number[] = [];
+    const writer = createExportProgressWriter(
+      (_guid, progress) => {
+        writes.push(progress.pages);
+        return 1;
+      },
+      () => 1_000,
+    );
+
+    writer.onExportProgress(SESSION, "a", { pages: 29, sections: 1, assets: 8 });
+    expect(writes).toEqual([29]);
+    // Still remembered while the export is running — forgetting here would let a
+    // rate-limited burst through.
+    writer.onExportProgress(SESSION, "a", { pages: 31, sections: 1, assets: 8 });
+    expect(writes).toEqual([29]);
+
+    writer.forget(SESSION);
+    writer.onExportProgress(SESSION, "b", { pages: 2, sections: 1, assets: 1 });
+    expect(writes).toEqual([29, 2]);
   });
 });
 

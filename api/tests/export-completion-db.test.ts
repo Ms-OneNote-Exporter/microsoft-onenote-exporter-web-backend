@@ -87,6 +87,13 @@ describe("completeExport", () => {
       progress: { pages: 12, sections: 3, assets: 40 },
       startedAt: NOW,
       finishedAt: NOW + 5_000,
+      // Zeros, because these cases are clean exports. Passed rather than omitted
+      // because that is what `export-completion.ts` does with the real counts,
+      // and a terminal is the one moment where "nothing failed" is *measured*
+      // rather than merely absent.
+      failedSections: 0,
+      failedPages: 0,
+      failedGroups: 0,
     });
 
     // Read back rather than trusting the return value: the return says a row
@@ -112,6 +119,9 @@ describe("completeExport", () => {
       progress: null,
       startedAt: NOW,
       finishedAt: NOW + 5_000,
+      failedSections: 0,
+      failedPages: 0,
+      failedGroups: 0,
     });
 
     // `authenticated`, not a new state and not `exporting`. The session is still
@@ -137,6 +147,13 @@ describe("completeExport", () => {
       progress: { pages: 12, sections: 3, assets: 40 },
       startedAt: NOW,
       finishedAt: NOW + 5_000,
+      // Zeros, because these cases are clean exports. Passed rather than omitted
+      // because that is what `export-completion.ts` does with the real counts,
+      // and a terminal is the one moment where "nothing failed" is *measured*
+      // rather than merely absent.
+      failedSections: 0,
+      failedPages: 0,
+      failedGroups: 0,
     });
 
     const parsed = JSON.parse(row().export_state!) as Record<string, unknown>;
@@ -163,6 +180,9 @@ describe("completeExport", () => {
       progress: null,
       startedAt: NOW,
       finishedAt: NOW + 1_000,
+      failedSections: 0,
+      failedPages: 0,
+      failedGroups: 0,
     });
 
     const parsed = JSON.parse(row().export_state!) as Record<string, unknown>;
@@ -184,6 +204,9 @@ describe("completeExport", () => {
       progress: null,
       startedAt: NOW,
       finishedAt: NOW,
+      failedSections: 0,
+      failedPages: 0,
+      failedGroups: 0,
     });
 
     expect(recorded).toBe(false);

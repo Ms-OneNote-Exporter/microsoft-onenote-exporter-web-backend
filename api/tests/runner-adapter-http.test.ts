@@ -41,6 +41,7 @@ import { Readable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Db } from "../src/db.js";
+import { completeExport, type ExportCompletionDeps } from "../src/export-completion.js";
 import { hashSecret } from "../src/session.js";
 import {
   HttpRunnerAdapter,
@@ -1367,5 +1368,330 @@ describe("a finished export is handed on, not just published", () => {
       failedGroups: 0,
       notebookNotFound: false,
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+/**
+ * The terminal is emitted **after** the artifact it announces.
+ *
+ * ## What was wrong, and how it was known
+ *
+ * `publish` emitted `export-done` to the hub and only then called the completion
+ * callback. The browser received the terminal, correctly called `refreshStatus()`,
+ * and read a snapshot taken before `completeExport` had written the row. Nothing
+ * triggers a second refresh, so the card sat on "Exporting 0 pages, 0 sections,
+ * 0 assets" with no link until the user reloaded by hand.
+ *
+ * Proved far-side in one run, not inferred from the handler: the instrumented
+ * stream showed the terminal **arriving**, SQLite read-only showed `done` with an
+ * `artifact_id` and `export published` in the log, and the browser showed no link.
+ * The architecture documents the opposite order — *completeExport → record id +
+ * counts + finished_at*, then *SSE export-done → the snapshot gains
+ * `artifact.downloadUrl`* — and the code did it backwards.
+ *
+ * ## Why these tests run the real chain
+ *
+ * The ordering asserted is the ordering of the three steps that produce a
+ * download, so the wiring here is the **real** `completeExport`, with the adapter
+ * standing in as its runner and only the orchestrator's HTTP client and the
+ * database's row writer recorded. A hand-rolled callback that pushes a string would
+ * assert a mock's order, which is the mistake this file was written to stop.
+ *
+ * The timeline is recorded by wrapping the subscriber's `write`, which `SseHub.emit`
+ * calls synchronously — so each entry is the moment the event was published, not the
+ * moment a test got round to looking. Polling for the frame instead would let the
+ * very ordering under test slip past unremarked.
+ */
+describe("the terminal is emitted after the artifact it announces", () => {
+  const ARTIFACT = "A".repeat(43);
+
+  function doneFrame(id = ARTIFACT): string {
+    return `id: 1\ndata: ${JSON.stringify({
+      type: "export-done",
+      id,
+      notebook: "Notebook",
+      pages: 20,
+      sections: 7,
+      assets: 55,
+      failedSections: 0,
+      failedPages: 0,
+      failedGroups: 0,
+    })}\n\n`;
+  }
+
+  function partialFrame(id = ARTIFACT, seq = 1): string {
+    return `id: ${seq}\ndata: ${JSON.stringify({
+      type: "export-partial",
+      id,
+      reason: "aborted",
+    })}\n\n`;
+  }
+
+  function abortedFrame(id = ARTIFACT): string {
+    return `id: 1\ndata: ${JSON.stringify({ type: "export-aborted", id })}\n\n`;
+  }
+
+  /**
+   * The real completion chain, wired to a recording db and orchestrator.
+   *
+   * Staging is not recorded by a spy but delegated to the adapter, so the first
+   * step is a real HTTP request to the fake runner — the same "the bytes arrived"
+   * discipline as the rest of this file. The `stage` marker is pushed before it, so
+   * the timeline shows where in the chain the request was made.
+   */
+  function completionDeps(adapter: HttpRunnerAdapter, order: string[]): ExportCompletionDeps {
+    return {
+      runner: {
+        publishArtifact: (request) => {
+          order.push("stage");
+          return adapter.publishArtifact(request);
+        },
+      },
+      orchestrator: {
+        finalize: vi.fn(async (request) => {
+          order.push("finalize");
+          return {
+            ok: true,
+            value: {
+              artifactId: request.artifactId,
+              archiveName: request.partial ? "vault.partial.zip" : "vault.zip",
+              bytes: 2048,
+              partial: request.partial,
+            },
+          };
+        }),
+      },
+      db: {
+        completeExport: vi.fn(() => {
+          order.push("record");
+          return true;
+        }),
+        markExportUnpublishable: vi.fn(() => {
+          order.push("unpublishable");
+          return true;
+        }),
+      },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    };
+  }
+
+  /** A subscriber that appends `emit:<type>` to the timeline as frames are written. */
+  function timeline(sse: SseHub, order: string[] = []): ReturnType<typeof subscribe> {
+    const sub = subscribe(sse);
+    const write = sub.res.write;
+    sub.res.write = ((chunk: string) => {
+      for (const frame of framesFrom({ written: [String(chunk)] })) {
+        order.push(`emit:${frame.type}`);
+      }
+      return write(chunk);
+    }) as ServerResponse["write"];
+    return sub;
+  }
+
+  it("emits export-done after completeExport has recorded the artifact", async () => {
+    const order: string[] = [];
+    const runner = await fakeRunner();
+    const sub = timeline(runner.sse, order);
+    const adapter = adapterFor(runner, {
+      onExportFinished: (input) => completeExport(completionDeps(adapter, order), input),
+    });
+
+    runner.sseFrames = [doneFrame()];
+    await adapter.listNotebooks(SESSION);
+    await adapter.drain();
+
+    // The whole assertion, in one list: stage, finalise, record, **then** the
+    // terminal. The browser's refresh — which this event triggers — now reads a row
+    // that exists. Before the fix the first entry was `emit:export-done` and the
+    // refresh read a session that was still `running` with `finishedAt: null`.
+    expect(order).toEqual(["stage", "finalize", "record", "emit:export-done"]);
+
+    // And `drain()` observes the emit: the frame is on the wire the moment
+    // `drain()` resolves, read **without polling** so that is asserted rather than
+    // waited for. `drain()` awaits the tracked task, and the terminal is emitted
+    // inside it — what releases this await is the export's own completion.
+    const frames = framesFrom(sub.res);
+    expect(frames.map((f) => f.type)).toEqual(["export-done"]);
+    // The payload is the one the frame handler read, counts and all — captured at
+    // frame-handling time rather than re-derived when the chain finally settled.
+    expect(frames[0].data).toMatchObject({
+      id: ARTIFACT,
+      notebook: "Notebook",
+      pages: 20,
+      sections: 7,
+      assets: 55,
+    });
+  });
+
+  it("emits export-partial after the partial vault is recorded, because it raced identically", async () => {
+    const order: string[] = [];
+    const runner = await fakeRunner();
+    timeline(runner.sse, order);
+    const adapter = adapterFor(runner, {
+      onExportFinished: (input) => completeExport(completionDeps(adapter, order), input),
+    });
+
+    // An abort's vault goes through the same chain and was emitted by the same
+    // early line, so fixing `export-done` alone would have left half the terminal
+    // events announcing an artifact that did not exist yet.
+    runner.sseFrames = [partialFrame()];
+    await adapter.listNotebooks(SESSION);
+    await adapter.drain();
+
+    expect(order).toEqual(["stage", "finalize", "record", "emit:export-partial"]);
+  });
+
+  it("still emits the terminal when the completion callback throws", async () => {
+    const order: string[] = [];
+    const runner = await fakeRunner();
+    const sub = timeline(runner.sse, order);
+    const adapter = adapterFor(runner, {
+      onExportFinished: async () => {
+        order.push("callback");
+        throw new Error("archive failed: ENOSPC");
+      },
+    });
+
+    runner.sseFrames = [doneFrame()];
+    await adapter.listNotebooks(SESSION);
+    await adapter.drain();
+
+    // The card must **end**, not hang. `completeExport` is documented never to
+    // throw, but the callback is injected and a card stuck on "Exporting" for ever
+    // is the worst outcome available — so the emit is in the `finally`, and the
+    // failure is reported afterwards rather than swallowed.
+    expect(order).toEqual(["callback", "emit:export-done", "emit:error"]);
+    expect(framesFrom(sub.res).map((f) => f.type)).toEqual(["export-done", "error"]);
+  });
+
+  it("emits nothing while a completion that has not settled is still running", async () => {
+    const order: string[] = [];
+    const runner = await fakeRunner();
+    const sub = timeline(runner.sse, order);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const adapter = adapterFor(runner, { onExportFinished: () => held });
+
+    runner.sseFrames = [doneFrame()];
+    await adapter.listNotebooks(SESSION);
+    // `drain()` is not awaited here and could not be: the chain has not settled,
+    // and until it does there is no artifact to announce. This is the other half
+    // of the throwing case — deferred, not dropped.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(framesFrom(sub.res)).toHaveLength(0);
+
+    // And it was deferred rather than cancelled: the terminal arrives as soon as
+    // the chain settles, which is the whole contract.
+    release();
+    await adapter.drain();
+    expect(framesFrom(sub.res).map((f) => f.type)).toEqual(["export-done"]);
+  });
+
+  it("keeps consuming frames while the completion is still running", async () => {
+    const order: string[] = [];
+    const runner = await fakeRunner();
+    const sub = timeline(runner.sse, order);
+    let settled = false;
+    const adapter = adapterFor(runner, {
+      onExportFinished: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        settled = true;
+      },
+    });
+
+    runner.sseFrames = [
+      doneFrame(),
+      `id: 2\ndata: ${JSON.stringify({
+        type: "export-log",
+        id: ARTIFACT,
+        line: "the pump kept going",
+      })}\n\n`,
+    ];
+    await adapter.listNotebooks(SESSION);
+    await sub.received(1);
+
+    // The property the fire-and-forget design protects, and the reason the fix is
+    // "emit inside the tracked task" rather than "await it in the frame handler":
+    // `readEvents` awaits frame handling, so a frame arriving minutes into a
+    // multi-gigabyte zip must still be consumed. A user's abort click is exactly
+    // such a frame. The terminal has not been announced yet, and the pump has
+    // already moved on.
+    expect(settled).toBe(false);
+    expect(framesFrom(sub.res).map((f) => f.type)).toEqual(["export-log"]);
+  });
+
+  it("emits one terminal per artifact id, across the abort pair and a replay", async () => {
+    const runner = await fakeRunner();
+    const sub = timeline(runner.sse);
+    const seen: ExportFinishedInput[] = [];
+    const adapter = adapterFor(runner, {
+      onExportFinished: (input) => {
+        seen.push(input);
+      },
+    });
+
+    // The abort pair alone would prove nothing here — only `export-partial` reaches
+    // the publish path, so that case emits one terminal whether or not the dedupe
+    // exists ("publishes once when the same terminal event arrives twice" says so
+    // at length). The third frame is the pump's own reconnect replaying past its
+    // last sequence number, and that is what the guard is for: two renames of one
+    // staging directory, the second 409ing.
+    runner.sseFrames = [
+      abortedFrame(),
+      partialFrame(),
+      partialFrame(ARTIFACT, 2),
+    ];
+    await adapter.listNotebooks(SESSION);
+    await adapter.drain();
+
+    expect(seen).toHaveLength(1);
+    // One terminal per artifact id — and `export-aborted` still goes out, because
+    // it has no completion chain and so nothing to be ordered after.
+    expect(framesFrom(sub.res).map((f) => f.type)).toEqual(["export-aborted", "export-partial"]);
+  });
+
+  it("emits the terminal even when no completion callback is configured", async () => {
+    const runner = await fakeRunner();
+    const sub = timeline(runner.sse);
+    // No `onExportFinished` at all — a test double, or a deployment with publishing
+    // switched off. There is no chain to wait for, so the terminal is emitted
+    // straight away; dropping it instead would be the same bug one layer down, and
+    // a quieter one: a card that never ends, with nothing in the logs.
+    const adapter = adapterFor(runner);
+
+    runner.sseFrames = [doneFrame()];
+    await adapter.listNotebooks(SESSION);
+    await sub.received(1);
+
+    expect(framesFrom(sub.res).map((f) => f.type)).toEqual(["export-done"]);
+  });
+
+  it("explains a failed publish after the terminal, not before it", async () => {
+    const runner = await fakeRunner();
+    const sub = timeline(runner.sse);
+    const adapter = adapterFor(runner, {
+      onExportFinished: async () => {
+        throw new Error("archive failed: ENOSPC");
+      },
+    });
+
+    runner.sseFrames = [doneFrame()];
+    await adapter.listNotebooks(SESSION);
+    await adapter.drain();
+
+    // Pinned rather than tolerated. The emit is in the task body's `finally`, which
+    // runs before the rejection reaches the `.catch` that reports the failure — so
+    // the card ends and *then* says why the file is not there, which is the order a
+    // user can act on. Moving the emit into the outer `.finally` looks like a
+    // tidy-up, and it flips this to `error` then `export-done`: the card told it is
+    // broken before it was ever told it finished. The throwing-callback test above
+    // fails the same way, and the existing "keeps consuming events after a
+    // completion callback fails" asserts with `toContain`, which would notice
+    // neither.
+    expect(framesFrom(sub.res).map((f) => f.type)).toEqual(["export-done", "error"]);
   });
 });

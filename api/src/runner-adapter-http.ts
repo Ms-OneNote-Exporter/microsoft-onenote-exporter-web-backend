@@ -147,6 +147,22 @@ export interface ExportFinishedInput {
   readonly walkFailed?: boolean;
 }
 
+/**
+ * The terminal event a finished export announces, as the frame handler read it.
+ *
+ * Built at **frame-handling time** and handed to `#finishExport`, because the emit
+ * now happens after the completion chain settles: counts read at emit time would be
+ * counts read by a different code path minutes later, on a frame that is no longer
+ * the one in hand.
+ *
+ * `export-aborted` is deliberately not in this union — it has no completion chain
+ * and so nothing to order itself after. See the frame handler.
+ */
+interface ExportTerminal {
+  readonly type: "export-done" | "export-partial";
+  readonly data: unknown;
+}
+
 /** Options for the adapter. */
 export interface HttpRunnerAdapterOptions {
   /**
@@ -219,6 +235,11 @@ export interface HttpRunnerAdapterOptions {
    * adapter must not block the event pump waiting for it. Failures are caught and
    * logged rather than thrown — a failed publish must not kill the stream and lose
    * every subsequent event. Await `drain()` to observe them.
+   *
+   * The `export-done` / `export-partial` frame is emitted **once this settles**, not
+   * before it: that event is what makes the client refresh its status, and a refresh
+   * issued before the row exists reads a session that is still `running`. See
+   * `#finishExport`.
    */
   readonly onExportFinished?: (input: ExportFinishedInput) => Promise<void> | void;
   /** Per-request timeout. Logins and exports return immediately, so this is short. */
@@ -311,6 +332,13 @@ export class HttpRunnerAdapter implements RunnerAdapter {
    * holds at most a handful of ids for a session whose absolute TTL is twelve
    * hours, and a prune policy would be a way to lose the protection without
    * gaining anything. Cleared with the pumps, in `stopAll`.
+   *
+   * So the entries accumulate per **export of a session**, not per unit of time —
+   * there is no clock involved and none needed. And it cannot suppress a
+   * legitimate terminal: every export mints a fresh `artifactId`, so a second
+   * export of the same session is a different key. Both properties are what make
+   * this set safe to leave un-pruned, and both are worth stating here because
+   * "unbounded set" otherwise reads as a leak waiting to happen.
    */
   readonly #published = new Set<string>();
   readonly #timeoutMs: number;
@@ -570,28 +598,81 @@ export class HttpRunnerAdapter implements RunnerAdapter {
   }
 
   /**
-   * finishExport hands a terminal export to the injected completion callback.
+   * finishExport hands a terminal export to the completion callback, and emits the
+   * terminal event once that chain has settled.
    *
-   * Fire-and-forget by design, and the reason is a timing constraint rather than a
-   * convenience: `readEvents` awaits `#handleFrame` on the reader loop, so anything
-   * awaited here would stop the pump consuming frames until the publish finished.
-   * Zipping a multi-gigabyte vault takes minutes, and every event after it — the
-   * abort a user clicks, the `export-partial` that explains what happened — would
-   * sit unread behind it.
+   * ## The terminal means *downloadable*, so it is emitted last
    *
-   * So it is started, tracked in `#publishing`, and its failure is reported rather
-   * than thrown. Throwing here would be worse than dropping it: `#handleFrame` runs
-   * inside `#pump`'s try, so a rejection would tear down the event stream and lose
-   * every subsequent event for this session too.
+   * The emit used to sit in the frame handler, **before** the callback was called.
+   * The browser received `export-done`, correctly called `refreshStatus()`, and read
+   * a snapshot taken before `completeExport` had finished — stage, finalise,
+   * **record**. Nothing triggers a second refresh, so the card stayed on "Exporting
+   * 0 pages, 0 sections, 0 assets" with no link until the user reloaded by hand.
+   *
+   * Proved far-side, in one run: the instrumented stream showed `export-progress →
+   * export-done` — the terminal *arrived* — SQLite read-only showed `done` with an
+   * `artifact_id`, and the UI showed no link. The architecture documents the
+   * opposite order ("completeExport → record id + counts + finished_at", then
+   * "SSE export-done → the snapshot gains artifact.downloadUrl") and the code did it
+   * backwards. The same class as everything else this project has found: an
+   * assertion about the handler was never an assertion about the bytes at the far
+   * side.
+   *
+   * ## Inside the task body, not the outer `.catch(...).finally(...)`
+   *
+   * The emit belongs to the completion, so it goes where the completion is awaited.
+   * The outer chain is a different thing with its own reaction order: the `.catch`
+   * handler runs **first**, so an emit left in that `.finally` lands *after*
+   * `#reportPublishFailure`'s `error` — a card told the export is broken before it
+   * was ever told it finished. Two tests in `api/tests/runner-adapter-http.test.ts`
+   * fail if it is moved there, which is the only reason that placement is pinned
+   * rather than argued about.
+   *
+   * **The consequence, named:** `#reportPublishFailure`'s `error` now arrives
+   * *after* the terminal rather than before it. A failed publish ends the card and
+   * then explains itself. That is the deliberate trade — `completeExport` is
+   * documented never to throw, but the callback is injected, and a card that never
+   * ends is the worst outcome available. Tested rather than tolerated.
+   *
+   * A `db.completeExport` that returns false — the session erased between the frame
+   * and the record — also lands here: the terminal is emitted to a session with no
+   * subscriber, which the hub ignores. Harmless, and named so the emit is not
+   * "optimised" away by someone reading it as a bug later.
+   *
+   * ## Still fire-and-forget, and why this is not "await it, then emit, at the call site"
+   *
+   * The constraint is a timing one, not a convenience: `readEvents` awaits
+   * `#handleFrame` on the reader loop, so anything awaited in the frame handler
+   * stops the pump consuming frames until the publish finished. Zipping a
+   * multi-gigabyte vault takes minutes, and every event after it — the abort a user
+   * clicks, the `export-partial` that explains what happened — would sit unread
+   * behind it. Awaiting at the call site is the one shape that gets the ordering
+   * right by making the pump wait for the zip, which is the thing that must not
+   * happen.
+   *
+   * So the chain is started, tracked in `#publishing`, and its failure is reported
+   * rather than thrown. Throwing here would be worse than dropping it:
+   * `#handleFrame` runs inside `#pump`'s try, so a rejection would tear down the
+   * event stream and lose every subsequent event for this session too.
    *
    * Duplicate suppression lives here rather than in the callback, because this is
    * the only place that knows both events arrived: the runner publishes
    * `export-aborted` **and** `export-partial` for one cancellation, and a naive
-   * handler would zip and finalise the same vault twice.
+   * handler would zip and finalise the same vault twice. It now guards the
+   * terminal as well as the publish — one `export-done` per artifact id, not one
+   * per frame.
    */
-  #finishExport(input: ExportFinishedInput): void {
+  #finishExport(input: ExportFinishedInput, terminal: ExportTerminal): void {
     const callback = this.#onExportFinished;
-    if (callback === undefined) return;
+    if (callback === undefined) {
+      // No chain configured, so there is nothing for the terminal to be ordered
+      // after and nothing to wait for. Emitted synchronously rather than dropped:
+      // a callback-less adapter is a test double or a deployment with publishing
+      // switched off, and swallowing the terminal there would be the same bug one
+      // layer down — a card that never ends.
+      this.#sse.emit(input.sessionId, terminal.type, terminal.data);
+      return;
+    }
 
     // One publish per artifact id. The second terminal event for the same export is
     // a duplicate of the first, not new work.
@@ -599,7 +680,14 @@ export class HttpRunnerAdapter implements RunnerAdapter {
     this.#published.add(input.artifactId);
 
     const task = (async () => {
-      await callback(input);
+      try {
+        await callback(input);
+      } finally {
+        // In the task's own `finally`, not the outer one: the `.catch` below runs
+        // first and reports a failed publish, and a terminal that arrived after its
+        // own failure report would end a card that never saw itself begin.
+        this.#sse.emit(input.sessionId, terminal.type, terminal.data);
+      }
     })();
     this.#publishing.add(task);
     void task
@@ -961,7 +1049,7 @@ export class HttpRunnerAdapter implements RunnerAdapter {
       raw,
       this.#onAuthOutcome,
       this.#onNotebooksListed,
-      (input) => this.#finishExport(input),
+      (input, terminal) => this.#finishExport(input, terminal),
       this.#now,
     );
     if (published === "challenge-code") {
@@ -1005,7 +1093,7 @@ function publish(
   raw: Record<string, unknown>,
   onAuthOutcome?: (sessionId: string, outcome: "authenticated" | "failed") => void,
   onNotebooksListed?: (sessionId: string, names: readonly string[]) => void,
-  onExportFinished?: (input: ExportFinishedInput) => void,
+  onExportFinished?: (input: ExportFinishedInput, terminal: ExportTerminal) => void,
   now: () => number = Date.now,
 ): "published" | "dropped" | "challenge-code" {
   const str = (key: string): string => (typeof raw[key] === "string" ? (raw[key] as string) : "");
@@ -1173,13 +1261,6 @@ function publish(
         const assets = num("assets");
         const partial = !walkFailed && pages > 0 && lost > 0;
 
-        sse.emit(sessionId, "export-done", {
-          id,
-          notebook: str("notebook"),
-          pages,
-          sections: sectionTotal,
-          assets,
-        });
         // **This call is the fix.** Before it, `export-done` was published to the
         // hub and nothing else happened: no zip, no finalise, no row written. The
         // session therefore reported `running` with `finishedAt: null` forever,
@@ -1188,20 +1269,31 @@ function publish(
         //
         // The counts are forwarded rather than re-derived, so what the user is
         // shown is what the exporter actually walked.
-        onExportFinished?.({
-          sessionId,
-          artifactId: id,
-          partial,
-          partialReason: null,
-          notebook: str("notebook"),
-          progress: pages > 0 || sectionTotal > 0 || assets > 0 ? { pages, sections: sectionTotal, assets } : null,
-          finishedAt: now(),
-          failedSections,
-          failedPages,
-          failedGroups,
-          notebookNotFound,
-          walkFailed,
-        });
+        onExportFinished?.(
+          {
+            sessionId,
+            artifactId: id,
+            partial,
+            partialReason: null,
+            notebook: str("notebook"),
+            progress: pages > 0 || sectionTotal > 0 || assets > 0 ? { pages, sections: sectionTotal, assets } : null,
+            finishedAt: now(),
+            failedSections,
+            failedPages,
+            failedGroups,
+            notebookNotFound,
+            walkFailed,
+          },
+          // The terminal, as the same frame read it — built here so the payload is
+          // captured at frame-handling time, and handed over rather than emitted,
+          // because it is emitted only once the chain above has settled. See
+          // `#finishExport`: emitting it here is what left the browser refreshing
+          // a snapshot taken before the row was written.
+          {
+            type: "export-done",
+            data: { id, notebook: str("notebook"), pages, sections: sectionTotal, assets },
+          },
+        );
       } else if (type === "export-log") {
         sse.emit(sessionId, "export-log", { id, line: str("line") });
       } else if (type === "export-partial") {
@@ -1209,26 +1301,36 @@ function publish(
         const failedPages = num("failedPages");
         const failedGroups = num("failedGroups");
 
-        sse.emit(sessionId, "export-partial", { id, reason: str("reason") || "aborted" });
         // A partial vault is still a vault the user may want — §8.2 preserves what
         // is on disk — so it is **published, labelled partial**, rather than skipped.
         // The label is the orchestrator's to write and it cannot verify this bit,
         // which is exactly why it is forwarded from the side that watched the walk.
-        onExportFinished?.({
-          sessionId,
-          artifactId: id,
-          partial: true,
-          partialReason: partialReason(),
-          notebook: str("notebook"),
-          progress: progress(),
-          finishedAt: now(),
-          failedSections,
-          failedPages,
-          failedGroups,
-          notebookNotFound: raw.notebookNotFound === true,
-          walkFailed: raw.walkFailed === true,
-        });
+        //
+        // Same ordering as `export-done` above, and for the same reason: an abort's
+        // partial vault goes through the identical chain, so it raced identically.
+        onExportFinished?.(
+          {
+            sessionId,
+            artifactId: id,
+            partial: true,
+            partialReason: partialReason(),
+            notebook: str("notebook"),
+            progress: progress(),
+            finishedAt: now(),
+            failedSections,
+            failedPages,
+            failedGroups,
+            notebookNotFound: raw.notebookNotFound === true,
+            walkFailed: raw.walkFailed === true,
+          },
+          { type: "export-partial", data: { id, reason: str("reason") || "aborted" } },
+        );
       } else if (type === "export-aborted") {
+        // **The one terminal that keeps its emit here.** There is no completion
+        // chain for an abort — the vault may never exist — and the abort route
+        // writes the session's state on its own. So there is nothing to wait for
+        // and nothing to race: this event says the walk stopped, and the browser's
+        // refresh reads a row that is already correct.
         sse.emit(sessionId, "export-aborted", { id });
       } else {
         sse.emit(sessionId, "export-started", { id });

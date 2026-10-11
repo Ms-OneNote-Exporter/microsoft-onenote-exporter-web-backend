@@ -1935,7 +1935,7 @@ func TestAnAbortedClaimIsLoggedWithItsPhase(t *testing.T) {
 const deadRunnerGUID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
 
 // boundSlotOn installs one bound slot backed by a container the fake owns.
-func boundSlotOn(p *Pool, d *fakeDaemon, slotID, guid string, running bool) *fakeContainer {
+func boundSlotOn(t *testing.T, p *Pool, d *fakeDaemon, slotID, guid string, running bool) *fakeContainer {
 	t.Helper()
 	ctr := d.add(slotID, running, map[string]string{
 		"msout.role":         "runner",
@@ -1964,7 +1964,7 @@ func TestSweepReportsABoundSlotWhoseContainerIsGone(t *testing.T) {
 	now := time.Now()
 	p.now = func() time.Time { return now }
 
-	ctr := boundSlotOn(p, d, "slot-1", deadRunnerGUID, true)
+	ctr := boundSlotOn(t, p, d, "slot-1", deadRunnerGUID, true)
 	// Removed behind the pool's back — an operator's `docker rm`, a prune, or a
 	// daemon whose store did not survive. Whatever caused it, the slot still holds
 	// the id and the Engine still says the container is not there.
@@ -2006,7 +2006,7 @@ func TestSweepDoesNotReportABoundSlotWhoseInspectFailed(t *testing.T) {
 	now := time.Now()
 	p.now = func() time.Time { return now }
 
-	ctr := boundSlotOn(p, d, "slot-1", deadRunnerGUID, true)
+	ctr := boundSlotOn(t, p, d, "slot-1", deadRunnerGUID, true)
 	d.failNext("inspect", errors.New("docker engine (/var/run/docker.sock): dial unix: connection refused"))
 
 	if err := p.Sweep(t.Context()); err != nil {
@@ -2038,7 +2038,7 @@ func TestSweepReportsAStoppedBoundRunnerOnlyOnTheSecondSweep(t *testing.T) {
 	now := time.Now()
 	p.now = func() time.Time { return now }
 
-	ctr := boundSlotOn(p, d, "slot-1", deadRunnerGUID, true)
+	ctr := boundSlotOn(t, p, d, "slot-1", deadRunnerGUID, true)
 
 	if err := p.Sweep(t.Context()); err != nil {
 		t.Fatalf("first sweep: %v", err)
@@ -2129,7 +2129,7 @@ func TestSweepSkipsABoundSlotWithNoContainer(t *testing.T) {
 		ID: "slot-1", State: StateBound, SessionGUID: deadRunnerGUID,
 		CreatedAt: now, SessionExpiresAt: now.Add(time.Hour),
 	}
-	boundSlotOn(p, d, "slot-2", "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", true)
+	boundSlotOn(t, p, d, "slot-2", "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", true)
 	if err := d.RemoveContainer(t.Context(), p.slots["slot-2"].ContainerID); err != nil {
 		t.Fatalf("remove container: %v", err)
 	}
@@ -2158,7 +2158,7 @@ func TestSweepLogsADeadBoundRunnerWithItsSlotContainerAndState(t *testing.T) {
 	now := time.Now()
 	p.now = func() time.Time { return now }
 
-	ctr := boundSlotOn(p, d, "slot-1", deadRunnerGUID, true)
+	ctr := boundSlotOn(t, p, d, "slot-1", deadRunnerGUID, true)
 	if err := d.StopContainer(t.Context(), ctr.id, 0); err != nil {
 		t.Fatalf("stop container: %v", err)
 	}

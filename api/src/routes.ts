@@ -948,8 +948,11 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
       reply.header("retry-after", String(slot.retryAfterSeconds));
       return reply.code(429).send({ error: slot.reason, retryAfterSeconds: slot.retryAfterSeconds });
     }
-    // Released if the route bails below, so a failed start does not consume a
-    // global slot indefinitely.
+    // **Every exit from this handler returns the global slot.** The bails below
+    // release it explicitly, and the `finally` at the end of this handler catches
+    // the exits nobody planned for — a `db.run` failing on SQLITE_BUSY, or a
+    // throw inside the start-failure path's own writes — any of which would
+    // otherwise hold one of the six global slots until the api restarts.
     let released = false;
     const release = () => {
       if (released) return;
@@ -957,154 +960,169 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
       deps.limiter.releaseExportSlot();
     };
 
-    if (session.runner_id === null) {
-      // Same rebind as the notebooks route, for the same reason: `releaseForIdle`
-      // nulls `runner_id` after the idle deadline, and refusing here meant a signed-in
-      // session could export **once**. Every second export answered
-      // `409 no runner bound to this session` until the user signed in again.
-      const rebound = await rebindRunner(request, reply, session, deps);
-      if (rebound !== null) {
-        release();
-        return rebound;
-      }
-    }
-
-    const exportId = generateArtifactId();
-    deps.db.run(
-      `UPDATE sessions SET state = 'exporting', notebook = ?, export_state = ? WHERE guid = ?`,
-      notebook,
-      JSON.stringify({
-        state: "queued",
-        partialReason: null,
-        id: exportId,
-        notebook,
-        progress: { pages: 0, sections: 0, assets: 0 },
-        startedAt: now(),
-        finishedAt: null,
-      }),
-      session.guid,
-    );
-    deps.sse.emit(session.guid, "export-queued", { id: exportId, notebook });
-
-    if (deps.runner === undefined) {
-      // No slot leaked: the global slot taken above is returned, because nothing
-      // is going to run.
-      release();
-      return reply.code(501).send({ error: "export execution not wired yet" });
-    }
-
-    // The abort controller lives for the duration of the run. §8.2: abort
-    // preserves what is on disk and marks the artifact partial, so the only thing
-    // cancellation has to do is stop the traversal.
-    const controller = new AbortController();
-    deps.db.run(
-      `UPDATE sessions SET export_state = ? WHERE guid = ?`,
-      JSON.stringify({
-        state: "running",
-        partialReason: null,
-        id: exportId,
-        notebook,
-        // **Superseded by the first `export-progress` frame, and deliberately so.**
-        //
-        // These zeros are not the api's guess at how far the walk has got — they
-        // are the *starting* value, written because `export_state` is replaced
-        // whole and a card that renders `progress: null` has nothing to show. The
-        // runner's adapter now hands every frame to `db.updateExportProgress`,
-        // which overwrites this key and nothing else, so the first frame after
-        // the walk begins replaces them within about a second.
-        //
-        // Named here because the symptom this plan exists to fix was precisely
-        // this line being the *last* writer of all. It is still a zero; it is no
-        // longer a zero for the length of the walk. What it cannot become, and
-        // what no amount of writing here can fix, is a count **inside** a
-        // section: the exporter announces once per section (`exporter.js:1339`),
-        // so a single-section notebook — the one the user measured, 29 pages —
-        // shows these zeros until its one section closes. That is a package
-        // cadence, not an api gap; the runner's heartbeat re-publishes the last
-        // known counts between sections, and cannot invent one in the middle.
-        progress: { pages: 0, sections: 0, assets: 0 },
-        startedAt: now(),
-        finishedAt: null,
-      }),
-      session.guid,
-    );
-
     try {
-      await deps.runner.startExport({
-        sessionId: session.guid,
-        exportId,
-        notebook,
-        signal: controller.signal,
-      });
-    } catch (error) {
-      release();
+      if (session.runner_id === null) {
+        // Same rebind as the notebooks route, for the same reason: `releaseForIdle`
+        // nulls `runner_id` after the idle deadline, and refusing here meant a signed-in
+        // session could export **once**. Every second export answered
+        // `409 no runner bound to this session` until the user signed in again.
+        const rebound = await rebindRunner(request, reply, session, deps);
+        if (rebound !== null) {
+          release();
+          return rebound;
+        }
+      }
+
+      const exportId = generateArtifactId();
       deps.db.run(
-        // **`state` is reset here too**, and it is the field that matters.
-        //
-        // The route set `state = 'exporting'` above, and #44's sweeper guard is
-        // `if (session.state === "exporting") continue;` — so a session left in that
-        // state is **never** released for idle. Nothing else writes it back:
-        // `completeExport` resets it on success, `markExportUnpublishable` resets it
-        // when publishing fails, and this path — the one where the runner refused the
-        // export outright — reset only `export_state`.
-        //
-        // So an export that failed to *start* pinned its slot until `TTL.absolute`
-        // erased the whole session twelve hours later. Observed on the deployed host:
-        // a `502 export failed to start` (the runner was busy listing notebooks, the
-        // most ordinary thing in the world) left `state = exporting` and
-        // `runner_id` bound, permanently.
-        //
-        // On a pool of two, two unlucky clicks lock every user out for half a day.
-        `UPDATE sessions SET state = 'authenticated', export_state = ? WHERE guid = ?`,
+        `UPDATE sessions SET state = 'exporting', notebook = ?, export_state = ? WHERE guid = ?`,
+        notebook,
         JSON.stringify({
-          state: "failed",
+          state: "queued",
           partialReason: null,
-          // The reason a user can be shown, and the reason it survives a refresh.
-          // `sanitiseExportError` returns null for an unclassifiable failure, so
-          // the generic message is the fallback — the user always gets a reason,
-          // and never a path from the exporter's own error text.
-          error: sanitiseExportError(classifyExportFailure(error)) ?? GENERIC_EXPORT_ERROR,
           id: exportId,
           notebook,
-          progress: null,
+          progress: { pages: 0, sections: 0, assets: 0 },
           startedAt: now(),
-          finishedAt: now(),
+          finishedAt: null,
         }),
         session.guid,
       );
-      deps.sse.emit(session.guid, "error", {
-        id: exportId,
-        message: "export failed to start",
-      });
-      // The full error goes to the log, not to the browser: it is the operator's
-      // to read and may contain a path.
-      request.log.error({ session: session.guid, err: error }, "export start failed");
+      deps.sse.emit(session.guid, "export-queued", { id: exportId, notebook });
 
-      // **Not always a 502.** `busy` and `no_auth` are not gateway failures, and
-      // #40 established the vocabulary for exactly this — it was applied to the
-      // credential and notebook routes and **missed here**, so a user who clicked
-      // export while the runner was still listing notebooks was told the service was
-      // broken. Observed on the deployed host: `the runner is holding another job`
-      // rendered as `502 export failed to start`.
-      //
-      // The two call for opposite advice, so they are answered differently — and the
-      // statuses are `runnerFailure`'s, unchanged from #40, not invented here:
-      //   busy    → 503, retryable: the wait is a listing, tens of seconds
-      //   no_auth → 409, **not** retryable: the runner lost its cookie jar, and
-      //             repeating cannot help until the user signs in again
-      const failure = runnerFailure(error);
-      return reply.code(failure.status).send({
-        error: failure.message,
-        reason: failure.kind,
-        retryable: failure.retryable,
-      });
+      if (deps.runner === undefined) {
+        // No slot leaked: the global slot taken above is returned, because nothing
+        // is going to run.
+        release();
+        return reply.code(501).send({ error: "export execution not wired yet" });
+      }
+
+      // The abort controller lives for the duration of the run. §8.2: abort
+      // preserves what is on disk and marks the artifact partial, so the only thing
+      // cancellation has to do is stop the traversal.
+      const controller = new AbortController();
+      deps.db.run(
+        `UPDATE sessions SET export_state = ? WHERE guid = ?`,
+        JSON.stringify({
+          state: "running",
+          partialReason: null,
+          id: exportId,
+          notebook,
+          // **Superseded by the first `export-progress` frame, and deliberately so.**
+          //
+          // These zeros are not the api's guess at how far the walk has got — they
+          // are the *starting* value, written because `export_state` is replaced
+          // whole and a card that renders `progress: null` has nothing to show. The
+          // runner's adapter now hands every frame to `db.updateExportProgress`,
+          // which overwrites this key and nothing else, so the first frame after
+          // the walk begins replaces them within about a second.
+          //
+          // Named here because the symptom this plan exists to fix was precisely
+          // this line being the *last* writer of all. It is still a zero; it is no
+          // longer a zero for the length of the walk. What it cannot become, and
+          // what no amount of writing here can fix, is a count **inside** a
+          // section: the exporter announces once per section (`exporter.js:1339`),
+          // so a single-section notebook — the one the user measured, 29 pages —
+          // shows these zeros until its one section closes. That is a package
+          // cadence, not an api gap; the runner's heartbeat re-publishes the last
+          // known counts between sections, and cannot invent one in the middle.
+          progress: { pages: 0, sections: 0, assets: 0 },
+          startedAt: now(),
+          finishedAt: null,
+        }),
+        session.guid,
+      );
+
+      try {
+        await deps.runner.startExport({
+          sessionId: session.guid,
+          exportId,
+          notebook,
+          signal: controller.signal,
+        });
+      } catch (error) {
+        release();
+        deps.db.run(
+          // **`state` is reset here too**, and it is the field that matters.
+          //
+          // The route set `state = 'exporting'` above, and #44's sweeper guard is
+          // `if (session.state === "exporting") continue;` — so a session left in that
+          // state is **never** released for idle. Nothing else writes it back:
+          // `completeExport` resets it on success, `markExportUnpublishable` resets it
+          // when publishing fails, and this path — the one where the runner refused the
+          // export outright — reset only `export_state`.
+          //
+          // So an export that failed to *start* pinned its slot until `TTL.absolute`
+          // erased the whole session twelve hours later. Observed on the deployed host:
+          // a `502 export failed to start` (the runner was busy listing notebooks, the
+          // most ordinary thing in the world) left `state = exporting` and
+          // `runner_id` bound, permanently.
+          //
+          // On a pool of two, two unlucky clicks lock every user out for half a day.
+          `UPDATE sessions SET state = 'authenticated', export_state = ? WHERE guid = ?`,
+          JSON.stringify({
+            state: "failed",
+            partialReason: null,
+            // The reason a user can be shown, and the reason it survives a refresh.
+            // `sanitiseExportError` returns null for an unclassifiable failure, so
+            // the generic message is the fallback — the user always gets a reason,
+            // and never a path from the exporter's own error text.
+            error: sanitiseExportError(classifyExportFailure(error)) ?? GENERIC_EXPORT_ERROR,
+            id: exportId,
+            notebook,
+            progress: null,
+            startedAt: now(),
+            finishedAt: now(),
+          }),
+          session.guid,
+        );
+        deps.sse.emit(session.guid, "error", {
+          id: exportId,
+          message: "export failed to start",
+        });
+        // The full error goes to the log, not to the browser: it is the operator's
+        // to read and may contain a path.
+        request.log.error({ session: session.guid, err: error }, "export start failed");
+
+        // **Not always a 502.** `busy` and `no_auth` are not gateway failures, and
+        // #40 established the vocabulary for exactly this — it was applied to the
+        // credential and notebook routes and **missed here**, so a user who clicked
+        // export while the runner was still listing notebooks was told the service was
+        // broken. Observed on the deployed host: `the runner is holding another job`
+        // rendered as `502 export failed to start`.
+        //
+        // The two call for opposite advice, so they are answered differently — and the
+        // statuses are `runnerFailure`'s, unchanged from #40, not invented here:
+        //   busy    → 503, retryable: the wait is a listing, tens of seconds
+        //   no_auth → 409, **not** retryable: the runner lost its cookie jar, and
+        //             repeating cannot help until the user signs in again
+        const failure = runnerFailure(error);
+        return reply.code(failure.status).send({
+          error: failure.message,
+          reason: failure.kind,
+          retryable: failure.retryable,
+        });
+      }
+
+      // The slot is released when the run finishes rather than being held for the
+      // export's duration — §2.1: "Export running — no idle kill", and throughput
+      // is bounded by concurrency rather than by how long exports take.
+      release();
+      return reply.code(202).send({ id: exportId, state: "running" });
+    } finally {
+      // `released` is still false only when nothing above planned this exit —
+      // an exception escaped. The slot is returned either way; this log is the
+      // only signal the net ever fires, because the 429 a leak would eventually
+      // produce is refused silently (routes.ts:947) and RateLimiter.stats() is
+      // never called from src/.
+      if (!released) {
+        request.log.warn(
+          { session: session.guid },
+          "export route exited without releasing its global slot; returned by the finally",
+        );
+      }
+      release();
     }
-
-    // The slot is released when the run finishes rather than being held for the
-    // export's duration — §2.1: "Export running — no idle kill", and throughput
-    // is bounded by concurrency rather than by how long exports take.
-    release();
-    return reply.code(202).send({ id: exportId, state: "running" });
   });
 
   // ---- GET /internal/authorize-download -----------------------------------

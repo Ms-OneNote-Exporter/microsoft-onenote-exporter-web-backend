@@ -189,6 +189,46 @@ describe("runErase", () => {
     expect(db.getSession(GUID)).toBeUndefined();
   });
 
+  // A failure that is *reported* but not *logged* is indistinguishable from one
+  // that never happened, once the process has moved on. §11's "alert on repeats"
+  // is written against this line, so it has to name the session, the step and the
+  // error — the same three things the 500's `failedAt` alone cannot recover.
+  //
+  // Mutation-proof: delete the `log.warn("erase step failed", …)` in `note()` and
+  // this goes red, which is the only thing here that distinguishes "the machine
+  // reports the first failure" from "the machine also tells anybody".
+  it("logs the first failed step with its session, step and error", async () => {
+    seedSession(GUID, "authenticated", "slot-1");
+    const { deps } = makeDeps({ failAt: "freeze" });
+    const warned: Array<{ message: string; fields?: Record<string, unknown> }> = [];
+    const observed: EraseDeps = {
+      ...deps,
+      // Message-first, the shape `EraseDeps.log` declares: the machine must not
+      // know which logger it has been handed.
+      log: {
+        warn: (message, fields) => {
+          warned.push({ message, fields });
+        },
+      },
+    };
+
+    const outcome = await runErase(observed, GUID);
+
+    // Exactly one: `note` is called per step, and only the *first* failure is the
+    // one reported. A second line here would mean repeats are untrackable.
+    expect(warned).toHaveLength(1);
+    expect(warned[0]?.message).toBe("erase step failed");
+    expect(warned[0]?.fields?.session).toBe(GUID);
+    // The step's **union value**, not the factory's fail key. `failAt: "freeze"`
+    // is what the test asks the runner to throw; `"frozen"` is the EraseStep that
+    // records it, and the log has to agree with `failedAt` below.
+    expect(warned[0]?.fields?.step).toBe("frozen");
+    expect(String(warned[0]?.fields?.error)).toContain("freeze failed");
+    // The same failure, reported — so the log and the HTTP answer name one event.
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.failedAt).toBe("frozen");
+  });
+
   it("marks the row erasing before anything else, so an interruption is visible", async () => {
     seedSession();
     // `abort` is the first async step. If the row is already marked by the time it

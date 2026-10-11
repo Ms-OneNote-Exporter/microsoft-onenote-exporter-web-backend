@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { Writable } from "node:stream";
 import type { FastifyInstance } from "fastify";
 
 import { buildServer, type ServerDeps } from "../src/server.js";
@@ -927,5 +928,127 @@ describe("a failed export explains itself", () => {
     expect(snapshot.export.error).not.toBeNull();
     expect(snapshot.export.error).not.toMatch(/[/\\]/);
     expect(snapshot.export.error).not.toContain("Work");
+  });
+});
+
+// ---- the failed erase that said nothing ------------------------------------
+//
+// A user asked to be forgotten; the runner was already dead, so steps 2–4 all
+// transport-failed. The machine did every step anyway, deleted the row, reclaimed
+// the slot and answered `500 {"error":"erase_failed","failedAt":…}` — and wrote
+// nothing, because the route handed `runErase` no `log` and the machine's default
+// is a no-op. The response is the only trace, and it goes nowhere. §11's "alert on
+// repeats" is written against the log line that was being dropped.
+
+describe("a failed erase is not silent", () => {
+  /**
+   * A runner whose `abort` transport-fails and whose other calls answer.
+   *
+   * The dead-runner shape of the incident, reached through the first step: the
+   * first failure is `aborted`, and every step after it still runs — which is what
+   * makes the deleted row and the 500 coexist in the same request.
+   */
+  function deadRunner(): MockRunner {
+    const inner = new MockRunner({ db, sse, speed: 0 });
+    return Object.assign(inner, {
+      async abort(): Promise<void> {
+        throw new Error("runner is gone");
+      },
+    });
+  }
+
+  /**
+   * Captures what pino actually **wrote**.
+   *
+   * A `logMethod` hook would see the arguments whether or not the fields survived:
+   * pino drops a malformed field set at write time, so an assertion on raw hook
+   * arguments passes against the very adapter this change exists to prevent —
+   * `log: request.log`, which compiles (the field is optional) and emits the line
+   * with no session, no step and no error. Reading the serialised stream is what
+   * makes the test fail on that instead of on it.
+   *
+   * No `level`: Fastify defaults to info, so a warn is admitted. `level: "error"`
+   * (as in runner-failure-answer.test.ts) would make the line a no-op and this
+   * would assert nothing at all.
+   */
+  function capturingStream(): { stream: Writable; lines: () => Record<string, unknown>[] } {
+    const chunks: string[] = [];
+    const stream = new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(chunk.toString());
+        callback();
+      },
+    });
+    return {
+      stream,
+      lines: () =>
+        chunks
+          .join("")
+          .split("\n")
+          .filter((line) => line.trim().length > 0)
+          .map((line) => JSON.parse(line) as Record<string, unknown>),
+    };
+  }
+
+  async function eraseAgainstDeadRunner(): Promise<{
+    status: number;
+    body: Record<string, unknown>;
+    lines: Record<string, unknown>[];
+  }> {
+    seed();
+    const orchestrator = new FakeOrchestrator({ size: 2 });
+    // The slots exist, so step 8 has a real `runners` row to reclaim rather than
+    // reporting a second, unrelated failure.
+    syncPool(db, orchestrator.slotIds());
+    const { stream, lines } = capturingStream();
+
+    // The logger is an *option*, not a dep: `ServerDeps` has no logger field and
+    // `baseServer` reads `options.logger ?? false`.
+    const server = buildServer(
+      config,
+      {
+        db,
+        sse,
+        limiter: new RateLimiter({ logSalt: "test" }),
+        orchestrator,
+        eraseRunner: deadRunner(),
+      } satisfies ServerDeps,
+      { logger: { stream } },
+    );
+    await server.ready();
+    try {
+      const response = await server.inject({
+        method: "POST",
+        url: "/api/session/erase",
+        headers: { cookie: cookie(), origin: ORIGIN, "x-csrf-token": csrf() },
+      });
+      return { status: response.statusCode, body: response.json(), lines: lines() };
+    } finally {
+      await server.close();
+    }
+  }
+
+  it("still answers 500 naming the step, because best-effort did not finish", async () => {
+    const { status, body } = await eraseAgainstDeadRunner();
+
+    expect(status).toBe(500);
+    // `aborted` — the EraseStep value, and the first of the three that failed.
+    expect(body.failedAt).toBe("aborted");
+  });
+
+  // Mutation-proof: delete the `log:` adapter from `routes.ts` and this goes red.
+  // It is the only guard on the wiring, because `EraseDeps.log` is optional and
+  // everything above still passes without it.
+  it("writes the failure to the log, with the session, the step and the error", async () => {
+    const { lines } = await eraseAgainstDeadRunner();
+
+    const entry = lines.find((line) => line.msg === "erase step failed");
+    expect(entry).toBeDefined();
+    // Top-level keys, which is the shape pino actually emits: the machine's
+    // message-first `warn(msg, fields)` becomes pino's fields-first
+    // `warn(fields, msg)`, and the fields have to survive that inversion.
+    expect(entry?.session).toBe(GUID);
+    expect(entry?.step).toBe("aborted");
+    expect(String(entry?.error)).toContain("runner is gone");
   });
 });

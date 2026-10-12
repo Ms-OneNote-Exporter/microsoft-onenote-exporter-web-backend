@@ -35,6 +35,12 @@ export const EVENT_TYPES = [
   "login-failed",
   "auth-expired",
   "notebooks-listed",
+  // The listing's own output, forwarded from the runner as it happens. Not a
+  // terminal and not a snapshot: it is the only thing a listing has to say while
+  // it runs, and the position is load-bearing - the frontend transcribes this
+  // array with an order-sensitive `toEqual`, so this name sits immediately after
+  // `notebooks-listed` on both sides or neither side passes.
+  "listing-log",
   "export-queued",
   "export-started",
   "export-progress",

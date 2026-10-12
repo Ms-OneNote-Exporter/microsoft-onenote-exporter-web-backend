@@ -22,6 +22,7 @@
  *   challenge-seen                 (nothing: no session claim)
  *   challenge-expired              (folded into the login-result reason)
  *   login-result {ok, reason}      login-success | login-failed {reason}
+ *   listing-log {line, level}      listing-log {line, level}
  *   export-started                 export-started {id}
  *   export-progress {progress}     export-progress {id, progress}
  *   export-log {line}              export-log {id, line}
@@ -51,6 +52,22 @@ export type RunnerEvent =
   | { type: "challenge"; kind: string; label: string; number: string | null; expiresAt: string | null }
   | { type: "login-success" }
   | { type: "login-failed"; reason: string }
+  /**
+   * One line of the listing's own output, emitted while the listing runs.
+   *
+   * **A pass-through, deliberately.** The package's `listing-log {line, level}` is
+   * the whole of what a listing has to say about itself before it is finished, so
+   * there is nothing here to translate — and a listing that takes thirty seconds
+   * in silence is indistinguishable from a hung one. `level` is carried because a
+   * viewer has to tell a WARN ("network idle timeout — continuing anyway") from a
+   * routine INFO, and dropping it here would lose it for good.
+   *
+   * Ordered before `notebooks-listed` because that is when it arrives, exactly as
+   * `export-log` sits ahead of `export-done` below. There is deliberately no
+   * terminal of its own: `notebooks-listed` / `notebooks-failed` are this route's,
+   * composed from the return value and the rejection.
+   */
+  | { type: "listing-log"; line: string; level: string }
   | { type: "notebooks-listed"; notebooks: ReadonlyArray<{ name: string; url: string }> }
   | { type: "notebooks-failed"; reason: string }
   | { type: "export-started"; id: string }

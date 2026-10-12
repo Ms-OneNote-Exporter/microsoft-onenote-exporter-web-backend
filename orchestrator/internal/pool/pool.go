@@ -983,10 +983,12 @@ func (p *Pool) EnsurePool(ctx context.Context) error {
 // `slot.SessionExpiresAt` is recorded at claim time, and `api` remains the authority
 // on when a session ends — it releases idle sessions and calls Remove.
 //
-// Container age still decides two things, because both are about containers rather
-// than sessions: an **idle** slot is removed after `SlotIdleTimeout`, and `Reconcile`
-// replaces rather than adopts a container already past `RunnerTTL`, since adopting
-// one would attach a fresh budget to a browser tree of unknown vintage.
+// Container age still decides one thing, because it is about a container rather
+// than a session: an **idle** slot is removed after `SlotIdleTimeout`. A **bound**
+// container past `RunnerTTL` is adopted rather than replaced — the 5-minute budget
+// is an idle-hygiene clock, and the clocks that bound an export's life belong to
+// the runner (its own 1-hour export timeout) and to `api` (the 12-hour session
+// cap). See the adopt branch in `Reconcile`.
 //
 // ## The third rule, added: is a bound runner still there?
 //
@@ -1297,12 +1299,66 @@ func (p *Pool) Reconcile(ctx context.Context, sessionExpired func(guid string) b
 			continue
 		}
 
-		// The runner TTL is enforced here as well as in Sweep. Sweep covers a
+		// The runner TTL bounds a runner that nothing is using. Sweep covers a
 		// long-running process; this covers a host that was down, where the
-		// container may be days old by the time anything looks at it. Adopting
-		// an over-age container would attach a fresh 5-minute budget to a
+		// container may be days old by the time anything looks at it. Adopting an
+		// over-age **unbound** container would attach a fresh 5-minute budget to a
 		// browser process tree that has been running for days.
+		//
+		// It is not a bound container's rule. See the adopt branch below.
 		if p.now().Sub(createdAt) > p.cfg.RunnerTTL {
+			// **A bound runner whose session is still live is adopted, not replaced.**
+			//
+			// The 5-minute budget is an idle-hygiene clock, not a lease on the
+			// export. "Should this export still be running?" is not a question this
+			// pool holds the clocks to answer, and two clocks that can answer it
+			// already exist and belong to the components that own them: the
+			// runner's own 1-hour export timeout (`MSOUT_EXPORT_TIMEOUT_MS`,
+			// runner/src/config.ts) and the api's 12-hour absolute session cap.
+			// Neither reads the orchestrator's clock.
+			//
+			// The rule was wrong here only, which is why it is stated here at all.
+			// `Sweep` has never recycled a bound slot for age: its bound branch
+			// recycles on the **session's** expiry, and its own comment records why
+			// ("The session's own expiry is the honest bound"). Boot `Reconcile`
+			// replaced instead, and boot is every deploy — so each restart destroyed
+			// the browser holding a live export's cookie jar, and with it the walk.
+			// Worse, it could not even see the difference: `main.go` passes
+			// `NeverExpire` here because `api` is not reachable yet, so *every*
+			// bound runner reached this branch looking like a live one.
+			//
+			// Adoption is also self-correcting, which is why the safe direction is
+			// the cheap one. If the session really is gone, the api's session
+			// sweeper releases the slot within its 30s poll and `EnsurePool` refills
+			// it: one idle container for half a minute. The cost of the wrong
+			// replacement is the user's export.
+			if bound && (sessionExpired == nil || !sessionExpired(guid)) {
+				p.mu.Lock()
+				slot.ContainerID = id
+				slot.CreatedAt = createdAt
+				slot.SessionGUID = guid
+				// The same state computation the normal adopt path below makes: a
+				// container that has already exited must not be adopted as bound,
+				// because refillable() excludes StateBound and EnsurePool would
+				// never replace it.
+				switch {
+				case !ctr.State.Running:
+					slot.State = StateDead
+				default:
+					slot.State = StateBound
+				}
+				slot.BoundAt = createdAt
+				if exp, err := labels.ReadExpires(ctr.Labels); err == nil {
+					slot.SessionExpiresAt = exp
+				}
+				p.mu.Unlock()
+
+				p.log.Warn("reconcile: adopted an over-age runner whose session is still live",
+					"container", id, "slot", slotID, "session", guid,
+					"ageSeconds", int(p.now().Sub(createdAt).Seconds()))
+				continue
+			}
+
 			p.mu.Lock()
 			slot.ContainerID = id
 			slot.CreatedAt = createdAt
@@ -1323,10 +1379,16 @@ func (p *Pool) Reconcile(ctx context.Context, sessionExpired func(guid string) b
 				"container", id, "slot", slotID,
 				"ageSeconds", int(p.now().Sub(createdAt).Seconds()))
 
-			// replace() puts an idle runner in the slot, which is correct for an
-			// unbound container. A bound one is handled by the caller's own
-			// session state: the slot is marked draining, so the next claim or
-			// sweep re-establishes it with the vault remounted.
+			// Reached only for an **unbound** container now, and replace() putting
+			// a fresh idle runner in the slot is right for it. What it is no
+			// longer claimed to do is handle a bound one "via the caller's own
+			// session state": it did not. The slot ended up `idle` under a fresh
+			// container with no vault mount, while the api's session row still
+			// named this slot and still believed it held a logged-in browser — so
+			// the next claim handed the slot to somebody else with the previous
+			// user's export destroyed. The caller's session state was never going
+			// to be consulted again, because `replace` returns the slot to the
+			// pool. A bound runner now takes the adopt branch above instead.
 			if err := p.replace(ctx, slot, id); err != nil {
 				p.log.Error("reconcile: replace over-age runner", "container", id, "error", err)
 			}

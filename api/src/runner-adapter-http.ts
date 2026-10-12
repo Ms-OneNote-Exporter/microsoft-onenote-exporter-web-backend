@@ -1317,6 +1317,20 @@ function publish(
       return "published";
     }
 
+    case "listing-log":
+      // The listing's own output, mid-listing. **Its own name, and no `id`:** no
+      // artifact sits behind a listing, and the export log's `id` is exactly what
+      // tells a client that two lines belong to different work. A blank `id` here
+      // would file a listing line under an export the session never started.
+      //
+      // `{line, level}` verbatim, as `export-log` does with its line. `level`
+      // survives because the package's two WARNs — a network-idle timeout it
+      // continues past, and a failed MCAS dismissal — are otherwise
+      // indistinguishable from its routine INFO, and this frame is not persisted:
+      // it reaches the browser and ages out of the hub with everything else.
+      sse.emit(sessionId, "listing-log", { line: str("line"), level: str("level") });
+      return "published";
+
     case "notebooks-failed":
       sse.emit(sessionId, "error", { message: "notebook listing failed", reason: str("reason") });
       return "published";

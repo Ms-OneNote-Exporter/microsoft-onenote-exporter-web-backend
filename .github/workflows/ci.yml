@@ -211,6 +211,71 @@ jobs:
           fi
           echo "dist/ is free of mock code"
 
+  runner:
+    name: runner (node)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: runner
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # The same floor as the api above, for the same reason: 22.13.0 is when
+          # node:sqlite stopped being flagged, and the runner declares the floor in
+          # its own `engines`. A runner on a different Node than the api it serves is
+          # a difference nobody chose.
+          node-version: "22.13.0"
+          cache: npm
+          cache-dependency-path: runner/package-lock.json
+
+      - name: install
+        # `npm ci`, for the reason the api's install step gives: it installs exactly
+        # the lockfile and fails if package.json and the lockfile disagree, so a
+        # version nobody ran is a red build rather than a silent resolution.
+        #
+        # Which matters more here than in the api. The runner's Dockerfile asserts
+        # the dependency **set** by name, so a lockfile left at an older version of
+        # `@msout/microsoft-onenote-list-notebooks` builds an image that passes that
+        # check, ships, and then emits nothing the operator is waiting to see. The
+        # suite below is what caught that: `tests/observer-contract.test.ts` reads
+        # the installed package's own event vocabulary, so an old lockfile is a red
+        # test rather than a quiet image.
+        #
+        # **No `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD` here, and that is a deliberate
+        # difference from the api's install step.** The api sets it because that
+        # component never launches a browser - the runner owns Playwright. This one
+        # is the runner: `tests/credential.test.ts` types the credential into a
+        # real Chromium page and reads the value back out of the DOM, because
+        # asserting on the string this process *intended* to send is what let two
+        # real defects through.
+        run: npm ci
+
+      - name: install chromium
+        # Not optional, and not covered by `npm ci`.
+        #
+        # The first run of this job asserted the browser "comes down with the
+        # install" and was red in four seconds with
+        # `Executable doesn't exist at …/chromium_headless_shell-1243/…` — the
+        # postinstall that normally fetches it did not run under `npm ci` on this
+        # image, so 13 credential tests failed in `beforeAll` and 119 passed. A
+        # comment asserting a control is not a control; the explicit install is.
+        #
+        # `--with-deps` because Chromium needs system libraries the image does not
+        # carry, and `apt` is available on the GitHub runner. This is the slowest
+        # step in the job and the reason it is not a bare `vitest` invocation — and
+        # the first time the credential byte-for-byte guarantee has had CI
+        # coverage anywhere.
+        run: npx playwright install --with-deps chromium
+
+      - name: typecheck
+        run: npm run typecheck
+
+      - name: test
+        # `vitest run`, not `vitest`. A watch-mode suite in CI is a job that
+        # reports success without having run anything.
+        run: npx vitest run
+
   # The infra files cannot be run here: this job has a Docker daemon, but the
   # capability assertions in capability.yml need a stack that does not exist yet.
   # What it *can* do is parse and resolve them, which catches the majority of

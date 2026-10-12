@@ -67,6 +67,10 @@ import { loadConfig, type RunnerConfig } from "./config.js";
 import { EventHub, formatSse, SSE_KEEPALIVE, type RunnerEvent } from "./events.js";
 import { JobSlot, JobBusyError, makeSessionDirs, removeSessionDirs, sessionPaths } from "./sessions.js";
 import { isValidGuid, readAccount, readCredentialBytes, passwordFrom } from "./credential.js";
+// A type, and only a type: `import type` is erased at emit, so this cannot become
+// the static `require` the lazy `packages()` below exists to avoid. The type
+// itself is hand-written in `msout.d.ts` — the packages ship no declarations.
+import type { ListEvent } from "@msout/microsoft-onenote-list-notebooks";
 
 /** How often an idle SSE stream is kept alive. */
 const KEEPALIVE_MS = 15_000;
@@ -405,6 +409,18 @@ export function buildApp(
         const notebooks = await listNotebooks({
           authFile: paths.authFile,
           keepOpen: false,
+          // The listing's own output, forwarded as it happens. The same inline
+          // shape the login and the export use, and for the same reason: a
+          // listing that produces nothing for thirty seconds is a listing nobody
+          // can tell from a hung one. `ListEvent` is the package's own vocabulary
+          // — one name, frozen in `LIST_EVENT_TYPES` — so there is nothing to
+          // translate and the type does the filtering a `switch` would otherwise
+          // do.
+          //
+          // Forwarded verbatim: the package already redacts its auth-file paths
+          // and emits the line undecorated (no timestamp, no colour), so there is
+          // nothing here to strip and nothing that could carry a secret.
+          onEvent: (event: ListEvent) => hub.publish(guid, event),
         });
 
         hub.publish(guid, {

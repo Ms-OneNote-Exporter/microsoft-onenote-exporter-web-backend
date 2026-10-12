@@ -71,17 +71,53 @@ declare module "@msout/microsoft-onenote-list-notebooks" {
   }
 
   /**
+   * One event from `listNotebooks()`. Mirrors `LIST_EVENT_TYPES`, which is
+   * **not** on the package's main entry — it is exported by the
+   * `@msout/microsoft-onenote-list-notebooks/observer` subpath, alongside
+   * `createListingObserver`. `tests/observer-contract.test.ts` reads it from
+   * there.
+   *
+   * One name, and it is a literal rather than `string`: the package freezes the
+   * list, so a second name would be a package change this declaration would have
+   * to absorb silently. `ListEvent` and the runner's own `RunnerEvent` member are
+   * the same three fields, which is why a line can be published without being
+   * rebuilt.
+   */
+  export interface ListEvent {
+    readonly type: "listing-log";
+    /** Already undecorated by the package: no timestamp, no colour escapes. */
+    readonly line: string;
+    readonly level: string;
+  }
+
+  /**
    * Lists notebooks from a saved session.
    *
-   * Returns `{notebooks, browser, context}`. `keepOpen` decides whether the
-   * browser is left running for a caller that needs it — the runner passes
-   * `false` because it has no use for a browser it would then have to close.
+   * **Resolves a bare array — `NotebookEntry[]`, not `{notebooks}`.** The
+   * declaration previously said `{notebooks: NotebookEntry[]}`, which was simply
+   * false, and the false part was load-bearing: `result.notebooks` on an array is
+   * `undefined`, so `?? []` produced an empty list and the runner published an
+   * empty notebook list on every run. See the route in `src/index.ts`.
+   *
+   * `keepOpen` is **not read by the package** — there is no such option in
+   * `listNotebooks()` — so the runner's `keepOpen: false` is inert and the
+   * browser is closed by the package itself when the listing returns. Kept in the
+   * declaration because the call site still passes it: the honest correction is to
+   * stop describing it as behaviour, not to leave the typecheck failing on a
+   * line nobody has agreed to delete.
+   *
+   * `onEvent` is optional and its absence is the package's default: a listing
+   * without one behaves exactly as it did before 0.0.8, which is what its CLI
+   * relies on. So a runner on 0.0.7 and a runner on 0.0.8 both list; only the
+   * lines differ.
    */
   export function listNotebooks(options: {
     authFile: string;
+    /** Inert. See above: no such option in the package. */
     keepOpen?: boolean;
     notheadless?: boolean;
-  }): Promise<{ notebooks: NotebookEntry[] }>;
+    onEvent?: (event: ListEvent) => void;
+  }): Promise<NotebookEntry[]>;
 }
 
 declare module "@msout/microsoft-onenote-export-notebook" {

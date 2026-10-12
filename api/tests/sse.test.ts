@@ -436,6 +436,11 @@ describe("event types", () => {
       "login-failed",
       "auth-expired",
       "notebooks-listed",
+      // Not in PLAN-v2 §7.1, like `snapshot` below: the listing's own output,
+      // carried from the package through the runner. Here because this array is
+      // the contract and this loop is its containment check - the frontend's
+      // transcription of the order is the one that can fail on a position.
+      "listing-log",
       "export-queued",
       "export-started",
       "export-progress",

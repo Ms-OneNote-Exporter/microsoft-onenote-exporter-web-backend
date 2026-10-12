@@ -565,6 +565,55 @@ describe("runner events reach the api's own vocabulary", () => {
     expect(done?.data).toMatchObject({ id: "artifact-id", pages: 20, sections: 7 });
   });
 
+  it("carries a listing's log line through, with its level", async () => {
+    const runner = await fakeRunner();
+    const adapter = adapterFor(runner);
+
+    runner.sseFrames = [
+      `id: 1\ndata: ${JSON.stringify({
+        type: "listing-log",
+        line: "Network idle timeout - continuing anyway...",
+        level: "warn",
+      })}\n\n`,
+    ];
+
+    const sub = subscribe(runner.sse);
+    await adapter.listNotebooks(SESSION);
+    const events = await sub.received();
+
+    // The whole point of the level. Both warnings this listing can emit are ones
+    // it continues past anyway, so without the level the frame says nothing a
+    // client could act on and the two cases read identically.
+    const log = events.find((e) => e.type === "listing-log");
+    expect(log?.data).toEqual({
+      line: "Network idle timeout - continuing anyway...",
+      level: "warn",
+    });
+  });
+
+  it("files a listing's line under no export, and invents no id for it", async () => {
+    const runner = await fakeRunner();
+    const adapter = adapterFor(runner);
+
+    runner.sseFrames = [
+      `id: 1\ndata: ${JSON.stringify({
+        type: "listing-log",
+        line: "Found 3 notebooks!",
+        level: "info",
+      })}\n\n`,
+    ];
+
+    const sub = subscribe(runner.sse);
+    await adapter.listNotebooks(SESSION);
+    const events = await sub.received();
+
+    // **Not an `export-log` with a missing id.** `export-log` carries the artifact
+    // id that tells two lines apart; a listing has no artifact, so a blank id
+    // would file this line under an export the session never started.
+    expect(events.map((e) => e.type)).toEqual(["listing-log"]);
+    expect(events[0]?.data).not.toHaveProperty("id");
+  });
+
   it("forwards a replay gap rather than hiding it", async () => {
     const runner = await fakeRunner();
     const adapter = adapterFor(runner);

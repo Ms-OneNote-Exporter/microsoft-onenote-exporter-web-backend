@@ -310,6 +310,172 @@ func TestReconcileRecyclesARunnerPastTheRunnerTTL(t *testing.T) {
 	}
 }
 
+// The over-age rule has two inputs and one of them used to be ignored: whether the
+// container is bound, and whether its session is still alive. Only the bound-and-
+// live cell is new, and it is not an edge case — `main.go` passes `NeverExpire`
+// because `api` is not reachable during boot, so on every deploy *every* bound
+// runner arrives at this branch looking live. Replacing one killed the browser
+// holding the cookie jar of an export in progress.
+//
+// The other three cells are pinned here too, so the new branch cannot be widened
+// by accident: the expired cell is still an orphan (the check above the TTL branch
+// removes it, and age is not what decides that), and unbound stays replaced.
+func TestReconcileOverAgeAdoptsOnlyABoundRunnerWithALiveSession(t *testing.T) {
+	guid := "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+	expired := func(g string) bool { return g == guid }
+
+	cases := []struct {
+		name    string
+		bound   bool
+		session func(string) bool
+		want    string // adopted | removed | replaced
+	}{
+		{
+			name:    "bound to a live session is adopted",
+			bound:   true,
+			session: nothingExpired,
+			want:    "adopted",
+		},
+		{
+			name:    "bound to an expired session is removed as an orphan",
+			bound:   true,
+			session: expired,
+			want:    "removed",
+		},
+		{
+			name:    "unbound is replaced",
+			bound:   false,
+			session: nothingExpired,
+			want:    "replaced",
+		},
+		{
+			name:    "unbound is replaced whatever the predicate says",
+			bound:   false,
+			session: expired,
+			want:    "replaced",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newReconcileFixture(t, 1, &Slot{ID: "slot-1"})
+			created := f.now.Add(-2 * time.Hour) // far past the 5-minute budget
+
+			// The expires label is derived from the predicate rather than set per
+			// case, so a cell cannot pass on a label that contradicts its own
+			// premise.
+			expires := f.now.Add(-time.Hour)
+			if !tc.session(guid) {
+				expires = f.now.Add(time.Hour)
+			}
+
+			ctr := f.d.add("over-age", true, runnerLabels("slot-1", tc.bound, created, expires))
+
+			if err := f.p.Reconcile(t.Context(), tc.session); err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+
+			slots := f.p.Slots()
+			if len(slots) != 1 {
+				t.Fatalf("slots = %d, want 1", len(slots))
+			}
+
+			switch tc.want {
+			case "adopted":
+				// The container that is still there is the one holding the browser,
+				// so it has to survive reconciliation intact.
+				if _, err := f.d.InspectContainer(t.Context(), ctr.id); err != nil {
+					t.Fatalf("an over-age runner bound to a live session was destroyed; "+
+						"it holds the browser an export in progress is walking in: %v", err)
+				}
+				if slots[0].ContainerID != ctr.id {
+					t.Errorf("adopted container = %q, want %q", slots[0].ContainerID, ctr.id)
+				}
+				if slots[0].State != StateBound {
+					t.Errorf("state = %q, want bound", slots[0].State)
+				}
+				if slots[0].SessionGUID != guid {
+					t.Errorf("adopted session = %q, want %q", slots[0].SessionGUID, guid)
+				}
+				// BoundAt is what the api reads as "when did this session bind".
+				// The normal adopt path stamps it with the container's creation time
+				// because at boot that is the only record of the bind that outlived
+				// the process, so this path has to write it too — the replace path's
+				// bookkeeping never did, which is part of why the slot it produced
+				// was nonsense.
+				if slots[0].BoundAt.UnixMilli() != created.UnixMilli() {
+					t.Errorf("BoundAt = %v, want %v", slots[0].BoundAt, created)
+				}
+			case "removed":
+				// The orphan check above the TTL branch is what does this, and the
+				// outcome is the same one it gives for an expired session of any age:
+				// never resurrect a session the caller says is gone.
+				if _, err := f.d.InspectContainer(t.Context(), ctr.id); err == nil {
+					t.Error("a container bound to an expired session survived reconciliation")
+				}
+				if slots[0].SessionGUID == guid {
+					t.Errorf("slot still claims expired session %s", guid)
+				}
+				if slots[0].ContainerID == ctr.id {
+					t.Errorf("slot still points at the removed container: %+v", slots[0])
+				}
+			case "replaced":
+				// An unbound runner past its budget is a browser tree holding
+				// nobody's session, which is exactly what the budget is for.
+				if _, err := f.d.InspectContainer(t.Context(), ctr.id); err == nil {
+					t.Error("the over-age container still exists after reconciliation")
+				}
+				if slots[0].ContainerID == ctr.id {
+					t.Error("the over-age container was adopted as-is")
+				}
+				if slots[0].State != StateIdle {
+					t.Errorf("replacement state = %q, want idle", slots[0].State)
+				}
+			}
+		})
+	}
+}
+
+// Adopting an over-age runner must not adopt a dead one as healthy. `refillable`
+// excludes `StateBound`, so a slot recorded as bound with a container that has
+// exited is one `EnsurePool` will never refill and nothing will ever replace: the
+// dead-runner observer in `Sweep` reports it, and the api — which holds the session
+// rows — releases it. The state has to say dead for that conversation to start.
+//
+// This is the case the adopt branch's own state computation exists for, and the
+// only thing that distinguishes it from the case above is `State.Running`.
+func TestReconcileAdoptsAnOverAgeBoundRunnerThatHasExitedAsDead(t *testing.T) {
+	guid := "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+
+	f := newReconcileFixture(t, 1, &Slot{ID: "slot-1"})
+	created := f.now.Add(-2 * time.Hour)
+	// running: false — the container has exited, and its labels still name a
+	// session the caller reports as live.
+	ctr := f.d.add("exited", false, runnerLabels("slot-1", true, created, f.now.Add(time.Hour)))
+
+	if err := f.p.Reconcile(t.Context(), nothingExpired); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	slots := f.p.Slots()
+	if slots[0].State != StateDead {
+		t.Errorf("state = %q, want dead — an exited container adopted as bound is a "+
+			"slot EnsurePool will never refill", slots[0].State)
+	}
+	// The identity is still adopted, so the slot is known and the container is
+	// left inspectable for diagnosis rather than deleted here.
+	if slots[0].ContainerID != ctr.id {
+		t.Errorf("adopted container = %q, want %q", slots[0].ContainerID, ctr.id)
+	}
+	if _, err := f.d.InspectContainer(t.Context(), ctr.id); err != nil {
+		t.Errorf("the exited container was removed here; its exit state should stay "+
+			"inspectable: %v", err)
+	}
+	if slots[0].SessionGUID != guid {
+		t.Errorf("adopted session = %q, want %q", slots[0].SessionGUID, guid)
+	}
+}
+
 // A runner with no slot label cannot be attributed to a slot. Adopting it would
 // guess, and guessing here means possibly mapping one session's container onto
 // another's slot.

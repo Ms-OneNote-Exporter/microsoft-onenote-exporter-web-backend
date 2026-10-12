@@ -238,9 +238,9 @@ jobs:
         # the dependency **set** by name, so a lockfile left at an older version of
         # `@msout/microsoft-onenote-list-notebooks` builds an image that passes that
         # check, ships, and then emits nothing the operator is waiting to see. The
-        # suite below is what caught that: `tests/observer-contract.test.ts` reads the
-        # installed package's own event vocabulary, so an old lockfile is a red test
-        # rather than a quiet image.
+        # suite below is what caught that: `tests/observer-contract.test.ts` reads
+        # the installed package's own event vocabulary, so an old lockfile is a red
+        # test rather than a quiet image.
         #
         # **No `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD` here, and that is a deliberate
         # difference from the api's install step.** The api sets it because that
@@ -248,12 +248,25 @@ jobs:
         # is the runner: `tests/credential.test.ts` types the credential into a
         # real Chromium page and reads the value back out of the DOM, because
         # asserting on the string this process *intended* to send is what let two
-        # real defects through. Skipping the download would not make that job
-        # faster, it would make it red, at 13 tests in `beforeAll`.
-        #
-        # So the browser comes down with the install. It is the slowest step in
-        # this job and the only reason this job is not a `vitest` invocation.
+        # real defects through.
         run: npm ci
+
+      - name: install chromium
+        # Not optional, and not covered by `npm ci`.
+        #
+        # The first run of this job asserted the browser "comes down with the
+        # install" and was red in four seconds with
+        # `Executable doesn't exist at …/chromium_headless_shell-1243/…` — the
+        # postinstall that normally fetches it did not run under `npm ci` on this
+        # image, so 13 credential tests failed in `beforeAll` and 119 passed. A
+        # comment asserting a control is not a control; the explicit install is.
+        #
+        # `--with-deps` because Chromium needs system libraries the image does not
+        # carry, and `apt` is available on the GitHub runner. This is the slowest
+        # step in the job and the reason it is not a bare `vitest` invocation — and
+        # the first time the credential byte-for-byte guarantee has had CI
+        # coverage anywhere.
+        run: npx playwright install --with-deps chromium
 
       - name: typecheck
         run: npm run typecheck

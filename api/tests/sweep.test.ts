@@ -1009,7 +1009,7 @@ describe("PoolBinder.releaseForIdle", () => {
     // §2.3 step 3→4: the vault survives, so activity again rebinds without a
     // re-login. Deleting the row would log the user out every time they idle.
     seedRunners(1);
-    seedSession(GUID, { state: "authenticated", auth: "valid", runner_id: "slot-1" });
+    seedSession(GUID, { state: "authenticated", auth_state: "valid", runner_id: "slot-1" });
     const { client } = orchestratorStub({ release: "ok" });
     const binder = new PoolBinder(options(client));
 
@@ -1199,7 +1199,7 @@ describe("sweep", () => {
     seedRunners(1);
     seedSession(GUID, {
       state: "authenticated",
-      auth: "valid",
+      auth_state: "valid",
       runner_id: "slot-1",
       idle_expires_at: now - 1,
     });
@@ -1290,7 +1290,7 @@ describe("sweep", () => {
   it("deletes a session past the absolute cap regardless of state", async () => {
     seedSession(GUID, {
       state: "authenticated",
-      auth: "valid",
+      auth_state: "valid",
       expires_at: now - 1,
     });
     const report = await run();
@@ -1338,7 +1338,7 @@ describe("sweep", () => {
     seedSession(OTHER, { state: "created", created_at: now });
     seedSession("11111111-1111-1111-1111-111111111111", {
       state: "authenticated",
-      auth: "valid",
+      auth_state: "valid",
       expires_at: now - 1,
     });
 
@@ -1711,7 +1711,7 @@ describe("sweep reclaims orphan bindings", () => {
   // (b) The other side of the predicate. Without this the branch would be
   // indistinguishable from "release every slot /stats mentions".
   it("leaves a slot alone when the session it is bound to still exists", async () => {
-    seedSession(GUID, { state: "authenticated", auth: "valid", runner_id: "slot-1" });
+    seedSession(GUID, { state: "authenticated", auth_state: "valid", runner_id: "slot-1" });
     bindRow("slot-1", GUID);
 
     const { report, released } = await runWith({
@@ -1887,7 +1887,7 @@ describe("sweep reclaims orphan bindings", () => {
       release: "ok",
       onRelease: (slotId) => {
         if (slotId !== "slot-1") return;
-        seedSession(DEAD_TWO, { state: "authenticated", auth: "valid", runner_id: "slot-2" });
+        seedSession(DEAD_TWO, { state: "authenticated", auth_state: "valid", runner_id: "slot-2" });
       },
     });
 

@@ -364,8 +364,23 @@ export class PoolBinder {
     // request. Three is enough to clear the drift seen in practice (a pool renumbered
     // across a restart) and short enough that a genuine disagreement surfaces as an
     // error rather than a timeout.
+    //
+    // **Slots the orchestrator has refused, kept out of the retries.**
+    //
+    // Dropping the offending row is not enough on its own, because the retry's own
+    // re-sync puts it straight back: `/stats` still lists the slot, so `syncPool`
+    // re-registers the row, and the next `claimRunner` draws from a pool that
+    // contains it again. With `ORDER BY RANDOM()` the retry is then a coin flip
+    // against the row just refused — on a two-slot pool, `(1/2)³ = 12.5%`, so seven
+    // of every eight sign-ins fail on a disagreement a single other row could have
+    // fixed. Each refusal is recorded here so the *next* attempt cannot re-draw it,
+    // which turns "spin" into "walk the pool".
+    //
+    // One set for the whole loop, not one per attempt: a second refusal must narrow
+    // the draw further, or the retry could bounce between two bad rows.
+    const excluded = new Set<string>();
     for (let attempt = 1; ; attempt++) {
-      const result = await this.#claimOnce(session, mode);
+      const result = await this.#claimOnce(session, mode, excluded);
       if (result.ok) return result;
       if (result.reason !== "slot-conflict") return result;
       if (attempt >= CLAIM_ATTEMPTS) {
@@ -379,6 +394,11 @@ export class PoolBinder {
       // was just dropped was this process's only evidence about membership, and
       // without re-learning, `claimRunner` can only pick from what is left — which, if
       // the drift removed every row, is nothing.
+      //
+      // Re-learning re-adds the refused slot, and `excluded` is what keeps that from
+      // mattering: the row comes back, but the next draw cannot be it. `syncPool` is
+      // unchanged, deliberately — it reports the orchestrator's membership, and
+      // membership is exactly the thing that is correct here.
       const stats = await this.#orchestrator.stats();
       if (!stats.ok || stats.value.slotIds === undefined) {
         // No membership to learn from. Retrying would only re-pick the same rows.
@@ -399,11 +419,27 @@ export class PoolBinder {
   /**
    * claimOnce makes one full pass: take a SQLite row, then ask the orchestrator for
    * that slot. The retry policy lives in `claimForLogin`.
+   *
+   * `excluded` is passed to both claims below, not just the first. The second one
+   * runs after a re-sync has put the refused row back, so it is the claim most at
+   * risk of re-drawing it — omitting it would leave the retry able to repeat the
+   * exact failure it exists to recover from. It is carried as a `Set` rather than a
+   * list because it accumulates across attempts, and only `#finishClaim`'s conflict
+   * branch writes to it.
    */
-  async #claimOnce(session: SessionRow, mode: ClaimMode): Promise<ClaimResult> {
+  async #claimOnce(
+    session: SessionRow,
+    mode: ClaimMode,
+    excluded: Set<string>,
+  ): Promise<ClaimResult> {
     const now = this.#now();
+    // `claimRunner` takes a list, and one is taken here rather than at each call
+    // site because both claims below read the same set: the only thing that writes
+    // to it is `#finishClaim`'s conflict branch, which is downstream of the second
+    // claim and returns from it.
+    const skip: readonly string[] = [...excluded];
 
-    if (!this.#db.claimRunner(session.guid)) {
+    if (!this.#db.claimRunner(session.guid, skip)) {
       // Pool exhaustion. §2.6: the caller shows the earliest of
       // (idle_expires_at, expires_at) minus now, or says plainly that every
       // session is busy rather than showing a countdown that will not move.
@@ -441,9 +477,9 @@ export class PoolBinder {
             added: learned.added,
             total: learned.total,
           });
-          if (this.#db.claimRunner(session.guid)) {
+          if (this.#db.claimRunner(session.guid, skip)) {
             // Fall through to the rest of the claim on the success path below.
-            return this.#finishClaim(session, now, mode);
+            return this.#finishClaim(session, now, mode, excluded);
           }
         }
       }
@@ -461,11 +497,29 @@ export class PoolBinder {
         });
         return { ok: false, reason: "pool-exhausted", fillError };
       }
+
+      // **A draw emptied by its own exclusions is not an exhausted pool.**
+      //
+      // This is the one place the exclusion set can change the answer rather than
+      // only the pick, and it has to: excluding a refused slot makes the draw fail
+      // for a reason that has nothing to do with anybody else using the pool. When
+      // every slot the orchestrator names has been refused, reporting `pool-exhausted`
+      // tells the user to wait for capacity that cannot admit them — the same
+      // misreading the conflict branch exists to prevent, one step further from its
+      // cause. So the refusal is reported as the refusal it is.
+      if (drawEmptiedByExclusions(stats, excluded)) {
+        this.#log.warn("every slot the orchestrator names has been refused", {
+          session: session.guid,
+          excluded: excluded.size,
+        });
+        return { ok: false, reason: "slot-conflict" };
+      }
+
       this.#log.info("pool exhausted", { session: session.guid });
       return { ok: false, reason: "pool-exhausted" };
     }
 
-    return this.#finishClaim(session, now, mode);
+    return this.#finishClaim(session, now, mode, excluded);
   }
 
   /**
@@ -475,11 +529,14 @@ export class PoolBinder {
    * on the first attempt and once after learning the pool's membership. Both
    * paths must be identical from here — the row is claimed, so everything that
    * follows assumes exactly that.
+   *
+   * `excluded` is where the set is written, and only in the conflict branch below.
    */
   async #finishClaim(
     session: SessionRow,
     now: number,
     mode: ClaimMode,
+    excluded: Set<string>,
   ): Promise<ClaimResult> {
     const claimed = this.#db.get<{ id: string }>(
       `SELECT id FROM runners WHERE session_guid = ?`,
@@ -524,12 +581,29 @@ export class PoolBinder {
       // Removing the row is what the orchestrator's answer means: it does not have this
       // slot, so this process should stop offering it. `syncPool` puts back the ones
       // that do exist.
+      //
+      // **And the slot is recorded as refused for the rest of this session's retry.**
+      // Dropping the row alone does not survive the retry: `/stats` still lists the
+      // slot, `syncPool` re-registers it, and `ORDER BY RANDOM()` can draw it straight
+      // back. The row being gone between attempts and the row being *offered* again are
+      // different facts, and only the second one makes progress — so the refusal is
+      // remembered here, where it is observed, rather than left to be re-derived by
+      // another lottery.
+      //
+      // **Only `conflict` writes to the set.** The floor refusal further down is also a
+      // "no", but it means the opposite: that slot is valid and merely not ready yet.
+      // Excluding it would shrink the pool this loop still has to draw from, and on a
+      // small pool it would turn a recoverable bad draw into `pool-exhausted`.
       if (result.error.kind === "conflict") {
         this.#db.removeRunner(claimed.id);
+        excluded.add(claimed.id);
         this.#log.warn("orchestrator refused the claimed slot; row dropped", {
           session: session.guid,
           runner: claimed.id,
           error: result.error.kind as string,
+          // How many slots this loop can no longer offer, so a pool that is entirely
+          // bad reads as an exhausted draw rather than as a mysterious retry.
+          excluded: excluded.size,
         });
         return { ok: false, reason: "slot-conflict" };
       }
@@ -671,6 +745,12 @@ export class PoolBinder {
         // the pool, not a broken pool. The session's own row was never written —
         // `claimBindingWrite` below did not run — so it is still `created` and the
         // next attempt draws another slot.
+        //
+        // Deliberately **not** added to `excluded`, though a later caller will retry:
+        // this slot was released on both sides and is `idle` again, so it is a
+        // legitimate claim candidate once its container has been replaced. Excluding
+        // it would treat "not ready yet" as "does not exist", and on a small pool
+        // would shrink the retry's draw by one for no reason at all.
         return { ok: false, reason: "slot-expiring", retryable: true };
       }
     }
@@ -1556,5 +1636,36 @@ export async function reconcile(options: SweeperOptions): Promise<{
   };
 }
 
-/** The result of a stats call, used by the boot reconciler. */
+/** The result of a stats call, used by the boot reconciler and by the claim path. */
 type StatsResult = OrchestratorResult<OrchestratorStats>;
+
+/**
+ * drawEmptiedByExclusions reports whether the only reason a claim found nothing to
+ * take is that this session has already been refused every slot the orchestrator
+ * names.
+ *
+ * It exists to keep the exclusion set honest about *why* a draw came back empty.
+ * Without it, narrowing the draw turns an unreconcilable disagreement into
+ * `pool-exhausted` — "every session is busy, try shortly" for a pool nobody is
+ * using, which is the same wrong answer the conflict branch was written to stop
+ * giving, reached by a different road.
+ *
+ * Narrower than `excluded.size > 0`, and the two conditions that carry the weight are
+ * each a case that would be misreported without them:
+ *
+ *   - **an empty `slotIds`** is a pool with no slots at all. That is exhaustion, and
+ *     the two sides agree about it perfectly well.
+ *   - **a named slot that was not refused** is capacity this session has not tried.
+ *     The claim failing says other sessions are holding it, and "busy, retry shortly"
+ *     is the true advice.
+ *
+ * An unreachable orchestrator says nothing at all about the pool, so it cannot support
+ * a claim that the two views disagree either.
+ */
+function drawEmptiedByExclusions(stats: StatsResult, excluded: ReadonlySet<string>): boolean {
+  // Stated rather than left to `every`: nothing refused means nothing excluded.
+  if (excluded.size === 0) return false;
+  const named = stats.ok ? stats.value.slotIds : undefined;
+  if (named === undefined || named.length === 0) return false;
+  return named.every((id) => excluded.has(id));
+}

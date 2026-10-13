@@ -213,6 +213,76 @@ describe("claimRunner", () => {
     expect(row?.status).toBe("idle");
     expect(row?.session_guid).toBeNull();
   });
+
+  // ---- the exclusion set ---------------------------------------------------
+  //
+  // `claimRunner` draws with `ORDER BY RANDOM()`, and that is what keeps the pool's
+  // load spread — and what makes a slot the caller already knows to be bad a coin
+  // flip on the next attempt rather than a certainty. The exclusion set is the
+  // caller's way of turning that into "the other one", so these tests are about a
+  // slot *not* being drawn rather than about one being drawn.
+
+  it("claims the other slot when one is excluded", () => {
+    // The loop is the assertion. One draw with `ORDER BY RANDOM()` cannot tell an
+    // honoured exclusion from a lucky one; fifty draws can — and fifty draws of the
+    // old behaviour would pass with probability 2^-50.
+    for (let i = 0; i < 50; i++) {
+      const guid = `3f2504e0-4f89-11d3-9a0c-${String(i).padStart(12, "0")}`;
+      expect(db.claimRunner(guid, ["slot-1"])).toBe(true);
+      expect(
+        db.get<{ id: string }>(`SELECT id FROM runners WHERE session_guid = ?`, guid)?.id,
+      ).toBe("slot-2");
+      db.releaseRunner("slot-2");
+    }
+  });
+
+  it("treats an empty exclusion list as no exclusion at all", () => {
+    // SQLite does accept `NOT IN ()` and reads it as the empty set, so nothing here
+    // is a syntax-error trap — but the clause is still omitted when the list is
+    // empty, because the dialects this could be ported to are not so forgiving. The
+    // observable contract is the one asserted here: an empty list changes nothing at
+    // all. It fails if the empty list is ever read as excluding something, and it
+    // fails if the clause is emitted with no placeholders to bind and the draw ends
+    // up restricted.
+    const picked = new Set<string>();
+    for (let i = 0; i < 200; i++) {
+      const guid = `3f2504e0-4f89-11d3-9a0c-${String(i).padStart(12, "0")}`;
+      expect(db.claimRunner(guid, [])).toBe(true);
+      picked.add(db.get<{ id: string }>(`SELECT id FROM runners WHERE session_guid = ?`, guid)!.id);
+      db.run(`UPDATE runners SET status='idle', session_guid=NULL WHERE session_guid = ?`, guid);
+    }
+    expect([...picked].sort()).toEqual(["slot-1", "slot-2"]);
+  });
+
+  it("claims nothing when every idle slot is excluded", () => {
+    // A boolean, not a slot: this is the whole answer `claimRunner` has to give, and it
+    // is what the retry sees once every slot has been refused. Whether that empty draw
+    // is reported as exhaustion or as the disagreement it is, is decided one level up,
+    // in `#claimOnce`.
+    expect(db.claimRunner("3f2504e0-4f89-11d3-9a0c-0305e82c3301", ["slot-1", "slot-2"])).toBe(false);
+    expect(
+      db.get<{ session_guid: string }>(`SELECT session_guid FROM runners WHERE session_guid IS NOT NULL`),
+    ).toBeUndefined();
+    // The already-claimed row is untouched: an exclusion is not a release.
+    expect(
+      db.get<{ status: string; session_guid: string | null }>(
+        `SELECT status, session_guid FROM runners WHERE id = 'slot-3'`,
+      ),
+    ).toEqual({ status: "claimed", session_guid: null });
+  });
+
+  it("binds the session rather than an excluded id, whatever the order of the placeholders", () => {
+    // `NOT IN` placeholders sit after `session_guid` in the statement, so their
+    // bindings must sit after it in the argument list. An id that matches no row is
+    // the case that catches the two lists drifting apart: with the arguments
+    // transposed, the session would be recorded under a slot name.
+    expect(db.claimRunner("3f2504e0-4f89-11d3-9a0c-0305e82c3301", ["slot-9"])).toBe(true);
+    expect(
+      db.get<{ session_guid: string; status: string }>(
+        `SELECT session_guid, status FROM runners WHERE session_guid IS NOT NULL`,
+      ),
+    ).toEqual({ session_guid: "3f2504e0-4f89-11d3-9a0c-0305e82c3301", status: "claimed" });
+  });
 });
 
 describe("reconcileRunners", () => {

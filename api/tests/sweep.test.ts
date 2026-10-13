@@ -68,10 +68,24 @@ function orchestratorStub(opts: {
    * which is otherwise a race no deterministic test can reach.
    */
   onRelease?: (slotId: string) => void;
+  /**
+   * Slot ids the orchestrator refuses with a 409, whatever else is asked for.
+   *
+   * `claim` is one answer for every slot, which is what most of this file needs and
+   * what makes "the retry tried something else" unobservable. Naming the refusals
+   * per slot is what makes it a question with an answer — the api believes in a pool
+   * of several slots and the orchestrator will give it one of them.
+   *
+   * Only consulted when `claim` is `"ok"`, so an existing test's single-answer stub
+   * behaves exactly as before.
+   */
+  refuse?: readonly string[];
 }) {
   const calls: string[] = [];
   /** The slot ids `/release` was actually asked to release, in order. */
   const released: string[] = [];
+  /** The slot ids `/claim` was actually asked for, in order. */
+  const claimAttempts: string[] = [];
   let lastClaimBody: string | undefined;
   const client = new OrchestratorClient({
     baseUrl: "http://127.0.0.1:1",
@@ -90,7 +104,24 @@ function orchestratorStub(opts: {
         lastClaimBody = decodeBody(init?.body);
       }
       if (path === "/claim") {
+        // Read off the body, not off the api's own view: "which slot was offered" is
+        // the question every retry test here asks, and it has to be answered by the
+        // wire rather than by whatever the api believes it claimed.
+        const asked = (() => {
+          try {
+            const body = JSON.parse(lastClaimBody ?? "{}") as { slotId?: string };
+            return body.slotId ?? opts.slotIds?.[0] ?? "slot-1";
+          } catch {
+            return opts.slotIds?.[0] ?? "slot-1";
+          }
+        })();
+        claimAttempts.push(asked);
         if (opts.claim === "ok") {
+          // Inside the `"ok"` branch, not beside it: a stub that refuses a named slot
+          // while every other slot is claimable is exactly what a pool in disagreement
+          // looks like, and a refusal list that only applied when the whole endpoint
+          // was refusing would never produce one.
+          if (opts.refuse?.includes(asked) === true) return new Response("{}", { status: 409 });
           // **Echoes the slot it was asked for**, the way a real orchestrator does now.
           //
           // It used to answer `"slot-9"` — a slot that exists nowhere — and every test
@@ -100,14 +131,6 @@ function orchestratorStub(opts: {
           //
           // A fixture that only works because the code under test discards half of it is
           // not a fixture; it is a second implementation of the wrong thing.
-          const asked = (() => {
-            try {
-              const body = JSON.parse(lastClaimBody ?? "{}") as { slotId?: string };
-              return body.slotId ?? opts.slotIds?.[0] ?? "slot-1";
-            } catch {
-              return opts.slotIds?.[0] ?? "slot-1";
-            }
-          })();
           return new Response(JSON.stringify({ slotId: asked, containerId: "ctr9" }));
         }
         if (opts.claim === "conflict") return new Response("{}", { status: 409 });
@@ -178,7 +201,7 @@ function orchestratorStub(opts: {
       return new Response("{}", { status: 404 });
     }) as typeof fetch,
   });
-  return { client, calls, released };
+  return { client, calls, released, claimAttempts };
 }
 
 /** `fetch` bodies arrive as bytes here, so a stub has to decode before parsing. */
@@ -268,6 +291,24 @@ function seedRunners(count: number) {
 
 function options(orchestrator: OrchestratorClient): SweeperOptions {
   return { db, orchestrator, sse, now: () => now };
+}
+
+/**
+ * The ids the orchestrator was offered, counted once per extra offer.
+ *
+ * Read off the `/claim` bodies, and asserted as "nothing appears twice" rather than
+ * as a particular sequence of picks: `claimRunner` draws with `ORDER BY RANDOM()`, so
+ * the order is not a property of the code and pinning it would be pinning a seed. The
+ * absence of a repeat is.
+ */
+function repeats(claimAttempts: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const twice: string[] = [];
+  for (const id of claimAttempts) {
+    if (seen.has(id)) twice.push(id);
+    seen.add(id);
+  }
+  return twice;
 }
 
 beforeEach(() => {
@@ -556,6 +597,188 @@ describe("PoolBinder.claimForLogin", () => {
   });
 });
 
+// ---- the retry's exclusion set ----------------------------------------------
+//
+// ## The failure
+//
+// A slot the orchestrator refuses (409) is dropped from `runners` — and the retry's
+// own re-sync puts it straight back, because `/stats` still lists it. So the next
+// `claimRunner` draws from a pool that contains the row just refused, and
+// `ORDER BY RANDOM()` makes that a coin flip rather than a certainty. On a two-slot
+// pool the login succeeds `(1/2)³ = 12.5%` of the time: **seven of every eight
+// sign-ins fail**, on a disagreement a single other row could have fixed.
+//
+// Dropping the row and *not* re-offering it are two different facts, and only the
+// second one makes progress. These tests are about which slots the api is willing to
+// offer again, so every one of them reads the `/claim` bodies off the wire rather
+// than trusting the api's own bookkeeping.
+//
+// ## Why the assertions here look like they do
+//
+// `claimRunner` picks at random, so a single two-slot draw cannot tell a working
+// exclusion from a lucky one — the file above had to be rewritten once for exactly
+// that reason. The assertions are therefore chosen to hold **every** time with the
+// behaviour in place and to fail for the old behaviour, rather than to describe one
+// particular sequence of picks:
+//   - "no slot is offered twice" is exactly the property, and is independent of which
+//     slot is drawn first
+//   - the repeated login asks the question forty times, so the old behaviour has to
+//     get lucky on every single one of them to pass it
+
+describe("PoolBinder's retry exclusion set", () => {
+  it("never offers the orchestrator a slot it has already refused", async () => {
+    seedRunners(2);
+    seedSession(GUID, { state: "created" });
+    // The pool is `slot-1` and `slot-2`, `/stats` names both — so the retry's
+    // re-learn really does put the refused row back, which is the whole situation.
+    // Only `slot-1` is refused, so a login that respects the exclusion always ends
+    // on `slot-2` and one that ignores it ends there only half the time.
+    const { client, claimAttempts } = orchestratorStub({
+      claim: "ok",
+      stats: "filled",
+      slotIds: ["slot-1", "slot-2"],
+      refuse: ["slot-1"],
+    });
+    const binder = new PoolBinder(options(client));
+
+    const result = await binder.claimForLogin(db.getSession(GUID)!);
+
+    // The property, and it is the whole one: no slot is ever offered twice. Whether
+    // this login needed a retry at all depends on which slot the draw reached first,
+    // so nothing here asserts that it did — only that a refused slot never comes
+    // round again. Asking the question forty times over is how the same property is
+    // asked when it cannot be assumed; that is the test below.
+    expect(repeats(claimAttempts)).toEqual([]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // Never the refused one, whichever way the draw went — and always the other one,
+    // because there are only two.
+    expect(result.runnerId).toBe("slot-2");
+    expect(result.runnerId).not.toBe("slot-1");
+  });
+
+  it("narrows the draw again after each refusal rather than bouncing between two", async () => {
+    seedRunners(3);
+    seedSession(GUID, { state: "created" });
+    // Two refusals and one usable slot. A retry that remembered only the *last*
+    // refusal would still be free to re-offer `slot-1`, and a retry that remembered
+    // neither has to draw `slot-3` three times running, which is `1/27`. So this
+    // pins accumulation rather than mere exclusion, and it does so for 26 runs in 27
+    // against the old behaviour.
+    const { client, claimAttempts } = orchestratorStub({
+      claim: "ok",
+      stats: "filled",
+      slotIds: ["slot-1", "slot-2", "slot-3"],
+      refuse: ["slot-1", "slot-2"],
+    });
+    const binder = new PoolBinder(options(client));
+
+    const result = await binder.claimForLogin(db.getSession(GUID)!);
+
+    // Each refused slot asked for at most once, which is the accumulation: after the
+    // second refusal both `slot-1` and `slot-2` are out of the draw.
+    expect(repeats(claimAttempts)).toEqual([]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.runnerId).toBe("slot-3");
+  });
+
+  it("signs a session in on a slot the orchestrator has not refused", async () => {
+    // Three slots, one refused, both draws reachable — so the answer may be either
+    // of the two good slots. What it may not be is the refused one, which is what
+    // makes this a statement about the draw rather than about a lucky seed.
+    seedRunners(3);
+    seedSession(GUID, { state: "created" });
+    const { client, claimAttempts } = orchestratorStub({
+      claim: "ok",
+      stats: "filled",
+      slotIds: ["slot-1", "slot-2", "slot-3"],
+      refuse: ["slot-1"],
+    });
+    const binder = new PoolBinder(options(client));
+
+    const result = await binder.claimForLogin(db.getSession(GUID)!);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(["slot-2", "slot-3"]).toContain(result.runnerId);
+    expect(repeats(claimAttempts)).toEqual([]);
+    // And the binding is the slot the orchestrator answered with, so nothing is left
+    // bound to a row that was refused.
+    expect(db.getSession(GUID)?.runner_id).toBe(result.runnerId);
+  });
+
+  // The question asked many times rather than once.
+  //
+  // With the exclusion in place this is *certain* — a refused slot cannot come back,
+  // so every one of these sign-ins lands on `slot-2`. Without it, each login has to
+  // draw `slot-2` on every one of its three attempts, which is `2^-3`; a run of forty
+  // sign-ins passing is therefore something the old behaviour can only manage by
+  // getting lucky every time, `2^-120`.
+  it("recovers on the first retry for every sign-in, not just the lucky ones", async () => {
+    let recovered = 0;
+    for (let i = 0; i < 40; i++) {
+      // A fresh pool and a fresh session each time, so one login cannot leave the
+      // next one a gift.
+      db.run(`DELETE FROM runners`);
+      seedRunners(2);
+      const guid = `3f2504e0-4f89-11d3-9a0c-${String(i).padStart(12, "0")}`;
+      seedSession(guid, { state: "created" });
+      const { client } = orchestratorStub({
+        claim: "ok",
+        stats: "filled",
+        slotIds: ["slot-1", "slot-2"],
+        refuse: ["slot-1"],
+      });
+
+      const result = await new PoolBinder(options(client)).claimForLogin(db.getSession(guid)!);
+
+      if (result.ok && result.runnerId === "slot-2") recovered++;
+    }
+    expect(recovered).toBe(40);
+  });
+
+  // A pool whose every slot has been refused is a pool the two sides disagree about,
+  // and saying so is the point. Reported as exhaustion it would send the user off to
+  // wait for capacity that cannot admit them, and tell an operator nothing is wrong.
+  it("reports the disagreement rather than a busy pool once every slot is refused", async () => {
+    seedRunners(2);
+    seedSession(GUID, { state: "created" });
+    const { client } = orchestratorStub({
+      claim: "ok",
+      stats: "filled",
+      slotIds: ["slot-1", "slot-2"],
+      refuse: ["slot-1", "slot-2"],
+    });
+    const binder = new PoolBinder(options(client));
+
+    const result = await binder.claimForLogin(db.getSession(GUID)!);
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("slot-conflict");
+  });
+
+  // The other half of that condition, and the case that would be broken by a
+  // broader rule. A pool with **no** slots is not a disagreement — the two views
+  // agree perfectly well — so excluding refused slots must not turn it into one.
+  it("still reports plain exhaustion when the orchestrator has no slots at all", async () => {
+    seedRunners(1);
+    seedSession(GUID, { state: "created" });
+    const { client } = orchestratorStub({
+      claim: "ok",
+      stats: "filled",
+      slotIds: [],
+      refuse: ["slot-1"],
+    });
+    const binder = new PoolBinder(options(client));
+
+    const result = await binder.claimForLogin(db.getSession(GUID)!);
+
+    expect(result).toEqual({ ok: false, reason: "pool-exhausted" });
+  });
+});
+
 // ---- the claim's post-claim floor check -------------------------------------
 //
 // A claim creates a container and takes ~57 s worst case. A slot whose container is
@@ -706,6 +929,76 @@ describe("PoolBinder's claim floor check", () => {
     const result = await binder.claimForLogin(db.getSession(GUID)!);
 
     expect(result.ok).toBe(true);
+  });
+
+  // ---- a bad draw, not a bad slot ------------------------------------------
+  //
+  // The floor refusal and a `conflict` both answer "no", and they mean opposite
+  // things. A conflict says the orchestrator does not have this slot, and that is a
+  // fact about the slot: the retry must not offer it again. The floor says this slot
+  // is fine and its container is simply about to be replaced — so it goes back into
+  // the pool and stays there.
+  //
+  // What this pins is the consequence that is reachable: the slot is **given back**,
+  // it is **not deleted** as a refused slot would be, and it is **claimable** by the
+  // next sign-in. What it cannot pin is the exclusion set itself — that set lives for
+  // one `claimForLogin`, and the loop returns on `slot-expiring` rather than
+  // retrying, so nothing here survives into a later draw to be asserted on. The
+  // code keeps the two refusals apart anyway, because the day the retry does honour
+  // `retryable`, a floor refusal written into the exclusion set would shrink the
+  // draw by one per bad draw until a login that could have been served reported
+  // `pool-exhausted`.
+  it("returns an expiring slot to the pool rather than treating it as refused", async () => {
+    seedRunners(2);
+    seedSession(GUID, { state: "created" });
+    // `slot-1` claims fine but is nearly out of budget; `slot-2` is refused with a 409
+    // and so is dropped from the draw. Either can be reached first —
+    // `ORDER BY RANDOM()` — so the floor is hit on the first attempt or, after
+    // `slot-2` is refused, on the retry. Both paths must land in the same place, so
+    // neither the answer nor the released slot is asserted conditionally.
+    const remaining: Record<string, number> = { "slot-1": 30, "slot-2": 300 };
+    const { client, released, claimAttempts } = orchestratorStub({
+      claim: "ok",
+      release: "ok",
+      stats: "filled",
+      slotIds: ["slot-1", "slot-2"],
+      refuse: ["slot-2"],
+      slotRemainingSec: remaining,
+    });
+    const binder = new PoolBinder(options(client));
+
+    const result = await binder.claimForLogin(db.getSession(GUID)!);
+
+    // Still its own answer: the retry does not swallow it, and the conflict it may
+    // have passed through on the way does not relabel it.
+    expect(result).toEqual({ ok: false, reason: "slot-expiring", retryable: true });
+    // Given back on the orchestrator's side — the half that holds the container.
+    expect(released).toEqual(["slot-1"]);
+    // Whatever the draw did, no slot was offered twice: the retry that got here went
+    // to `slot-1` rather than back to the `slot-2` that had been refused.
+    expect(repeats(claimAttempts)).toEqual([]);
+
+    // And here on ours: `idle`, unattached, and **still present**. A slot recorded
+    // as refused would have been deleted, and one recorded as excluded would be
+    // about to be withheld from the next draw.
+    const row = db.get<{ status: string; session_guid: string | null }>(
+      `SELECT status, session_guid FROM runners WHERE id = 'slot-1'`,
+    );
+    expect(row?.status).toBe("idle");
+    expect(row?.session_guid).toBeNull();
+
+    // Which is the property, asserted: with the rest of the pool gone and the slot's
+    // budget replenished, the next sign-in takes *that* slot. An exclusion that had
+    // swallowed the floor refusal would leave nothing to claim.
+    db.run(`DELETE FROM runners WHERE id <> 'slot-1'`);
+    remaining["slot-1"] = 300;
+    seedSession(OTHER, { state: "created" });
+
+    const second = await binder.claimForLogin(db.getSession(OTHER)!);
+
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    expect(second.runnerId).toBe("slot-1");
   });
 });
 

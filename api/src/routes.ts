@@ -673,19 +673,24 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
             cause: "pool-diverged",
           });
         }
+        const slotExpiring = bound.reason === "slot-expiring";
         return reply
-          .code(bound.reason === "pool-exhausted" ? 503 : 502)
+          .code(bound.reason === "pool-exhausted" || slotExpiring ? 503 : 502)
           .send({
             error: cannotFill
               ? "the service cannot start a browser right now"
-              : bound.reason === "pool-exhausted"
+              : bound.reason === "pool-exhausted" || slotExpiring
                 ? "every session is busy"
                 : "runner control plane unreachable",
             // Still retryable: a misconfiguration gets fixed and the pool refills.
             // But a client that has been told "busy" and is still failing after a
             // few attempts now has something to escalate with.
             retryable: true,
-            ...(cannotFill ? { cause: "pool-unfillable" } : {}),
+            ...(cannotFill
+              ? { cause: "pool-unfillable" }
+              : slotExpiring
+                ? { cause: "slot-expiring" }
+                : {}),
           });
       }
     }

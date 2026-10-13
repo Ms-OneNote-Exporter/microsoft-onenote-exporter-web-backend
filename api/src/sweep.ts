@@ -50,7 +50,7 @@ export type ClaimResult =
   | { ok: true; runnerId: string; containerId: string; runnerUrl: string | null }
   | {
       ok: false;
-      reason: "pool-exhausted" | "orchestrator-unreachable" | "slot-conflict";
+      reason: "pool-exhausted" | "orchestrator-unreachable" | "slot-conflict" | "slot-expiring";
       /**
        * Why the pool could not fill, when the orchestrator said.
        *
@@ -60,6 +60,15 @@ export type ClaimResult =
        * api said *every session is busy* for hours while `healthz` said `ok`.
        */
       fillError?: string;
+      /**
+       * Whether another attempt could succeed, for callers that branch on it.
+       *
+       * Only the floor refusal sets it: `slot-expiring` means this slot was a bad
+       * draw, and a later attempt draws another one — which is what separates it
+       * from `slot-conflict`, where the two processes disagree about the pool and
+       * no number of retries converges.
+       */
+      retryable?: boolean;
     };
 
 /**
@@ -257,6 +266,20 @@ export function idleExpiresAt(session: SessionRow, now: number): number | null {
  * human can see, not a request that never returns.
  */
 const CLAIM_ATTEMPTS = 3;
+
+/**
+ * The minimum remaining budget a slot must have to be claimed for login.
+ *
+ * A claim creates a container and takes ~57s worst case — a 10 s SIGTERM grace to stop
+ * the idle runner, ~2 s to create and start its replacement, and a 45 s healthcheck
+ * wait. A slot with less than this much budget left will be recycled mid-login, and
+ * the user gets a sign-in that dies on its own.
+ *
+ * Deliberately conservative: 60 s is a fifth of the 5-minute `RunnerTTL`, so this only
+ * fires on slots that are genuinely about to expire, and the gap absorbs the age the
+ * snapshot was stale by while the claim was in flight.
+ */
+const CLAIM_FLOOR_SECONDS = 60;
 
 export class PoolBinder {
   readonly #db: Db;
@@ -584,6 +607,72 @@ export class PoolBinder {
         claimed: claimed.id,
         used: slotId,
       });
+    }
+
+    // **The floor check, after the claim rather than before it.**
+    //
+    // A container about to be recycled is not something this process can see: it
+    // holds no container identity (§2.1), and the age lives on the orchestrator's
+    // side of the boundary. So the question — "does this slot have enough budget left
+    // to finish a login?" — is asked of `/stats`, keyed by the slot id `claimRunner`
+    // just handed over. `slotRemainingSec` is the orchestrator's arithmetic over its
+    // own `Slot.CreatedAt` and its own `RunnerTTL`, which is the only place both
+    // facts exist.
+    //
+    // **After**, because before the claim there is no slot to ask about: the slot is
+    // chosen by `claimRunner`, and the choice is `ORDER BY RANDOM()` over this
+    // process's rows. A pre-claim check would either reject every login or pick a
+    // different slot from the one that gets claimed — and a claim is the expensive,
+    // disruptive thing to do, so it is not done speculatively.
+    //
+    // **Fail-open, twice over.** A failed `/stats` is "we do not know", and an absent
+    // `slotRemainingSec` is "this orchestrator does not say" — the rolling-deploy
+    // state. Neither is evidence of a floor breach, and treating either as one would
+    // make a metrics field an availability dependency that fails hardest exactly when
+    // the orchestrator is least reachable. Both proceed, which is today's behaviour.
+    //
+    // The number is a snapshot, and it is stale by up to the claim's own ~57 s by the
+    // time this reads it. The floor is conservative for that reason: 60 s against a
+    // 300 s budget, so the worst case is spending the margin rather than overshooting
+    // it — and overshooting is the failure this exists to prevent.
+    const stats = await this.#orchestrator.stats();
+    if (stats.ok && stats.value.slotRemainingSec !== undefined) {
+      const remaining = stats.value.slotRemainingSec[slotId];
+      // `!== undefined` rather than a falsy test: a slot missing from the map has no
+      // container yet, which is not the same claim as one with no budget left.
+      if (remaining !== undefined && remaining < CLAIM_FLOOR_SECONDS) {
+        // Give the slot back, **both halves**: the orchestrator's binding — which is
+        // what holds the container that is about to expire — and this process's row.
+        //
+        // Both, because `releaseRunner` alone leaves the orchestrator holding a slot
+        // this process no longer offers. That is exactly the divergence the
+        // `slot-conflict` path exists to repair: the row gets claimed again, the
+        // orchestrator answers `already bound`, and a perfectly healthy pool refuses
+        // logins with "the service's view of its runner pool is out of date".
+        //
+        // A `conflict` is success, on the same terms as the three releases in
+        // `releaseFor*`: the slot is already gone or already unbound, which is the
+        // state this branch wanted.
+        const released = await this.#orchestrator.release(slotId);
+        this.#db.releaseRunner(slotId);
+        this.#log.warn("claimed slot is about to expire; released instead of bound", {
+          session: session.guid,
+          slot: slotId,
+          remainingSec: remaining,
+          // Only when the orchestrator could not be told, which is the case an
+          // operator has to look at: the container is still running and still aging,
+          // and the two sides disagree about who holds it. The sweeper's orphan
+          // branch is what reconciles that; this only records that it happened.
+          ...(released.ok || released.error.kind === "conflict"
+            ? {}
+            : { error: released.error.kind }),
+        });
+        // Retryable, and for a reason a caller can act on: this was a bad draw from
+        // the pool, not a broken pool. The session's own row was never written —
+        // `claimBindingWrite` below did not run — so it is still `created` and the
+        // next attempt draws another slot.
+        return { ok: false, reason: "slot-expiring", retryable: true };
+      }
     }
 
     this.#db.run(

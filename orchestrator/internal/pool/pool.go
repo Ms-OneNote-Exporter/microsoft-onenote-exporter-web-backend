@@ -389,11 +389,30 @@ type Stats struct {
 	// can distinguish one blip from a pool that has been unable to fill for minutes,
 	// which is the difference between retrying and escalating.
 	FillFailures int `json:"fillFailures,omitempty"`
+
+	// SlotAgeSec maps slot id -> container age in seconds.
+	//
+	// A read surface, like `BoundSessions` and `DeadSlots`. The orchestrator already
+	// holds every fact: `Slot.CreatedAt` is the label-derived clock the reconciler
+	// already trusts, and `RunnerTTL` is already in config. Exposing them adds no
+	// mount, no network reach, and no caller-supplied input.
+	//
+	// `omitempty`, so a pool with no containers marshals byte-for-byte as it did
+	// before this field existed.
+	SlotAgeSec map[string]int `json:"slotAgeSec,omitempty"`
+
+	// SlotRemainingSec maps slot id -> remaining budget in seconds.
+	//
+	// `remainingSec = max(0, budgetSec - ageSec)`: monotone non-increasing between
+	// replacements; a reset coincides with a container replacement and is therefore
+	// observable, never silent.
+	SlotRemainingSec map[string]int `json:"slotRemainingSec,omitempty"`
 }
 
 // Stats summarises the pool.
 func (p *Pool) Stats() Stats {
 	slots := p.Slots()
+	now := p.now()
 	byState := make(map[string]int, len(slots))
 	ids := make([]string, 0, len(slots))
 	// Left nil until a bound slot that records *which* session is found. `omitempty`
@@ -401,6 +420,12 @@ func (p *Pool) Stats() Stats {
 	// it did before this field existed — which is the point: an unchanged pool must
 	// not produce a changed response just because `Stats` learned a new trick.
 	var bound map[string]string
+	// Same rule, same reason, for the per-slot age and remaining budget below: left
+	// nil until a slot that actually holds a container is found, so a pool of vacant
+	// slots marshals exactly as it did before these fields existed.
+	var slotAgeSec, slotRemainingSec map[string]int
+	// One number for the whole pool, read once rather than per slot.
+	budgetSec := int(p.cfg.RunnerTTL.Seconds())
 	for _, s := range slots {
 		byState[string(s.State)]++
 		ids = append(ids, s.ID)
@@ -416,6 +441,29 @@ func (p *Pool) Stats() Stats {
 			}
 			bound[s.ID] = s.SessionGUID
 		}
+		// Age and remaining budget, for slots that hold a container. `CreatedAt` is
+		// zero until the create finishes — a vacant slot, or one `EnsurePool` has
+		// registered and is building into — and an age for it would be the age of a
+		// container that does not exist.
+		if s.CreatedAt.IsZero() {
+			continue
+		}
+		ageSec := int(now.Sub(s.CreatedAt).Seconds())
+		remainingSec := budgetSec - ageSec
+		// Clamped at zero rather than reported negative: a consumer reading this
+		// asks "how much is left", and the honest answer to "none" is 0. The
+		// alternative makes every comparison against it a signed one, and a
+		// floor check that has to know the sign is a floor check that can be
+		// evaded by a clock that disagrees by a day.
+		if remainingSec < 0 {
+			remainingSec = 0
+		}
+		if slotAgeSec == nil {
+			slotAgeSec = make(map[string]int, len(slots))
+			slotRemainingSec = make(map[string]int, len(slots))
+		}
+		slotAgeSec[s.ID] = ageSec
+		slotRemainingSec[s.ID] = remainingSec
 	}
 	// Sorted, so two calls against an unchanged pool produce byte-identical output.
 	// An unstable order would make a diff of two /stats responses meaningless, and
@@ -430,9 +478,19 @@ func (p *Pool) Stats() Stats {
 	stats := Stats{
 		Size:             len(slots),
 		ByState:          byState,
-		RunnerTTLSeconds: int(p.cfg.RunnerTTL.Seconds()),
+		// The same number the remaining budgets above were computed against, rather
+		// than a second conversion of the same config value: a caller that reads
+		// `runnerTtlSeconds` and a slot's `slotRemainingSec` from one response must
+		// not be able to see two different budgets.
+		RunnerTTLSeconds: budgetSec,
 		SlotIDs:          ids,
 		BoundSessions:    bound,
+		// Sorted like `ids`, by the same argument and for the same reason: two calls
+		// against an unchanged pool must produce byte-identical output. Nothing in
+		// `Stats` enforces that here either — `encoding/json` emits map keys in
+		// sorted order, so it holds because of the encoder.
+		SlotAgeSec:       slotAgeSec,
+		SlotRemainingSec: slotRemainingSec,
 		// Read outside the loop above and under its own lock, because `deadBound`
 		// is written by `Sweep` from the maintenance goroutine while this runs on a
 		// request handler. Sorted by the same argument as `ids`: two calls against an

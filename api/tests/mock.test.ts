@@ -787,6 +787,65 @@ describe("FakeOrchestrator", () => {
     // Still bound, so nothing else can take it mid-recycle.
     expect(fake.freeSlots).toBe(0);
   });
+
+  // The fake reporting `slotRemainingSec` at all is the point, for the same reason it
+  // reports `boundSessions`: a mock whose `/stats` quietly omitted the field would let
+  // the claim's floor check go unexercised in exactly the place it is supposed to be
+  // exercised, and would do it silently.
+  it("reports a per-slot budget only for slots that hold a container", async () => {
+    const fake = new FakeOrchestrator({ size: 2 });
+    const claimed = await fake.claim("a", new Date());
+    if (!claimed.ok) throw new Error("claim failed");
+
+    const stats = await fake.stats();
+
+    expect(stats.ok).toBe(true);
+    if (!stats.ok) return;
+    expect(stats.value.slotRemainingSec).toBeDefined();
+    expect(stats.value.slotAgeSec).toBeDefined();
+    // The claimed slot holds a container, so it has an age and a budget...
+    expect(stats.value.slotRemainingSec![claimed.value.slotId]).toBe(300);
+    expect(stats.value.slotAgeSec![claimed.value.slotId]).toBe(0);
+    // ...and the untouched one has none. The real `Stats` skips a zero `CreatedAt`, and
+    // `omitempty` drops the key entirely on a pool with no containers at all. A fake
+    // that filled the gap with zeros would teach a caller to refuse slots that have
+    // not been created.
+    const untouched = fake.slotIds().find((id) => id !== claimed.value.slotId)!;
+    expect(untouched in stats.value.slotRemainingSec!).toBe(false);
+  });
+
+  it("drops a released slot's budget, since its container is gone", async () => {
+    const fake = new FakeOrchestrator({ size: 1 });
+    const claimed = await fake.claim("a", new Date());
+    if (!claimed.ok) throw new Error("claim failed");
+    await fake.release(claimed.value.slotId);
+
+    const stats = await fake.stats();
+
+    expect(stats.ok).toBe(true);
+    // A pool with no containers marshals as it did before these fields existed.
+    if (stats.ok) expect(stats.value.slotRemainingSec).toBeUndefined();
+  });
+
+  it("restarts the budget on recycle, because the container is new", async () => {
+    let clock = 1_700_000_000_000;
+    const fake = new FakeOrchestrator({ size: 1, now: () => clock });
+    const claimed = await fake.claim("a", new Date());
+    if (!claimed.ok) throw new Error("claim failed");
+    clock += 290_000; // four minutes and fifty seconds later
+
+    const before = await fake.stats();
+    await fake.recycle(claimed.value.slotId, "ttl");
+    const after = await fake.stats();
+
+    if (!before.ok || !after.ok) throw new Error("stats failed");
+    // Nearly spent — a claim would be refused by the floor check...
+    expect(before.value.slotRemainingSec![claimed.value.slotId]).toBe(10);
+    // ...and the replacement starts the clock over. A fake that kept the old timestamp
+    // would report every recycled slot as about to expire forever.
+    expect(after.value.slotAgeSec![claimed.value.slotId]).toBe(0);
+    expect(after.value.slotRemainingSec![claimed.value.slotId]).toBe(300);
+  });
 });
 
 // ---- the pool seeding the mock discovered was missing ---------------------

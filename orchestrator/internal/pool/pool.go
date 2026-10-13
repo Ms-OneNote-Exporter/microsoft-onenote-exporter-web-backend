@@ -1761,6 +1761,24 @@ func (p *Pool) waitReady(ctx context.Context, containerID string) error {
 }
 
 // replace removes an old container and puts a fresh one in the slot.
+//
+// A create that fails here resets the slot to `StateVacant`, for the same reason
+// `fail` resets it to `StateIdle`: the old container is gone, so a slot claiming to
+// hold it would hand `api` an id that resolves to nothing.
+//
+// **Vacant, not `StateStarting`.** `StateStarting` is a create *in flight* — it is
+// the claim `EnsurePool` takes, and `refillable()` excludes it precisely so a second
+// tick cannot create a second container for the same slot. Leaving a slot there
+// after the create has already failed claims that in-flight create forever: the
+// exclusion is what stops `EnsurePool` from retrying, so the slot counted towards
+// capacity and was never created for again — a permanent loss of one pool position,
+// for the life of the process, with `/stats` reporting a full pool and no container
+// behind the number. `EnsurePool` retries a vacant slot on its next tick.
+//
+// The timestamps go to zero with it, and `Stats` skips only a zero `CreatedAt`. Left
+// at the age of the container just removed, the slot would report a `slotAgeSec` and
+// a `slotRemainingSec` for a container that does not exist, and the remaining budget
+// would be computed from a runner that is gone.
 func (p *Pool) replace(ctx context.Context, slot *Slot, oldContainerID string) error {
 	if err := p.docker.RemoveContainer(ctx, oldContainerID); err != nil {
 		return fmt.Errorf("replace: remove old: %w", err)
@@ -1769,7 +1787,16 @@ func (p *Pool) replace(ctx context.Context, slot *Slot, oldContainerID string) e
 	slot.ContainerID = ""
 	slot.State = StateStarting
 	p.mu.Unlock()
-	return p.create(ctx, slot)
+	if err := p.create(ctx, slot); err != nil {
+		p.mu.Lock()
+		slot.State = StateVacant
+		slot.CreatedAt = time.Time{}
+		slot.SessionGUID = ""
+		slot.BoundAt = time.Time{}
+		p.mu.Unlock()
+		return fmt.Errorf("replace: create: %w", err)
+	}
+	return nil
 }
 
 // destroy stops and removes a container. An empty id is a no-op, which is what

@@ -310,6 +310,103 @@ func TestReconcileRecyclesARunnerPastTheRunnerTTL(t *testing.T) {
 	}
 }
 
+// ---- a replace whose create fails must not strand the slot -----------------
+//
+// `replace` removes the old container *first*, so between the remove and a
+// successful create the slot holds nothing. If the create then failed, and the slot
+// were left in `StateStarting`, the loss would be permanent rather than temporary:
+//
+//   - `refillable()` excludes `StateStarting`, because that state means a create is
+//     in flight, so `EnsurePool` would never retry it
+//   - `EnsurePool` counts a slot it is not refilling as `filled`, so the pool would
+//     report itself full
+//
+// The result is a pool of 2 that can only ever serve 1, with nothing in `/stats` to
+// say so — `size: 2`, one runner, and the missing position never coming back for the
+// life of the process. This is the same hollow-slot failure `refillable()` was
+// written to undo, reached through the one writer that still used the old state.
+//
+// So a failed create resets the slot to vacant, and the next `EnsurePool` fills it.
+// The container count matters as much as the state: a create the Engine half-completed
+// would leave a second container behind the one the slot is about to be given, and
+// two runners on one `msout.slot.id` is exactly what the reconciler cannot unpick.
+
+// `replace` is private and reached only from Reconcile, so the failure is staged
+// through the daemon and the assertion is made on the pool.
+func TestReconcileFailedReplaceLeavesTheSlotForEnsurePoolToRetry(t *testing.T) {
+	f := newReconcileFixture(t, 1, &Slot{ID: "slot-1"})
+	created := f.now.Add(-2 * time.Hour) // past the TTL, so Reconcile replaces it
+	ctr := f.d.add("over-age", true, runnerLabels("slot-1", false, created, time.Time{}))
+	// The old container is removed before the create, and this fails that create —
+	// the Engine rejecting it, as it does for any of the reasons a create is refused.
+	f.d.failNext("create", cpuRangeErr())
+
+	if err := f.p.Reconcile(t.Context(), nothingExpired); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	slots := f.p.Slots()
+	if len(slots) != 1 {
+		t.Fatalf("slots = %d, want 1: %+v", len(slots), slots)
+	}
+	slot := slots[0]
+	// The old container is gone, so the slot must not claim to hold it.
+	if slot.ContainerID != "" {
+		t.Errorf("container = %q, want empty — the replaced container is already removed", slot.ContainerID)
+	}
+	if slot.ContainerID == ctr.id {
+		t.Error("the slot still points at the container replace removed")
+	}
+	// The load-bearing assertion. `starting` after a create that is already over is
+	// a claim that some create is in flight, and it is what makes the slot
+	// unretryable for the rest of the process.
+	if slot.State != StateVacant {
+		t.Errorf("state = %q, want vacant — `starting` excludes the slot from "+
+			"refillable(), so EnsurePool would never fill it again: %+v", slot.State, slot)
+	}
+	// A nonzero CreatedAt is the age of the container just removed, and `Stats`
+	// skips only a zero one — so the slot would report an age and a remaining
+	// budget for a container that does not exist.
+	if !slot.CreatedAt.IsZero() {
+		t.Errorf("CreatedAt = %v, want zero — it is the age of a container that no longer exists", slot.CreatedAt)
+	}
+	if slot.SessionGUID != "" || !slot.BoundAt.IsZero() {
+		t.Errorf("session bookkeeping survived a containerless slot: guid=%q boundAt=%v",
+			slot.SessionGUID, slot.BoundAt)
+	}
+	// The host is the other half of the claim: removed old container, no new one.
+	if n := f.d.count(); n != 0 {
+		t.Errorf("%d containers on the daemon after a failed replace, want 0 — the failed "+
+			"create left one behind that no slot owns", n)
+	}
+	if stats := f.p.Stats(); stats.SlotAgeSec["slot-1"] != 0 || len(stats.SlotAgeSec) != 0 {
+		t.Errorf("SlotAgeSec = %v, want no entry for a slot holding no container", stats.SlotAgeSec)
+	}
+
+	// The next tick is what the reset was for. `failNext` cleared itself, so this
+	// create succeeds and the slot is back in service without a restart.
+	if err := f.p.EnsurePool(t.Context()); err != nil {
+		t.Fatalf("EnsurePool after a failed replace: %v", err)
+	}
+	slots = f.p.Slots()
+	if len(slots) != 1 {
+		t.Fatalf("slots = %d, want 1", len(slots))
+	}
+	if slots[0].State != StateIdle {
+		t.Errorf("refilled state = %q, want idle — EnsurePool did not retry the slot: %+v",
+			slots[0].State, slots[0])
+	}
+	if slots[0].ContainerID == "" {
+		t.Error("refilled slot has no container")
+	}
+	if slots[0].ID != "slot-1" {
+		t.Errorf("refilled into %q, want slot-1 — the id is what sessions.runner_id names", slots[0].ID)
+	}
+	if n := f.d.count(); n != 1 {
+		t.Errorf("%d containers after the refill, want exactly 1", n)
+	}
+}
+
 // The over-age rule has two inputs and one of them used to be ignored: whether the
 // container is bound, and whether its session is still alive. Only the bound-and-
 // live cell is new, and it is not an edge case — `main.go` passes `NeverExpire`

@@ -18,6 +18,11 @@ package pool
 //   - **Caddy gets the artifact tree read-only** and nothing else, so an
 //     in-progress archive is never servable.
 //
+// The same ownership is why `DeleteArtifact` lives here rather than in the runner:
+// publishing an artifact is a privilege of knowing its id, and so is removing one.
+// The api holds the id for a session it owns and the orchestrator holds the volume,
+// and §2.2's split puts the two in different processes.
+//
 // ## Why it is a rename and not a copy
 //
 // A copy of a multi-gigabyte vault is the disk spike §8.3 warns about, and it
@@ -225,6 +230,42 @@ func (p *Pool) ArtifactMarker(artifactID string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// DeleteArtifact removes a published artifact directory.
+//
+// # Why this exists
+//
+// `Finalize` puts a vault at `<ArtifactRoot>/<artifactId>/vault.zip` and nothing
+// ever took it away. The api's erase machine shredded the *session* directory,
+// removed the container and deleted the row, and the published archive stayed on
+// the volume for the life of the disk — while the api told the user "we deleted
+// everything this service stored for this session". This is the other half of
+// that promise, and it has to live here because this process is the only holder of
+// the artifact volume (`api` reaches it only through `Stat` and `Finalize`, per
+// the mount split in PLAN-v3 §2.2).
+//
+// # Idempotent, deliberately
+//
+// Erase is best-effort and retried, and "the thing I was deleting is already gone"
+// is the outcome it wanted — `os.RemoveAll` returns nil for a path that does not
+// exist, so that is what this returns. A `404`-shaped error would make every
+// repeated erase look like a failure and push the machine towards reporting a
+// deletion that had already happened as one that had not.
+//
+// # Only the published directory
+//
+// Never `.staging`: a staged archive belongs to an export that has not finished,
+// and that export's own `SweepStaging` is the thing that reclaims it by age. This
+// verb is keyed on an artifact id the api only holds for a *completed* export.
+func (p *Pool) DeleteArtifact(artifactID string) error {
+	if !config.ValidArtifactID(artifactID) {
+		return ErrArtifactIDInvalid
+	}
+	if err := os.RemoveAll(filepath.Join(p.cfg.ArtifactRoot, artifactID)); err != nil {
+		return fmt.Errorf("delete artifact %s: %w", artifactID, err)
+	}
+	return nil
 }
 
 // SweepStaging removes staging directories older than the cutoff.

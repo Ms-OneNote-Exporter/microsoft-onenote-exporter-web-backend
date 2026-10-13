@@ -330,6 +330,39 @@ export interface OrchestratorApi {
    * it as an export that produced no artifact rather than retrying.
    */
   finalize(input: FinalizeInput): Promise<OrchestratorResult<FinalizeResponse>>;
+  /**
+   * deleteArtifact removes a published artifact directory.
+   *
+   * The ninth verb, and the first one whose only argument is an **artifact id**
+   * rather than a slot.
+   *
+   * ## Why it exists here rather than being done by the api
+   *
+   * `POST /api/session/erase` destroys three things on three hosts: the SQLite row
+   * (here), the cookie (in the browser), and the vault directory plus the published
+   * archive (on volumes this process does not have). PLAN-v3 §4.3 is the mount
+   * split that puts the artifact tree behind Caddy and the orchestrator, and §4.4
+   * makes the orchestrator the holder of it. So this process **cannot** delete
+   * `/opt/msout/data/artifacts/<id>/` even if it wanted to — there is no path there
+   * to open, and the mount is not its to open.
+   *
+   * That is the same reason `finalize` is a verb and not something the runner does
+   * for itself, and the same reason `stat` is: the component that decides what
+   * happens to an artifact is the one that owns the volume.
+   *
+   * ## Why erase needs it
+   *
+   * `finalize` renames a staged archive into `<artifactId>/vault.zip`, and until
+   * this verb existed **nothing ever removed it**. The erase machine shredded the
+   * session directory, removed the container and deleted the row, and the published
+   * vault stayed on the volume for the life of the disk — while `ERASE_UI_WORDING`
+   * told the user *"We deleted everything this service stored for this session."*
+   *
+   * Idempotent by contract: a not-found artifact is success, because erase is
+   * best-effort and retried, and "the thing I was deleting is already gone" is the
+   * outcome it wanted.
+   */
+  deleteArtifact(artifactId: string): Promise<OrchestratorResult<{ deleted: boolean }>>;
 }
 
 /** Options for the client. */
@@ -549,6 +582,18 @@ export class OrchestratorClient implements OrchestratorApi {
       sessionGuid: input.sessionGuid,
       partial: input.partial,
     });
+  }
+
+  /**
+   * deleteArtifact removes a published artifact directory.
+   *
+   * The read budget, not `CONTAINER_VERB_TIMEOUT_MS`: the work is an
+   * `os.RemoveAll` under the artifact root, sized by neither the pool nor a
+   * container. It is called from the erase machine, which is holding a session's
+   * cookie open, so it must not inherit the 75 s a container lifecycle needs.
+   */
+  deleteArtifact(artifactId: string): Promise<OrchestratorResult<{ deleted: boolean }>> {
+    return this.#call("POST", "/delete-artifact", { artifactId });
   }
 
   /** stats reports pool occupancy. */

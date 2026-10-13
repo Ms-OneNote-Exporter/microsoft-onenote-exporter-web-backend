@@ -72,6 +72,11 @@ function makeDeps(
       if (answer === "ok") return { ok: true };
       return { ok: false, errorKind: answer };
     },
+    async deleteArtifact(artifactId: string) {
+      calls.push(`deleteArtifact:${artifactId}`);
+      const e = fail("deleteArtifact");
+      if (e) throw e;
+    },
     async stats() {
       return { ok: true as const, value: { size: 0 } };
     },
@@ -133,6 +138,7 @@ describe("runErase", () => {
         "files-removed",
         "directory-removed",
         "container-removed",
+        "artifact-deleted",
         "row-deleted",
       ]);
     }
@@ -309,6 +315,132 @@ describe("runErase", () => {
     const { deps } = makeDeps();
     expect((await runErase(deps, GUID)).ok).toBe(true);
     expect((await runErase(deps, GUID)).ok).toBe(true);
+  });
+});
+
+/**
+ * Step 6b — removing the published artifact.
+ *
+ * The bug: `/finalize` renames a staged archive into
+ * `<artifactId>/vault.zip` on the artifact volume, and **nothing ever took it
+ * away**. Steps 4–6 delete the *session* directory and the container; neither is
+ * that path. So every erased session left its last vault on the disk for the life of
+ * the volume — while `ERASE_UI_WORDING` told the user *"We deleted everything this
+ * service stored for this session."*
+ *
+ * The machine cannot delete it: the artifact tree is mounted into the orchestrator
+ * and Caddy (PLAN-v3 §4.3) and not into this process (§4.4), so the call is the
+ * only way. Each test below goes red if that call is deleted, which is the
+ * operation the wording depends on.
+ */
+describe("runErase removes the published artifact", () => {
+  const ARTIFACT = "A".repeat(43);
+
+  function seedPublished(artifactId: string | null = ARTIFACT, guid = GUID): void {
+    seedSession(guid, "authenticated", "slot-1");
+    db.run(`UPDATE sessions SET artifact_id = ? WHERE guid = ?`, artifactId, guid);
+  }
+
+  it("asks the orchestrator to remove the artifact the session owns", async () => {
+    seedPublished();
+    const { deps, calls } = makeDeps();
+
+    const outcome = await runErase(deps, GUID);
+
+    expect(outcome.ok).toBe(true);
+    expect(calls).toContain(`deleteArtifact:${ARTIFACT}`);
+    if (outcome.ok) expect(outcome.steps).toContain("artifact-deleted");
+  });
+
+  // The id is read from the row, before it is deleted. Guessing it — or reusing the
+  // export id from `export_state`, which is a different value — would delete the
+  // wrong directory or nothing at all.
+  it("uses the artifact id stored on the row, not the export id", async () => {
+    seedPublished();
+    db.run(
+      `UPDATE sessions SET export_state = ? WHERE guid = ?`,
+      JSON.stringify({ state: "done", id: "E".repeat(43) }),
+      GUID,
+    );
+    const { deps, calls } = makeDeps();
+
+    await runErase(deps, GUID);
+
+    expect(calls).toContain(`deleteArtifact:${ARTIFACT}`);
+    expect(calls.some((c) => c.includes("E".repeat(43)))).toBe(false);
+  });
+
+  // Between the container and the row, because `sessions.artifact_id` is where the
+  // id comes from — read once at the top of the machine.
+  it("removes the artifact after the container and before the row", async () => {
+    seedPublished();
+    const { deps, calls } = makeDeps();
+
+    await runErase(deps, GUID);
+
+    const order = calls.map((c) => c.split(":")[0]);
+    expect(order.indexOf("remove")).toBeLessThan(order.indexOf("deleteArtifact"));
+  });
+
+  it("records the step when the session never published an artifact", async () => {
+    // Not "skipped": a reader of the step list has to be able to tell "there was
+    // nothing to delete" from "the deletion was never attempted".
+    seedPublished(null);
+    const { deps, calls } = makeDeps();
+
+    const outcome = await runErase(deps, GUID);
+
+    expect(outcome.ok).toBe(true);
+    expect(calls.some((c) => c.startsWith("deleteArtifact"))).toBe(false);
+    if (outcome.ok) expect(outcome.steps).toContain("artifact-deleted");
+  });
+
+  // Best-effort means *continued from*, not *abandoned*: §11 attempts every step
+  // after a failure, and the row is what the retry record is — a stranded one is
+  // worse than a missing one.
+  it("continues past a failed artifact removal and still deletes the row", async () => {
+    seedPublished();
+    const { deps, calls } = makeDeps({ failAt: "deleteArtifact" });
+
+    const outcome = await runErase(deps, GUID);
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.failedAt).toBe("artifact-deleted");
+    // The steps after it still ran.
+    expect(db.getSession(GUID)).toBeUndefined();
+    // And the shard went out with the row, which is the point: without this the
+    // published vault has no record anywhere and nothing ever revisits it.
+    expect(calls).toContain(`deleteArtifact:${ARTIFACT}`);
+  });
+
+  // §11's "alert on repeats" is written against this line, and a deletion that
+  // failed is the most reportable thing the machine can fail at — it is the only
+  // step whose absence leaves user data on a disk.
+  it("logs a failed artifact removal with its session, step and error", async () => {
+    seedPublished();
+    const { deps } = makeDeps({ failAt: "deleteArtifact" });
+    const warned: Array<{ message: string; fields?: Record<string, unknown> }> = [];
+
+    await runErase({ ...deps, log: { warn: (m, f) => warned.push({ message: m, fields: f }) } }, GUID);
+
+    const line = warned.find((w) => w.fields?.step === "artifact-deleted");
+    expect(line).toBeDefined();
+    expect(line?.fields?.session).toBe(GUID);
+    expect(String(line?.fields?.error)).toContain("deleteArtifact failed");
+  });
+
+  // T-E1: the row may already be gone while the volume is not — which is exactly
+  // what a half-finished erase leaves. The id has to come from somewhere, and the
+  // answer is "nowhere", so this is the case the step must not invent a deletion
+  // for. The published artifact of a row that is gone is unreachable by design; the
+  // sweep's own record is what covers it.
+  it("does not guess an artifact for a row that is already gone", async () => {
+    const { deps, calls } = makeDeps();
+
+    const outcome = await runErase(deps, GUID);
+
+    expect(outcome.ok).toBe(true);
+    expect(calls.some((c) => c.startsWith("deleteArtifact"))).toBe(false);
   });
 });
 

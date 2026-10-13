@@ -1,7 +1,7 @@
 // Package server is the orchestrator's HTTP surface.
 //
-// Five verbs and a health check. That is the entire API, and the way that is
-// enforced is structural rather than conventional:
+// A closed set of verbs and a health check. That is the entire API, and the way
+// that is enforced is structural rather than conventional:
 //
 //   - Routes are registered in an explicit map literal in routes(). An unknown
 //     method or path never reaches a handler, so there is no default branch to
@@ -116,6 +116,9 @@ func (s *Server) routeTable() map[string]map[string]struct{} {
 		"/stats":    {http.MethodGet: {}},
 		"/healthz":  {http.MethodGet: {}},
 		"/finalize": {http.MethodPost: {}},
+		// The ninth verb. See `handleDeleteArtifact` for why this surface — which
+		// PLAN-v3 §2.1 called "five verbs and a health check" — needs one more.
+		"/delete-artifact": {http.MethodPost: {}},
 	}
 	return table
 }
@@ -146,6 +149,9 @@ func (s *Server) routes() http.Handler {
 		},
 		"/finalize": {
 			http.MethodPost: s.handleFinalize,
+		},
+		"/delete-artifact": {
+			http.MethodPost: s.handleDeleteArtifact,
 		},
 		"/stats": {
 			http.MethodGet: s.handleStats,
@@ -435,6 +441,61 @@ func (s *Server) handleFinalize(c *call) (any, error) {
 		return nil, err
 	}
 	return result, nil
+}
+
+// deleteArtifactRequest is the input schema for the delete-artifact verb.
+//
+// One identifier, like `statRequest`. It carries no session and no path: the id
+// selects a directory this process already owns, and the caller cannot name
+// anything else — `ValidArtifactID` below is the whole of the enforcement.
+type deleteArtifactRequest struct {
+	ArtifactID string `json:"artifactId"`
+}
+
+// handleDeleteArtifact removes a published artifact directory.
+//
+// # Why the orchestrator surface has a ninth verb
+//
+// PLAN-v3 §2.1 says this is "five verbs and a health check", and every one of them
+// is about a *slot*. The artifact id is the other noun in the system, and it had
+// exactly two verbs on it: `/stat` to ask, `/finalize` to publish. Nothing to
+// delete with — so an erased session's published vault stayed on the volume while
+// the api told the user it had deleted everything.
+//
+// # Why `api` cannot do it itself
+//
+// §4.3 splits the mounts: the artifact volume is mounted read-write into **this**
+// process and read-only into Caddy, and it is not mounted into the api at all. §4.4
+// makes this process the holder of it. So the api has no path to open and no right
+// to open one, and adding the verb here is not a convenience — it is the only
+// place the work can be done. The api's alternative would be to grow a mount into
+// the component that must never hold a vault, which is the thing §4.3 is about.
+//
+// The argument is deliberately narrow: this removes an artifact the api already
+// owns, named by an id it already holds. It cannot reach the vault tree, a
+// container, or a slot, and the schema is one field wide.
+func (s *Server) handleDeleteArtifact(c *call) (any, error) {
+	var req deleteArtifactRequest
+	if err := c.decode(&req); err != nil {
+		return nil, badRequest("malformed delete-artifact request", err)
+	}
+	if !config.ValidArtifactID(req.ArtifactID) {
+		return nil, badRequest("artifactId must be 43 base64url characters", nil)
+	}
+
+	if err := s.pool.DeleteArtifact(req.ArtifactID); err != nil {
+		// The pool's own validation is unreachable past the check above; the case is
+		// here so a future refactor that moves the check cannot turn a caller's
+		// malformed id into a 500 that says "internal error".
+		if errors.Is(err, pool.ErrArtifactIDInvalid) {
+			return nil, badRequest("artifactId must be 43 base64url characters", nil)
+		}
+		// Anything else is the filesystem refusing, which is a 500 and an operator's
+		// problem. Not 404: an artifact that does not exist is a **success**, and
+		// saying otherwise would make every repeated erase look like a failure.
+		return nil, err
+	}
+	return map[string]any{"deleted": true}, nil
 }
 
 // handleHealthz reports liveness and the boot reconciliation outcome.

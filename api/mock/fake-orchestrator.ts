@@ -247,6 +247,25 @@ export class FakeOrchestrator {
     };
   }
 
+  /**
+   * deleteArtifact removes a published artifact directory.
+   *
+   * The map is the fake's stand-in for the artifact volume, so an erase that
+   * publishes and then erases leaves the fake reporting `exists: false` for the id
+   * — the same observable the api would get back from the real `/stat` after a
+   * real `/delete-artifact`.
+   *
+   * Idempotent, like the real one: an unknown id is `{ deleted: true }`, because
+   * "already gone" is the outcome the caller wanted.
+   */
+  async deleteArtifact(artifactId: string): Promise<OrchestratorResult<{ deleted: boolean }>> {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(artifactId)) {
+      return { ok: false, error: { kind: "unexpected", status: 400, body: "invalid artifact id" } };
+    }
+    this.#finalised.delete(artifactId);
+    return { ok: true, value: { deleted: true } };
+  }
+
   async stats(): Promise<OrchestratorResult<OrchestratorStats>> {
     const byState: Record<string, number> = { idle: 0, bound: 0 };
     for (const slot of this.#slots.values()) {

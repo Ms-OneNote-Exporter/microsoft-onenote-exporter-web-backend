@@ -249,6 +249,187 @@ func TestFinalizeRefusesAGuidThatIsNotOne(t *testing.T) {
 	}
 }
 
+// Deleting a published artifact.
+//
+// The same rule as the rest of this file applies, and it is the one that matters
+// here: the assertions are about the **filesystem**, asked through `ArtifactStat`,
+// because that is what the api asks before it tells Caddy to serve a download. A
+// `DeleteArtifact` that returned `nil` without removing anything would pass every
+// signature-shaped test and leave every erased session's vault on the volume.
+
+func TestDeleteArtifactRemovesWhereArtifactStatLooks(t *testing.T) {
+	p := stagedArchive(t, testID, 128)
+	if _, err := p.Finalize(FinalizeInput{ArtifactID: testID, SessionGUID: testGUID}); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+
+	// Before: published, so a download would be authorised.
+	if stat, err := p.ArtifactStat(testID); err != nil || !stat.Exists {
+		t.Fatalf("before delete, stat = %+v (err %v), want exists:true", stat, err)
+	}
+
+	if err := p.DeleteArtifact(testID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	stat, err := p.ArtifactStat(testID)
+	if err != nil {
+		t.Fatalf("stat after delete: %v", err)
+	}
+	if stat.Exists {
+		t.Error("delete reported success but ArtifactStat still finds the artifact; " +
+			"an erased session's vault is still downloadable")
+	}
+}
+
+// The archive itself, not merely the directory that held it. A directory removed
+// but a file left behind would be invisible to `ArtifactStat` (which requires a
+// directory) and would still be there on the volume — the exact shape this whole
+// change exists to remove.
+func TestDeleteArtifactRemovesTheArchiveItself(t *testing.T) {
+	p := stagedArchive(t, testID, 512)
+	if _, err := p.Finalize(FinalizeInput{ArtifactID: testID, SessionGUID: testGUID}); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	archive := filepath.Join(p.cfg.ArtifactRoot, testID, StagedArchiveName)
+
+	if err := p.DeleteArtifact(testID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := os.Stat(archive); !os.IsNotExist(err) {
+		t.Error("the archive is still on the artifact volume after delete")
+	}
+}
+
+// The same, for a partial vault: the `.partial.zip` name and the marker both live
+// inside the published directory, so both have to go with it.
+func TestDeleteArtifactRemovesAPartialVault(t *testing.T) {
+	p := stagedArchive(t, testID, 256)
+	if _, err := p.Finalize(FinalizeInput{
+		ArtifactID: testID, SessionGUID: testGUID, Partial: true,
+	}); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if marked, err := p.ArtifactMarker(testID); err != nil || !marked {
+		t.Fatalf("before delete, marker = %v (err %v), want marked", marked, err)
+	}
+
+	if err := p.DeleteArtifact(testID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	marked, err := p.ArtifactMarker(testID)
+	if err != nil {
+		t.Fatalf("marker after delete: %v", err)
+	}
+	if marked {
+		t.Error("the partial marker survived; the archive is gone but its label is not")
+	}
+}
+
+// Erase is best-effort and retried, and "the thing I was deleting is already gone"
+// is the outcome it wanted. An error here would make every repeated erase report a
+// failure and push the machine towards recording a completed deletion as a failed
+// one.
+func TestDeleteArtifactIsIdempotent(t *testing.T) {
+	p := stagedArchive(t, testID, 64)
+	if _, err := p.Finalize(FinalizeInput{ArtifactID: testID, SessionGUID: testGUID}); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		if err := p.DeleteArtifact(testID); err != nil {
+			t.Fatalf("delete %d: %v", i+1, err)
+		}
+	}
+	// And on a tree where nothing was ever published at all.
+	cfg := testConfig(t, 1)
+	empty := noDockerPool(t, cfg)
+	if err := empty.DeleteArtifact(testID); err != nil {
+		t.Errorf("delete on an empty artifact root: %v", err)
+	}
+}
+
+// A staged export belongs to an export that has not finished, and `SweepStaging` is
+// what reclaims it by age. A delete that reached into `.staging` would destroy a
+// run that is still working.
+func TestDeleteArtifactLeavesStagingAlone(t *testing.T) {
+	cfg := testConfig(t, 1)
+	p := noDockerPool(t, cfg)
+	stagedInto(t, cfg, testID, 512)
+
+	if err := p.DeleteArtifact(testID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.ArtifactRoot, StagingDir, testID, StagedArchiveName)); err != nil {
+		t.Errorf("a staged archive was removed by a published-artifact delete: %v", err)
+	}
+}
+
+// The id is joined onto a host path, so it is validated before that happens. This is
+// the same argument as `Finalize`'s, and the same list: "reject anything that is not
+// exactly 43 base64url characters" is smaller and more complete than stripping the
+// bad characters. A traversal here would delete a directory anywhere this process
+// can write — including the vault tree, which is the one tree Caddy must not serve
+// from.
+func TestDeleteArtifactRefusesAnIdThatCouldEscapeTheArtifactRoot(t *testing.T) {
+	cfg := testConfig(t, 1)
+	p := noDockerPool(t, cfg)
+
+	for _, bad := range []string{
+		"..",
+		"../" + testID,
+		strings.Repeat("../", 12) + "etc",
+		strings.Repeat("../", 12) + "escaped",
+		"short",
+		strings.Repeat("a", 42),
+		strings.Repeat("a", 44),
+		testID + "/",
+		"/" + testID,
+		testID + "\x00",
+		"." + testID,
+		testID + ".",
+	} {
+		if err := p.DeleteArtifact(bad); !errors.Is(err, ErrArtifactIDInvalid) {
+			t.Errorf("id %q: err = %v, want ErrArtifactIDInvalid", bad, err)
+		}
+	}
+
+	// Nothing escaped, and the artifact root is intact — the assertion is that the
+	// refusals happened *before* any path was built, not that the probes were absent.
+	for _, probe := range []string{
+		filepath.Join(filepath.Dir(cfg.ArtifactRoot), "escaped"),
+		filepath.Join(cfg.ArtifactRoot, "escaped"),
+	} {
+		if _, err := os.Stat(probe); err == nil {
+			t.Errorf("a traversal deleted %s", probe)
+		}
+	}
+}
+
+// One artifact, not the volume. This is the blast-radius property: a mistyped id
+// must not take another session's vault with it.
+func TestDeleteArtifactRemovesOnlyTheNamedArtifact(t *testing.T) {
+	otherID := strings.Repeat("B", 43)
+	p := stagedArchive(t, testID, 64)
+	if _, err := p.Finalize(FinalizeInput{ArtifactID: testID, SessionGUID: testGUID}); err != nil {
+		t.Fatalf("finalize first: %v", err)
+	}
+	stagedInto(t, p.cfg, otherID, 64)
+	if _, err := p.Finalize(FinalizeInput{ArtifactID: otherID, SessionGUID: testGUID}); err != nil {
+		t.Fatalf("finalize second: %v", err)
+	}
+
+	if err := p.DeleteArtifact(testID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if stat, _ := p.ArtifactStat(testID); stat.Exists {
+		t.Error("the named artifact survived")
+	}
+	if stat, _ := p.ArtifactStat(otherID); !stat.Exists {
+		t.Error("deleting one artifact removed another; a mistyped id takes a stranger's vault")
+	}
+}
+
 func TestSweepStagingRemovesAbandonedVaults(t *testing.T) {
 	// A runner that dies between streaming an archive and having it finalised
 	// leaves real bytes, holding a vault, reachable by nobody. On a quota'd VPS

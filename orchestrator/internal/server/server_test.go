@@ -273,7 +273,7 @@ func TestNoEndpointAcceptsCallerSuppliedCommandFields(t *testing.T) {
 		"timeout":       9999,
 	}
 
-	for _, path := range []string{"/claim", "/release", "/recycle", "/remove", "/stat"} {
+	for _, path := range []string{"/claim", "/release", "/recycle", "/remove", "/stat", "/delete-artifact"} {
 		for field, value := range dangerous {
 			payload := map[string]any{
 				"sessionGuid":        "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
@@ -575,6 +575,10 @@ func TestRouteTableIsExactlyTheVerbSet(t *testing.T) {
 		"/stats":    {http.MethodGet},
 		"/healthz":  {http.MethodGet},
 		"/finalize": {http.MethodPost},
+		// The ninth verb, and the one this test exists to make deliberate. It removes
+		// an artifact the api owns and nothing else — no slot, no vault, no container
+		// — so it is enumerated here like every other path rather than added quietly.
+		"/delete-artifact": {http.MethodPost},
 	}
 
 	if len(table) != len(want) {
@@ -610,6 +614,10 @@ func TestRequestSchemasHoldOnlyIdentifiers(t *testing.T) {
 		{"slotRequest", slotRequest{}, []string{"slotId"}},
 		{"recycleRequest", recycleRequest{}, []string{"slotId", "reason"}},
 		{"statRequest", statRequest{}, []string{"artifactId"}},
+		// The deletion verb's schema is asserted as narrowly as the others, and for
+		// a sharper reason: it is the only verb whose work is destructive. One field,
+		// an identifier — so a caller cannot name a path, a slot or a session.
+		{"deleteArtifactRequest", deleteArtifactRequest{}, []string{"artifactId"}},
 		// `partial` is a boolean, not an identifier. It is the one field on any
 		// verb that is not an id, and it is asserted here explicitly so adding it
 		// was a visible act: it selects the `.partial.zip` name and writes the
@@ -651,4 +659,216 @@ func contains(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// ---- POST /delete-artifact --------------------------------------------------
+//
+// The ninth verb. The filesystem work is covered against real directories in
+// internal/pool/artifact_test.go; what is only true of the *HTTP* surface is
+// tested here — that it is in the route table, that it requires the same signature
+// as every other verb, and that each kind of refusal gets the status a caller can
+// act on.
+//
+// The status mapping is the assertion worth having. This is a **destructive** verb
+// on a surface where everything else either creates or inspects, and it is called
+// from an erase that runs while the user's cookie is still open. A 409 here has to
+// mean "your id is not the shape" and nothing else, or the api's step 6b cannot
+// tell a malformed call from a full disk.
+
+// publishForTest finalises a staged archive so there is something to delete.
+func publishForTest(t *testing.T, cfg *config.Config, id string, size int) {
+	t.Helper()
+	stageForTest(t, cfg, id, size)
+	p := pool.New(cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if _, err := p.Finalize(pool.FinalizeInput{ArtifactID: id, SessionGUID: finalizeGUID}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+}
+
+func deleteBody(id string) []byte {
+	b, _ := json.Marshal(map[string]any{"artifactId": id})
+	return b
+}
+
+// The whole point, as one assertion: what the api is told afterwards.
+//
+// A handler that returned 200 without deleting anything would pass every
+// signature- and schema-shaped test and leave the vault on the volume — which is
+// the bug this verb exists to close.
+func TestDeleteArtifactRemovesThePublishedArchive(t *testing.T) {
+	_, h, cfg := newTestServer(t)
+	publishForTest(t, cfg, finalizeID, 512)
+
+	// Before: a download would be authorised.
+	if stat := do(t, h, http.MethodPost, "/stat", deleteBody(finalizeID)); stat.Code != http.StatusOK ||
+		!strings.Contains(stat.Body.String(), `"exists":true`) {
+		t.Fatalf("before delete, /stat = %d %s; want exists:true", stat.Code, stat.Body.String())
+	}
+
+	rec := do(t, h, http.MethodPost, "/delete-artifact", deleteBody(finalizeID))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "deleted") {
+		t.Errorf("body = %s, want it to report what it did", rec.Body.String())
+	}
+
+	// After: not there, which is the only thing `api` can check.
+	after := do(t, h, http.MethodPost, "/stat", deleteBody(finalizeID))
+	if after.Code != http.StatusOK {
+		t.Fatalf("stat after delete = %d: %s", after.Code, after.Body.String())
+	}
+	if !strings.Contains(after.Body.String(), `"exists":false`) {
+		t.Errorf("/stat says %s; the artifact is still downloadable after an erase", after.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(cfg.ArtifactRoot, finalizeID, pool.StagedArchiveName)); !os.IsNotExist(err) {
+		t.Error("the archive is still on the artifact volume")
+	}
+}
+
+// Idempotent over HTTP, because the api's erase is best-effort and retried and
+// "already gone" is the outcome it wanted. A 404 here would make every repeated
+// erase report a failure.
+func TestDeleteArtifactAnswers200ForAnArtifactThatIsAlreadyGone(t *testing.T) {
+	_, h, cfg := newTestServer(t)
+	publishForTest(t, cfg, finalizeID, 64)
+
+	if rec := do(t, h, http.MethodPost, "/delete-artifact", deleteBody(finalizeID)); rec.Code != http.StatusOK {
+		t.Fatalf("first delete = %d: %s", rec.Code, rec.Body.String())
+	}
+	rec := do(t, h, http.MethodPost, "/delete-artifact", deleteBody(finalizeID))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second delete = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	// ...and on a tree that never published anything.
+	rec = do(t, h, http.MethodPost, "/delete-artifact",
+		deleteBody(strings.Repeat("B", 43)))
+	if rec.Code != http.StatusOK {
+		t.Errorf("delete of an unknown artifact = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// 400, before the id is ever joined to a host path. A 409 would suggest a stale id
+// rather than a malformed one, and the api would treat it as an orchestrator
+// disagreement.
+func TestDeleteArtifactRejectsABadArtifactID(t *testing.T) {
+	_, h, _ := newTestServer(t)
+
+	for _, bad := range []string{"short", strings.Repeat("a", 44), "../" + finalizeID, "", ".."} {
+		rec := do(t, h, http.MethodPost, "/delete-artifact", deleteBody(bad))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("id %q: status = %d, want 400: %s", bad, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// A traversal must delete nothing. The destructive verb is the one where that
+// matters most, so it is asserted over HTTP as well as in the pool test.
+//
+// The probe is a sibling of the artifact directories — one level up from where
+// `<root>/<artifactId>` would sit — so `../escaped` resolves to exactly this path
+// and the assertion is about the join rather than about an unrelated temp dir.
+func TestDeleteArtifactRejectsATraversalAndDeletesNothing(t *testing.T) {
+	_, h, cfg := newTestServer(t)
+	sibling := filepath.Join(cfg.ArtifactRoot, "escaped")
+	if err := os.MkdirAll(sibling, 0o700); err != nil {
+		t.Fatalf("create the probe: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(sibling) }()
+
+	rec := do(t, h, http.MethodPost, "/delete-artifact", deleteBody("../escaped"))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(sibling); err != nil {
+		t.Errorf("a traversal deleted %s: %v", sibling, err)
+	}
+}
+
+// Same as every other verb, and asserted because a destructive path added to the
+// table without the auth hook has no other symptom than an open endpoint: anyone
+// who can reach this process could delete published vaults.
+func TestDeleteArtifactRequiresASignature(t *testing.T) {
+	_, h, cfg := newTestServer(t)
+	publishForTest(t, cfg, finalizeID, 64)
+
+	rec := doRaw(t, h, http.MethodPost, "/delete-artifact", deleteBody(finalizeID))
+	if rec.Code == http.StatusOK {
+		t.Fatalf("an unsigned delete succeeded: %s", rec.Body.String())
+	}
+	// ...and the artifact is still there, which is the half of the assertion that
+	// matters: a refusal that deleted anyway would pass the status check.
+	if _, err := os.Stat(filepath.Join(cfg.ArtifactRoot, finalizeID, pool.StagedArchiveName)); err != nil {
+		t.Errorf("an unsigned request removed the archive: %v", err)
+	}
+}
+
+func TestDeleteArtifactRejectsAMalformedBody(t *testing.T) {
+	_, h, _ := newTestServer(t)
+
+	rec := do(t, h, http.MethodPost, "/delete-artifact", []byte("{not json"))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A deletion verb must not accept anything that could name a different directory.
+// `DisallowUnknownFields` is the enforcement, asserted through the verb rather than
+// only through `TestUnknownFieldIsRejectedNotIgnored` on `/release`.
+func TestDeleteArtifactRejectsAnUnknownField(t *testing.T) {
+	_, h, cfg := newTestServer(t)
+	publishForTest(t, cfg, finalizeID, 64)
+
+	rec := do(t, h, http.MethodPost, "/delete-artifact",
+		[]byte(`{"artifactId":"`+finalizeID+`","path":"/etc"}`))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(cfg.ArtifactRoot, finalizeID, pool.StagedArchiveName)); err != nil {
+		t.Errorf("an unknown field still deleted the artifact: %v", err)
+	}
+}
+
+// In the route table, POST only. A handler that exists but is not in the table is
+// unreachable code a reader would believe in; a path that accepts a second method is
+// a verb set that has grown without anyone reading it.
+func TestDeleteArtifactIsInTheRouteTableForPostOnly(t *testing.T) {
+	_, h, _ := newTestServer(t)
+
+	for _, tc := range []struct {
+		method string
+		want   int
+	}{
+		{http.MethodGet, http.StatusMethodNotAllowed},
+		{http.MethodDelete, http.StatusMethodNotAllowed},
+		{http.MethodPut, http.StatusMethodNotAllowed},
+	} {
+		rec := do(t, h, tc.method, "/delete-artifact", nil)
+		if rec.Code != tc.want {
+			t.Errorf("%s /delete-artifact = %d, want %d", tc.method, rec.Code, tc.want)
+		}
+		if rec.Code == http.StatusMethodNotAllowed && rec.Header().Get("Allow") == "" {
+			t.Errorf("%s /delete-artifact: Allow header missing", tc.method)
+		}
+	}
+}
+
+// The blast-radius property, over HTTP: one id removes one artifact. A mistyped id
+// must not take a stranger's vault with it, which is the one thing a destructive
+// verb on a shared volume has to get right.
+func TestDeleteArtifactRemovesOnlyTheNamedArtifact(t *testing.T) {
+	otherID := strings.Repeat("B", 43)
+	_, h, cfg := newTestServer(t)
+	publishForTest(t, cfg, finalizeID, 64)
+	publishForTest(t, cfg, otherID, 64)
+
+	if rec := do(t, h, http.MethodPost, "/delete-artifact", deleteBody(finalizeID)); rec.Code != http.StatusOK {
+		t.Fatalf("delete = %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, h, http.MethodPost, "/stat", deleteBody(finalizeID)); !strings.Contains(rec.Body.String(), `"exists":false`) {
+		t.Errorf("the named artifact survived: %s", rec.Body.String())
+	}
+	if rec := do(t, h, http.MethodPost, "/stat", deleteBody(otherID)); !strings.Contains(rec.Body.String(), `"exists":true`) {
+		t.Errorf("deleting one artifact removed another: %s", rec.Body.String())
+	}
 }

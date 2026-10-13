@@ -187,6 +187,29 @@ else
   case "$RUNNER_IMAGE" in
     *"$EXPECTED"*) echo "  runner image  ${RUNNER_IMAGE}" ;;
     *)
+      # The malformed case gets its own message, because it is a different bug
+      # from the stale one and the two want opposite fixes.
+      #
+      # A `.env` holding an unexpanded substitution — `$(...)` or `${...}` written
+      # by hand, or a stray space — reaches this environment verbatim, because
+      # compose interpolates `${VAR}` and never expands a command. The Engine then
+      # rejects every create with `400 invalid reference format`, the pool holds no
+      # containers, and every login answers `409 pool-diverged`. Observed on the
+      # deployed host 2026-10-13, after a `.env` line reading
+      # `…msout-runner:$(git -C /opt/msout rev-parse HEAD)`. The generic message
+      # below would have sent the operator hunting for a stale tag instead.
+      case "$RUNNER_IMAGE" in
+        *'$'*|*'('*|*')'*|*' '*)
+          echo "FAIL: ORCH_RUNNER_IMAGE is not an image reference: '${RUNNER_IMAGE}'." >&2
+          echo "      It contains a shell substitution or whitespace. .env values are" >&2
+          echo "      literal - compose does not expand \$(...) - so the Engine rejects" >&2
+          echo "      every create with '400 invalid reference format', the pool holds no" >&2
+          echo "      containers, and every login answers 409 pool-diverged." >&2
+          echo "      Set RUNNER_IMAGE to ghcr.io/ms-one-note-exporter/msout-runner:${EXPECTED}" >&2
+          echo "      (infra/check-env.sh checks this before the deploy starts.)" >&2
+          exit 1
+          ;;
+      esac
       echo "FAIL: new runners would be created from '${RUNNER_IMAGE}', not ${EXPECTED}." >&2
       echo "      RUNNER_IMAGE in .env disagrees with IMAGE_TAG. Every runner created" >&2
       echo "      from here on would be an older build than the api talking to it," >&2

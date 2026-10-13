@@ -53,6 +53,14 @@ function orchestratorStub(opts: {
    */
   deadSlots?: string[];
   /**
+   * What `/stats` reports as `slotRemainingSec`: slot id → seconds of budget left.
+   *
+   * Omitted from the response when undefined, which is how this stub also stands in
+   * for an orchestrator predating the field — the rolling-deploy case the claim's
+   * post-claim floor check fails open for.
+   */
+  slotRemainingSec?: Record<string, number>;
+  /**
    * Runs inside the `/release` handler, before the answer is returned.
    *
    * Exists so a test can produce the window the pre-act liveness re-check exists
@@ -141,6 +149,13 @@ function orchestratorStub(opts: {
               // make "this orchestrator predates the field" unreachable, which is the
               // half of the pair that has to stay working.
               ...(opts.deadSlots === undefined ? {} : { deadSlots: opts.deadSlots }),
+              // And again for the per-slot budget the claim's floor check reads. The
+              // real one carries `omitempty` on it, so a stub that always sent `{}`
+              // would make "this orchestrator does not say" unreachable — which is
+              // the half that has to keep working during a rolling deploy.
+              ...(opts.slotRemainingSec === undefined
+                ? {}
+                : { slotRemainingSec: opts.slotRemainingSec }),
             }),
           );
         }
@@ -538,6 +553,159 @@ describe("PoolBinder.claimForLogin", () => {
     await binder.claimForLogin(db.getSession(GUID)!);
 
     expect(db.getSession(GUID)?.idle_expires_at).toBe(now + TTL.loginInProgress);
+  });
+});
+
+// ---- the claim's post-claim floor check -------------------------------------
+//
+// A claim creates a container and takes ~57 s worst case. A slot whose container is
+// about to be recycled out from under it turns that login into a sign-in that dies on
+// its own — and this process cannot see the age at all: it holds no container
+// identity (§2.1) and the clock lives on the orchestrator's side. `slotRemainingSec`
+// is the orchestrator's answer, and this is the check that acts on it.
+//
+// Every case below is a case where the check must **not** fire unless it has
+// evidence. The metrics are advisory: turning a missing field into a refusal would
+// make a rolling deploy an outage, and would refuse hardest exactly when the
+// orchestrator is least reachable.
+
+describe("PoolBinder's claim floor check", () => {
+  /** A pool of one slot the orchestrator names, so nothing has to be seeded. */
+  function oneSlot(opts: {
+    remainingSec?: Record<string, number>;
+    stats?: "ok" | "unreachable" | "filled";
+  }) {
+    return orchestratorStub({
+      claim: "ok",
+      release: "ok",
+      stats: opts.stats ?? "filled",
+      slotIds: ["slot-1"],
+      ...(opts.remainingSec === undefined ? {} : { slotRemainingSec: opts.remainingSec }),
+    });
+  }
+
+  it("refuses a slot with less than the floor left, and says which reason", async () => {
+    seedSession(GUID, { state: "created" });
+    const { client } = oneSlot({ remainingSec: { "slot-1": 30 } });
+    const binder = new PoolBinder(options(client));
+
+    const result = await binder.claimForLogin(db.getSession(GUID)!);
+
+    expect(result).toEqual({ ok: false, reason: "slot-expiring", retryable: true });
+  });
+
+  it("gives the slot back on both sides rather than keeping a container it distrusts", async () => {
+    seedSession(GUID, { state: "created" });
+    const { client, released } = oneSlot({ remainingSec: { "slot-1": 30 } });
+    const binder = new PoolBinder(options(client));
+
+    await binder.claimForLogin(db.getSession(GUID)!);
+
+    // The orchestrator's half. It is the side that holds the container, and a
+    // one-sided release would leave a slot bound to a session this process no longer
+    // offers — which is the divergence the `slot-conflict` path repairs by refusing
+    // the user's next login.
+    expect(released).toEqual(["slot-1"]);
+    // This process's half: the row is idle and unattached again, so the next
+    // `claimRunner` can offer it and nothing has to wait for a sweep to notice.
+    const row = db.get<{ status: string; session_guid: string | null }>(
+      `SELECT status, session_guid FROM runners WHERE id = 'slot-1'`,
+    );
+    expect(row?.status).toBe("idle");
+    expect(row?.session_guid).toBeNull();
+  });
+
+  it("leaves the session exactly as it found it, so a retry is a clean attempt", async () => {
+    seedSession(GUID, { state: "created" });
+    const { client } = oneSlot({ remainingSec: { "slot-1": 30 } });
+    const binder = new PoolBinder(options(client));
+
+    await binder.claimForLogin(db.getSession(GUID)!);
+
+    // `claimBindingWrite` never ran, so the session was never demoted to
+    // `authenticating` and never given a `runner_id` pointing at a container that is
+    // about to be destroyed. A retry draws another slot rather than inheriting this.
+    expect(db.getSession(GUID)?.state).toBe("created");
+    expect(db.getSession(GUID)?.runner_id).toBeNull();
+    expect(db.getSession(GUID)?.idle_expires_at).toBeNull();
+  });
+
+  // It is a refusal, not a conflict: `#claimWithRetries` retries only the one a
+  // different row could fix, and re-drawing here would just draw from a pool that has
+  // not had a container replaced yet.
+  it("does not retry a refusal — one claim, one answer", async () => {
+    seedSession(GUID, { state: "created" });
+    const { client, calls } = oneSlot({ remainingSec: { "slot-1": 30 } });
+    const binder = new PoolBinder(options(client));
+
+    await binder.claimForLogin(db.getSession(GUID)!);
+
+    expect(calls.filter((path) => path === "/claim")).toHaveLength(1);
+  });
+
+  // The floor is a floor, not an off-by-one. Exactly 60 s is enough, because the
+  // claim it has to cover costs ~57 s.
+  it("accepts a slot sitting exactly on the floor", async () => {
+    seedSession(GUID, { state: "created" });
+    const { client, released } = oneSlot({ remainingSec: { "slot-1": 60 } });
+    const binder = new PoolBinder(options(client));
+
+    const result = await binder.claimForLogin(db.getSession(GUID)!);
+
+    expect(result.ok).toBe(true);
+    expect(released).toEqual([]);
+  });
+
+  it("accepts a freshly created container", async () => {
+    seedSession(GUID, { state: "created" });
+    const { client } = oneSlot({ remainingSec: { "slot-1": 300 } });
+    const binder = new PoolBinder(options(client));
+
+    const result = await binder.claimForLogin(db.getSession(GUID)!);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.runnerId).toBe("slot-1");
+  });
+
+  // A failed `/stats` is "we do not know". It must never read as "this slot has no
+  // budget left", which is the failure that would refuse every login during an
+  // orchestrator outage — exactly when a login cannot be deferred instead.
+  it("proceeds when the orchestrator cannot be asked at all", async () => {
+    // Seeded rather than learned, so the SQLite claim succeeds without consulting
+    // `/stats`: the only `/stats` this test makes is the floor check's.
+    seedRunners(1);
+    seedSession(GUID, { state: "created" });
+    const { client } = orchestratorStub({ claim: "ok", stats: "unreachable" });
+    const binder = new PoolBinder(options(client));
+
+    const result = await binder.claimForLogin(db.getSession(GUID)!);
+
+    expect(result.ok).toBe(true);
+  });
+
+  // The rolling deploy: an api that shipped the check talking to an orchestrator that
+  // has not shipped the field. Absence means "this orchestrator does not say".
+  it("proceeds against an orchestrator that does not report a budget", async () => {
+    seedSession(GUID, { state: "created" });
+    const { client } = oneSlot({});
+    const binder = new PoolBinder(options(client));
+
+    const result = await binder.claimForLogin(db.getSession(GUID)!);
+
+    expect(result.ok).toBe(true);
+  });
+
+  // A slot missing from the map has no container yet — an age of nothing. That is
+  // not the same claim as "no budget left", and reading it as one would refuse the
+  // very slots that were about to be handed over.
+  it("proceeds when the claimed slot is absent from the map", async () => {
+    seedSession(GUID, { state: "created" });
+    const { client } = oneSlot({ remainingSec: {} });
+    const binder = new PoolBinder(options(client));
+
+    const result = await binder.claimForLogin(db.getSession(GUID)!);
+
+    expect(result.ok).toBe(true);
   });
 });
 

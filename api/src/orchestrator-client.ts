@@ -251,6 +251,31 @@ export interface OrchestratorStats {
 
   /** Consecutive failed top-up attempts, when there has been one. */
   readonly fillFailures?: number;
+
+  /**
+   * Per-slot container age in seconds, keyed by slot id.
+   *
+   * Optional for rolling-deploy compatibility: a new api talking to an orchestrator
+   * that predates this field will not see it. Absent means "this orchestrator does
+   * not say", which reads as "no floor check" — today's behaviour, with no regression.
+   *
+   * The orchestrator already holds every fact behind this: `Slot.CreatedAt` is the
+   * label-derived clock its reconciler already trusts, and `RunnerTTL` is its own
+   * config. It was simply not saying.
+   */
+  readonly slotAgeSec?: Readonly<Record<string, number>>;
+
+  /**
+   * Per-slot remaining budget in seconds, keyed by slot id.
+   *
+   * `remainingSec = max(0, budgetSec - ageSec)`. Monotone non-increasing between
+   * container replacements, so a reset is always a replacement and never a silence.
+   *
+   * Optional for the same reason `slotAgeSec` is. A slot is absent from the map when
+   * it holds no container — there is no age to report for a container that does not
+   * exist yet.
+   */
+  readonly slotRemainingSec?: Readonly<Record<string, number>>;
 }
 
 /** Errors the orchestrator's HTTP surface can produce, as typed results. */

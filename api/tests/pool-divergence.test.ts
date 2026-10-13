@@ -340,7 +340,7 @@ describe("an orchestrator with no slots at all", () => {
 
 describe("a healthy pool is not disturbed", () => {
   it("claims the first slot it is offered, with no retry", async () => {
-    // The retry must cost nothing on the happy path, including no extra `/stats`.
+    // The retry must cost nothing on the happy path.
     db.registerRunner("slot-1", "", "idle");
 
     const attempts: string[] = [];
@@ -352,6 +352,9 @@ describe("a healthy pool is not disturbed", () => {
         const url = new URL(String(input));
         if (url.pathname === "/stats") {
           statsCalls.push(1);
+          // No `slotRemainingSec`: the orchestrator this stub stands for does not
+          // report one, so the claim's floor check fails open. That is the case this
+          // test is about — a claim that proceeds — and the floor has its own tests.
           return new Response(JSON.stringify({ size: 1, byState: {}, slotIds: ["slot-1"] }), {
             status: 200,
             headers: { "content-type": "application/json" },
@@ -376,7 +379,12 @@ describe("a healthy pool is not disturbed", () => {
 
     expect(result.ok).toBe(true);
     expect(attempts).toHaveLength(1);
-    // The re-learn is only for the retry path.
-    expect(statsCalls).toHaveLength(0);
+    // Exactly one `/stats`, and it is the claim's floor check — **not** the retry's
+    // re-learn. This used to be `toHaveLength(0)`, which asserted that a healthy
+    // claim touches `/stats` not at all; the floor check made that untrue, and the
+    // number that still matters is that the re-learn does not happen: one stats
+    // call, not two. A second one would be the retry path running on a claim that
+    // needed no retry.
+    expect(statsCalls).toHaveLength(1);
   });
 });

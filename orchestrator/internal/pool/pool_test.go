@@ -1405,6 +1405,227 @@ func TestStatsMarshalsBoundSessionsUnderItsJSONKey(t *testing.T) {
 	}
 }
 
+// ---- per-slot age and remaining budget ---------------------------------------
+//
+// The api can already ask how many slots are idle; it could not ask how long the
+// container behind one of them has left. `Slot.CreatedAt` is the label-derived
+// clock `Reconcile` already trusts and `RunnerTTL` is already in config, so the
+// orchestrator holds every fact the question needs — it was simply not saying.
+//
+// These are that answer, and nothing more: two flat maps on an answer the api
+// already fetches every 30 seconds, in the shape `BoundSessions` and `DeadSlots`
+// established. No verb, no input, and no field that changes what the pool does.
+
+// budgetPool builds a pool with a fixed clock and one idle slot per entry in
+// `ages`. A negative age leaves `CreatedAt` zero — the state `EnsurePool` puts a
+// registered-but-unfilled slot in, and the only one with no container to measure.
+func budgetPool(t *testing.T, ttl time.Duration, ages map[string]time.Duration) *Pool {
+	t.Helper()
+	cfg := testConfig(t, len(ages))
+	cfg.RunnerTTL = ttl
+	p := New(cfg, nil, discardLog())
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	p.now = func() time.Time { return now }
+	for id, age := range ages {
+		slot := &Slot{ID: id, State: StateIdle, ContainerID: "container-" + id}
+		if age >= 0 {
+			slot.CreatedAt = now.Add(-age)
+		}
+		p.slots[id] = slot
+	}
+	return p
+}
+
+func TestStatsReportsPerSlotAgeAndRemaining(t *testing.T) {
+	// A four-minute budget, not the five the test config carries, so the assertion
+	// cannot pass by accident on a hard-coded 300.
+	p := budgetPool(t, 4*time.Minute, map[string]time.Duration{
+		"slot-1": 90 * time.Second,
+		"slot-2": 30 * time.Second,
+	})
+
+	stats := p.Stats()
+
+	if len(stats.SlotAgeSec) != 2 {
+		t.Fatalf("SlotAgeSec = %v, want an entry for each slot with a container", stats.SlotAgeSec)
+	}
+	if got := stats.SlotAgeSec["slot-1"]; got != 90 {
+		t.Errorf("slot-1 age = %ds, want 90s", got)
+	}
+	if got := stats.SlotAgeSec["slot-2"]; got != 30 {
+		t.Errorf("slot-2 age = %ds, want 30s", got)
+	}
+	// Remaining is the budget minus the age, per slot — the number a floor check
+	// compares against, and the one that makes the map worth carrying.
+	if got := stats.SlotRemainingSec["slot-1"]; got != 240-90 {
+		t.Errorf("slot-1 remaining = %ds, want %ds", got, 240-90)
+	}
+	if got := stats.SlotRemainingSec["slot-2"]; got != 240-30 {
+		t.Errorf("slot-2 remaining = %ds, want %ds", got, 240-30)
+	}
+}
+
+// A slot with no container has no age. `CreatedAt` is zero until the create
+// finishes, and reporting an age for a container that does not exist would tell
+// the api that an empty slot is the freshest thing in the pool — which is
+// precisely the slot it would then refuse to claim.
+func TestStatsOmitsSlotsThatHoldNoContainer(t *testing.T) {
+	p := budgetPool(t, 5*time.Minute, map[string]time.Duration{
+		"slot-1": -1, // no container
+		"slot-2": 45 * time.Second,
+	})
+
+	stats := p.Stats()
+
+	if _, listed := stats.SlotAgeSec["slot-1"]; listed {
+		t.Errorf("a slot with no container is reported as aged: %v", stats.SlotAgeSec)
+	}
+	if _, listed := stats.SlotRemainingSec["slot-1"]; listed {
+		t.Errorf("a slot with no container is reported as having budget left: %v", stats.SlotRemainingSec)
+	}
+	// Asserted after the absence, so a map that dropped everything passes neither
+	// check by accident.
+	if got := stats.SlotAgeSec["slot-2"]; got != 45 {
+		t.Errorf("slot-2 age = %ds, want 45s", got)
+	}
+}
+
+// `remainingSec = max(0, budgetSec - ageSec)`. Zero and never negative: a
+// consumer asking "how much is left" would have to know the sign to use the
+// answer, and a negative budget is not a thing a container has.
+func TestStatsClampsRemainingAtZeroOnceTheBudgetIsSpent(t *testing.T) {
+	p := budgetPool(t, 5*time.Minute, map[string]time.Duration{
+		"slot-1": 5 * time.Minute, // exactly spent
+		"slot-2": 12 * time.Minute,
+	})
+
+	stats := p.Stats()
+
+	if got := stats.SlotRemainingSec["slot-1"]; got != 0 {
+		t.Errorf("a slot at exactly the TTL has %ds remaining, want 0", got)
+	}
+	if got := stats.SlotRemainingSec["slot-2"]; got != 0 {
+		t.Errorf("a slot past the TTL has %ds remaining, want 0, not a negative", got)
+	}
+	// The age is still reported: clamping the budget must not hide how old the
+	// container is, which is the other half of the answer.
+	if got := stats.SlotAgeSec["slot-2"]; got != 720 {
+		t.Errorf("slot-2 age = %ds, want 720s", got)
+	}
+}
+
+// `omitempty`, on the same terms as `BoundSessions`: a pool with no containers
+// marshals byte-for-byte as it did before these fields existed, and a consumer
+// that diffs two `/stats` bodies must not see a key appear because the pool went
+// quiet. Asserted on the marshalled body, because the struct tag is not the
+// behaviour — the JSON is.
+func TestStatsOmitsSlotBudgetWhenNoSlotHasAContainer(t *testing.T) {
+	p := budgetPool(t, 5*time.Minute, map[string]time.Duration{
+		"slot-1": -1,
+		"slot-2": -1,
+	})
+
+	stats := p.Stats()
+	if stats.SlotAgeSec != nil {
+		t.Errorf("SlotAgeSec = %v on a pool with no containers, want nil", stats.SlotAgeSec)
+	}
+	if stats.SlotRemainingSec != nil {
+		t.Errorf("SlotRemainingSec = %v on a pool with no containers, want nil", stats.SlotRemainingSec)
+	}
+	body, err := json.Marshal(stats)
+	if err != nil {
+		t.Fatalf("marshal stats: %v", err)
+	}
+	for _, key := range []string{"slotAgeSec", "slotRemainingSec"} {
+		if strings.Contains(string(body), key) {
+			t.Errorf("/stats body carries %s on a pool with no containers: %s", key, body)
+		}
+	}
+}
+
+// Two calls against an unchanged pool are byte-identical, and the keys come out
+// sorted. `Stats` sorts `ids` itself; these two maps get the same guarantee from
+// `encoding/json`, which emits map keys in sorted order — a property of the
+// encoder rather than of this code, and the reason it is asserted here rather
+// than assumed.
+func TestStatsSlotBudgetIsDeterministicAndSorted(t *testing.T) {
+	ages := map[string]time.Duration{}
+	for i := 1; i <= 5; i++ {
+		ages[fmt.Sprintf("slot-%d", i)] = time.Duration(i) * time.Second
+	}
+	p := budgetPool(t, 5*time.Minute, ages)
+
+	first, err := json.Marshal(p.Stats())
+	if err != nil {
+		t.Fatalf("marshal stats: %v", err)
+	}
+	for i := 0; i < 20; i++ {
+		next, err := json.Marshal(p.Stats())
+		if err != nil {
+			t.Fatalf("marshal stats: %v", err)
+		}
+		if string(next) != string(first) {
+			t.Fatalf("/stats is unstable across calls:\n%s\n%s", first, next)
+		}
+	}
+
+	// Sorted on the wire, not merely stable: an unstable *order* is what makes a
+	// diff of two responses meaningless, and the only thing that produces it here
+	// is the map iteration.
+	previous := -1
+	for i := 1; i <= 5; i++ {
+		at := strings.Index(string(first), fmt.Sprintf(`"slot-%d":`, i))
+		if at < 0 {
+			t.Fatalf("slot-%d missing from the body: %s", i, first)
+		}
+		if at <= previous {
+			t.Fatalf("keys are not sorted on the wire at slot-%d: %s", i, first)
+		}
+		previous = at
+	}
+}
+
+// The both-ends pin, for the same reason `boundSessions` has one: `api` reads
+// these keys by name, across an HTTP boundary, from a component that shares no
+// code with this one. See `api/tests/orchestrator-client.test.ts`, which parses
+// these exact literals.
+func TestStatsMarshalsSlotBudgetUnderItsJSONKeys(t *testing.T) {
+	p := budgetPool(t, 5*time.Minute, map[string]time.Duration{"slot-1": 120 * time.Second})
+
+	body, err := json.Marshal(p.Stats())
+	if err != nil {
+		t.Fatalf("marshal stats: %v", err)
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("unmarshal stats: %v", err)
+	}
+
+	rawAge, present := decoded["slotAgeSec"]
+	if !present {
+		t.Fatalf("/stats body has no slotAgeSec key: %s", body)
+	}
+	var ages map[string]int
+	if err := json.Unmarshal(rawAge, &ages); err != nil {
+		t.Fatalf("slotAgeSec is not a slot→int map: %v", err)
+	}
+	if ages["slot-1"] != 120 {
+		t.Errorf("slotAgeSec = %v, want slot-1→120", ages)
+	}
+
+	rawRemaining, present := decoded["slotRemainingSec"]
+	if !present {
+		t.Fatalf("/stats body has no slotRemainingSec key: %s", body)
+	}
+	var remaining map[string]int
+	if err := json.Unmarshal(rawRemaining, &remaining); err != nil {
+		t.Fatalf("slotRemainingSec is not a slot→int map: %v", err)
+	}
+	if remaining["slot-1"] != 300-120 {
+		t.Errorf("slotRemainingSec = %v, want slot-1→%d", remaining, 300-120)
+	}
+}
+
 // ---- Claim with a named slot -------------------------------------------------
 //
 // The api names the slot it already claimed in SQLite, because a lock on a row that is

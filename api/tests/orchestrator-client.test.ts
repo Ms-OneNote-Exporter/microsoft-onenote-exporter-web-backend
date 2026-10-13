@@ -300,6 +300,89 @@ describe("OrchestratorClient", () => {
     if (!result.ok) return;
     expect(result.value.boundSessions).toBeUndefined();
   });
+
+  // The both-ends pin for the per-slot budget, whose other half is
+  // `orchestrator/internal/pool`'s `TestStatsMarshalsSlotBudgetUnderItsJSONKeys`.
+  //
+  // Same argument as `boundSessions` above: two components, no shared code, a name
+  // that is only a contract. If either side renames a key the claim's floor check
+  // silently stops firing — and it would stop *quietly*, because every other test
+  // would pass with the field simply absent.
+  //
+  // The keys' existence is asserted on the wire before the client is involved, since
+  // a content assertion against an absent field is vacuously true.
+  it("reads slotAgeSec and slotRemainingSec off the literal keys the orchestrator marshals", async () => {
+    const body = JSON.stringify({
+      size: 2,
+      byState: { idle: 2 },
+      runnerTtlSeconds: 300,
+      slotIds: ["slot-1", "slot-2"],
+      slotAgeSec: { "slot-1": 240, "slot-2": 12 },
+      slotRemainingSec: { "slot-1": 60, "slot-2": 288 },
+    });
+    for (const key of ["slotAgeSec", "slotRemainingSec"]) {
+      expect(key in (JSON.parse(body) as Record<string, unknown>)).toBe(true);
+    }
+
+    const c = client(stubFetch(200, body));
+    const result = await c.stats();
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // Seconds, keyed by slot id, carried through untouched: the client does no
+    // arithmetic on a number only the orchestrator can compute.
+    expect(result.value.slotAgeSec).toEqual({ "slot-1": 240, "slot-2": 12 });
+    expect(result.value.slotRemainingSec).toEqual({ "slot-1": 60, "slot-2": 288 });
+  });
+
+  // The other direction of the rolling deploy, and the half that has to keep working:
+  // an orchestrator predating the field omits it (`omitempty`), and that must read as
+  // "does not say" rather than as a pool whose slots have nothing left — which the
+  // claim's floor check would refuse every login over.
+  it("reads an orchestrator that omits the slot budget as not saying, not as empty", async () => {
+    const c = client(
+      stubFetch(
+        200,
+        JSON.stringify({ size: 2, byState: { idle: 2 }, runnerTtlSeconds: 300, slotIds: ["slot-1"] }),
+      ),
+    );
+
+    const result = await c.stats();
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.slotRemainingSec).toBeUndefined();
+    expect(result.value.slotAgeSec).toBeUndefined();
+  });
+
+  // A slot holding no container is absent from both maps, not present with a zero. The
+  // difference is the whole reason the caller can distinguish "no age" from "no
+  // budget", and it is what `omitempty` plus a zero `CreatedAt` produce on the far
+  // side.
+  it("carries a partial slot budget through without filling in the missing slots", async () => {
+    const c = client(
+      stubFetch(
+        200,
+        JSON.stringify({
+          size: 2,
+          byState: { idle: 1, starting: 1 },
+          runnerTtlSeconds: 300,
+          slotIds: ["slot-1", "slot-2"],
+          slotRemainingSec: { "slot-1": 0 },
+        }),
+      ),
+    );
+
+    const result = await c.stats();
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // `slot-1` is reported as spent, and `slot-2` — no container yet — is absent.
+    // A `Record` filled in with zeros would make both indistinguishable, and a claim
+    // would refuse a slot that has not been created.
+    expect(result.value.slotRemainingSec).toEqual({ "slot-1": 0 });
+    expect("slot-2" in (result.value.slotRemainingSec ?? {})).toBe(false);
+  });
 });
 
 /**

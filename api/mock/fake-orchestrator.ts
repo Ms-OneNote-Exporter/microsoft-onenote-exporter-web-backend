@@ -51,7 +51,25 @@ interface FakeSlot {
   readonly slotId: string;
   containerId: string;
   sessionGuid: string | null;
+  /**
+   * When the current container was created, in epoch ms. `null` when the slot has
+   * no container — the fake's version of the real `Slot.CreatedAt` being zero until
+   * the create finishes, and the reason `/stats` omits the age maps for such a slot.
+   *
+   * Null rather than 0 so "no container" cannot collide with a test whose clock
+   * happens to be the epoch.
+   */
+  createdAtMs: number | null;
 }
+
+/**
+ * The runner budget the fake reports, in seconds.
+ *
+ * One constant because `/stats` now answers `runnerTtlSeconds` and
+ * `slotRemainingSec` from the same number, and a fake that reported 300 for one and
+ * 600 for the other would hand a caller a self-contradicting pool.
+ */
+const RUNNER_TTL_SECONDS = 300;
 
 /**
  * FakeOrchestrator is an in-memory stand-in for the real control plane.
@@ -74,7 +92,7 @@ export class FakeOrchestrator {
     this.#now = options.now ?? (() => Date.now());
     for (let i = 1; i <= (options.size ?? 2); i++) {
       const slotId = `slot-${i}`;
-      this.#slots.set(slotId, { slotId, containerId: "", sessionGuid: null });
+      this.#slots.set(slotId, { slotId, containerId: "", sessionGuid: null, createdAtMs: null });
     }
   }
 
@@ -129,6 +147,7 @@ export class FakeOrchestrator {
     this.#seq++;
     free.sessionGuid = sessionGuid;
     free.containerId = `mock${String(this.#seq).padStart(6, "0")}`;
+    free.createdAtMs = this.#now();
     return { ok: true, value: { slotId: free.slotId, containerId: free.containerId } };
   }
 
@@ -142,6 +161,9 @@ export class FakeOrchestrator {
     // release and remove, and a fake that conflated them would hide it.
     slot.sessionGuid = null;
     slot.containerId = "";
+    // No container, no age — so `/stats` stops reporting one for this slot, exactly
+    // as the real pool does for a slot whose `CreatedAt` was reset on release.
+    slot.createdAtMs = null;
     return { ok: true, value: { released: true } };
   }
 
@@ -157,6 +179,10 @@ export class FakeOrchestrator {
     // binding survives.
     this.#seq++;
     slot.containerId = `mock${String(this.#seq).padStart(6, "0")}`;
+    // A replacement is a new container, so the age restarts from zero. A fake that
+    // kept the old `createdAtMs` would report a recycled slot as about to expire and
+    // teach a caller to distrust the field it is supposed to be testing.
+    slot.createdAtMs = this.#now();
     return { ok: true, value: { recycled: true } };
   }
 
@@ -239,12 +265,30 @@ export class FakeOrchestrator {
     for (const slot of this.#slots.values()) {
       if (slot.sessionGuid !== null) boundSessions[slot.slotId] = slot.sessionGuid;
     }
+    // Per-slot age and remaining budget, read off this file's own slot model for the
+    // same reason `boundSessions` is: a mock that quietly omitted the field would let
+    // a caller's floor check go unexercised in exactly the place it is supposed to be
+    // exercised — and would go unexercised *silently*, because every other test would
+    // still pass with the field simply absent.
+    //
+    // A slot with no container is absent from both maps, matching the real `Stats`,
+    // which skips a zero `CreatedAt` and carries `omitempty` on both. The arithmetic
+    // is the real one: `remaining = max(0, budget - age)`.
+    const slotAgeSec: Record<string, number> = {};
+    const slotRemainingSec: Record<string, number> = {};
+    const nowSec = Math.floor(this.#now() / 1000);
+    for (const slot of this.#slots.values()) {
+      if (slot.createdAtMs === null) continue;
+      const ageSec = Math.max(0, nowSec - Math.floor(slot.createdAtMs / 1000));
+      slotAgeSec[slot.slotId] = ageSec;
+      slotRemainingSec[slot.slotId] = Math.max(0, RUNNER_TTL_SECONDS - ageSec);
+    }
     return {
       ok: true,
       value: {
         size: this.#slots.size,
         byState,
-        runnerTtlSeconds: 300,
+        runnerTtlSeconds: RUNNER_TTL_SECONDS,
         // The real orchestrator exposes these now, and the api seeds its pool from
         // them. Sorted so the fake matches the real response byte for byte.
         slotIds: this.slotIds().sort(),
@@ -254,6 +298,11 @@ export class FakeOrchestrator {
         // rather than `{ boundSessions }`, because `exactOptionalPropertyTypes`
         // treats an explicit undefined as a different value from an absent key.
         ...(Object.keys(boundSessions).length === 0 ? {} : { boundSessions }),
+        // Same rule, same reason, and it is what makes a fresh pool — where no slot
+        // has a container yet — report neither key.
+        ...(Object.keys(slotAgeSec).length === 0
+          ? {}
+          : { slotAgeSec, slotRemainingSec }),
       },
     };
   }

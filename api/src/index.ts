@@ -220,6 +220,74 @@ export function createExportProgressWriter(
   return { onExportProgress, forget };
 }
 
+/** What {@link createAuthOutcomeHandler} is handed. */
+export interface AuthOutcomeDeps {
+  readonly db: Db;
+  readonly sse: SseHub;
+  readonly log: BootLog;
+}
+
+/**
+ * createAuthOutcomeHandler builds the callback the runner's stream reports a login
+ * outcome to.
+ *
+ * ## Why it emits `auth-state: failed` (issue #49)
+ *
+ * The runner saying `login-failed` used to be recorded in the database and told to
+ * nobody. The database is the authority, but the browser is **SSE-only**: a user who
+ * mistypes their password sat on a spinner until something else moved, and the one
+ * thing that did move was the sweeper 15 minutes later declaring the *challenge*
+ * expired — which is a different and false story ("your MFA window closed" for a
+ * password that was simply wrong).
+ *
+ * `auth-state` is the existing event for this and needs no frontend work: `App.tsx`
+ * handles it generically by re-reading `GET /api/session/status`, which now says
+ * `auth_state: "failed"` and so renders the refusal. The payload is advisory for
+ * exactly that reason — the row is the truth and the event only says "look again".
+ *
+ * ## Why it is exported, and why it is here
+ *
+ * Same reasoning as `createExportProgressWriter` above, and the same precedent: this
+ * is entrypoint *wiring*, and the adapter that receives it is constructed inside
+ * `boot` and not returned, so an inline arrow function is unreachable from a test.
+ * A rule that cannot be asserted is a rule nobody re-checks; extracting it is what
+ * makes "the api tells the user their login was refused" a test rather than a hope.
+ */
+export function createAuthOutcomeHandler(
+  deps: AuthOutcomeDeps,
+): (sessionId: string, outcome: "authenticated" | "failed") => void {
+  const { db, sse, log } = deps;
+  return (sessionId, outcome) => {
+    const now = Date.now();
+    const changed =
+      outcome === "authenticated"
+        ? db.markAuthenticated(sessionId, now)
+        : db.markAuthFailed(sessionId, now);
+    if (changed) {
+      log.info("runner reported a login outcome", { session: sessionId, outcome });
+    } else {
+      // Not an error: a late event for a session already released or erased is
+      // expected, and the guard inside `markAuthenticated` is what makes it
+      // harmless. Logged at `warn` because it is *also* what a genuine bug looks
+      // like — an outcome arriving for a session the api does not think is logging
+      // in — and the two are indistinguishable from here.
+      log.warn("login outcome for a session no longer authenticating", {
+        session: sessionId,
+        outcome,
+      });
+    }
+
+    // Only the failure, and only because the two halves are the two halves of the
+    // bug: the row above records the refusal and the event below tells the browser
+    // to re-read it. A success needs no such nudge — the runner's `login-success`
+    // frame is forwarded verbatim, and the client's own `refreshStatus` on it does
+    // the same job.
+    if (outcome === "failed") {
+      sse.emit(sessionId, "auth-state", { state: "failed" });
+    }
+  };
+}
+
 /**
  * boot runs the startup sequence and returns the assembled dependencies.
  *
@@ -348,26 +416,7 @@ runner = new HttpRunnerAdapter({
     // The shape is `onNotebooksListed` exactly: this adapter is transport and
     // stores nothing, so the write belongs to the process that owns the database.
     onExportProgress: progressWriter.onExportProgress,
-    onAuthOutcome: (sessionId, outcome) => {
-      const now = Date.now();
-      const changed =
-        outcome === "authenticated"
-          ? db.markAuthenticated(sessionId, now)
-          : db.markAuthFailed(sessionId, now);
-      if (changed) {
-        log.info("runner reported a login outcome", { session: sessionId, outcome });
-      } else {
-        // Not an error: a late event for a session already released or erased is
-        // expected, and the guard inside `markAuthenticated` is what makes it
-        // harmless. Logged at `warn` because it is *also* what a genuine bug looks
-        // like — an outcome arriving for a session the api does not think is logging
-        // in — and the two are indistinguishable from here.
-        log.warn("login outcome for a session no longer authenticating", {
-          session: sessionId,
-          outcome,
-        });
-      }
-    },
+    onAuthOutcome: createAuthOutcomeHandler({ db, sse, log }),
     // **The step that made an export observable.**
     //
     // `login-success` and `notebooks-listed` each got a callback that wrote the

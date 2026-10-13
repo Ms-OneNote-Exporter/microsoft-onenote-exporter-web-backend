@@ -1085,7 +1085,25 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
 
     // A login that never finished — an MFA prompt the user walked away from, or
     // a Microsoft interstitial that never resolved. 15 minutes.
-    if (session.state === "authenticating" && session.last_activity_at + TTL.loginInProgress <= now) {
+    //
+    // **Guarded on `auth_state` as well as `state`, and that second term is the fix.**
+    //
+    // `markAuthFailed` writes `auth_state = 'failed'` and deliberately leaves `state`
+    // at `authenticating` — the login is still the session's current phase, so a retry
+    // from the sign-in screen is not a new session. But the login is no longer *in
+    // progress*: it finished, and Microsoft refused the password. So `state` alone
+    // matched both shapes, and 15 minutes after a typo this branch fired, overwrote
+    // `auth_state` with `expired`, and emitted `challenge-expired` — telling the user
+    // their MFA window closed when the truth was that their password was wrong.
+    //
+    // Both terms must say `authenticating` for a login to still be in flight. A
+    // refused one falls through to the auth-failed branch at the bottom, which
+    // releases the slot at once and leaves `auth_state = 'failed'` standing.
+    if (
+      session.state === "authenticating" &&
+      session.auth_state === "authenticating" &&
+      session.last_activity_at + TTL.loginInProgress <= now
+    ) {
       // The runner is released rather than killed outright, so a user returning
       // within the session's remaining life keeps their vault. What changes is
       // auth_state: their auth.json may be half-written, and the next login
@@ -1268,10 +1286,17 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
 
     // A login that failed is over, and the slot is worth more to somebody else.
     //
-    // The login-expiry branch above is guarded on `state`, which `markAuthFailed` does
-    // not change — so without this the slot sits bound for the rest of the 15-minute
-    // window, which on the deployed two-slot pool is a quarter-hour of lockout for
-    // everyone from one mistyped password.
+    // The login-expiry branch above no longer reaches a failed login — it now requires
+    // `auth_state = 'authenticating'` as well as `state = 'authenticating'` (issue #49) —
+    // so this branch is the only thing that frees the slot, and it runs on the very next
+    // tick instead of up to 15 minutes later. On the deployed two-slot pool that delay
+    // was a quarter-hour of lockout for everyone from one mistyped password.
+    //
+    // It is placed after the idle branch rather than before it, so an expired deadline
+    // on a session this branch is about to release is handled as idle and the failed
+    // login is left alone; `releaseForIdle` leaves `auth_state = 'failed'` untouched and
+    // its `state = 'authenticated'` is the one write here worth watching (asserted in
+    // `tests/sweep.test.ts`).
     if (session.auth_state === "failed" && session.runner_id !== null) {
       if (await binder.releaseForAuthFailure(session)) {
         report.authFailedReleased++;

@@ -801,20 +801,44 @@ export class Db {
    * while the rest stay cold, which is also what keeps the pool's memory
    * footprint uneven rather than uniformly wasted.
    *
+   * `exclude` names slots that must not be picked this time. It is what lets a
+   * caller that has been **refused** by the orchestrator try a different slot:
+   * `ORDER BY RANDOM()` is what keeps the pool's load spread, and it is also
+   * what makes a refused slot a coin flip on the next attempt rather than a
+   * certainty. The set is per-call and never persisted — it says "not *this*
+   * round", not "never", because the disagreement that produced it is repaired
+   * by the very re-sync that re-adds the row.
+   *
    * Returns true when a slot was claimed.
    */
-  claimRunner(sessionGuid: string): boolean {
+  claimRunner(sessionGuid: string, exclude?: readonly string[]): boolean {
+    // An empty list produces no clause at all, and that is deliberate rather than
+    // tidy. SQLite does accept `NOT IN ()` and reads it as the empty set, but
+    // PostgreSQL, MySQL and SQL Server all reject it — so a statement that is legal
+    // here is not portable, and `Db` hands raw SQL to whichever driver is
+    // underneath it. Omitting the clause also keeps the statement byte-identical to
+    // the one the first claim attempt always ran, so the common path has nothing new
+    // in it.
+    //
+    // The placeholders are built as `?` rather than by joining the ids, so a slot
+    // name is a bound parameter and never reaches the parser. They are positional
+    // and sit *after* `session_guid`, so the bindings follow that order too.
+    const skipped =
+      exclude !== undefined && exclude.length > 0
+        ? `\n            AND id NOT IN (${exclude.map(() => "?").join(",")})`
+        : "";
     return this.transaction(() => {
       const changes = this.run(
         `UPDATE runners
             SET status = 'claimed', session_guid = ?
           WHERE id = (
             SELECT id FROM runners
-            WHERE status = 'idle' AND session_guid IS NULL
+            WHERE status = 'idle' AND session_guid IS NULL${skipped}
             ORDER BY RANDOM()
             LIMIT 1
           )`,
         sessionGuid,
+        ...(exclude ?? []),
       );
       return changes > 0;
     });

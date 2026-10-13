@@ -48,3 +48,9 @@ PLAN*.md
 # build artifact, and it is per-machine, so it is noise that `git add -A` would
 # otherwise sweep into a commit.
 runner/tsconfig.tsbuildinfo
+
+# The api is SQLite. An empty msout-api.db reached main in #75 by `git add -A`;
+# WAL and SHM alongside it are working files, never source.
+*.db
+*.db-wal
+*.db-shm

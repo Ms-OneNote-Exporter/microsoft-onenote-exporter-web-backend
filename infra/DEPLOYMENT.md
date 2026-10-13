@@ -201,6 +201,18 @@ static assertion, or a read of the file. That is the argument for deploying to a
 host rather than shipping another green PR, and it is why `capability.yml` builds
 and starts the stack instead of only parsing it.
 
+## Viewing Logs
+
+Logs from all four services live in `systemd`'s journal. Search with:
+
+- All msout stack:  `journalctl -u docker-msout-*.service`
+- Filtered by service: `journalctl -u docker-msout-api.service -f`
+- By container name: `journalctl CONTAINER_NAME=api -f`
+
+`docker logs <container>` still works. Logs persist to `/var/log/journal/` because Debian 13 has `Storage=persistent` in `/etc/systemd/journal.conf`.
+
+**Note:** Caddy's `Caddyfile` still sets `output: discard` — `journald` receives nothing from the Caddy container, which matches the prior behavior.
+
 ## What is not done
 
 - **GHCR publish.** Images are built on the host with `ghcr.io/…` names but are

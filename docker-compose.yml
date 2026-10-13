@@ -221,6 +221,8 @@ services:
       - NET_BIND_SERVICE
     security_opt:
       - no-new-privileges:true
+    logging:
+      driver: journald
     healthcheck:
       # Caddy's own answer, not the api's: this probes the proxy, and a healthy
       # proxy pointing at a dead api is not a healthy proxy.
@@ -341,6 +343,8 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    logging:
+      driver: journald
     depends_on:
       orchestrator:
         condition: service_healthy
@@ -535,6 +539,8 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    logging:
+      driver: journald
     healthcheck:
       test: ["CMD", "/usr/local/bin/orchestrator", "-healthcheck"]
       interval: 30s
@@ -616,6 +622,8 @@ services:
     # enable unprivileged user namespaces is a host prerequisite, not a default.
     # The integration test in .github/workflows/ is the gate on that.
     shm_size: 1gb
+    logging:
+      driver: journald
     # `pids` under `deploy.resources.limits`, not the top-level `pids_limit`.
     # Compose rejects a file that sets both to different values, and it is a
     # confusing error rather than an obvious one — so the form the rest of the file

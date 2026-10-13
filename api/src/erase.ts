@@ -35,6 +35,7 @@ export type EraseStep =
   | "files-removed"
   | "directory-removed"
   | "container-removed"
+  | "artifact-deleted"
   | "row-deleted";
 
 /** What erase did, or where it stopped. */
@@ -82,6 +83,21 @@ export interface EraserOrchestrator {
    * container depending on which one it was.
    */
   remove(slotId: string): Promise<EraseRemoveResult>;
+  /**
+   * Removes a published artifact directory.
+   *
+   * PLAN-v3 §4.3/§4.4: the artifact tree is mounted into the orchestrator and behind
+   * Caddy, and **not** into this process. So the published archive
+   * `<artifactId>/vault.zip` is on a volume this one cannot reach, and the only way
+   * to delete it is to ask the holder.
+   *
+   * A `void` rather than the typed result `remove` carries, because this step is
+   * not the one that decides whether a local record is kept — `remove`'s
+   * `errorKind` decides whether the `runners` row survives, and nothing here has a
+   * row to keep. There is only "done" and "not done", and a throw says the second
+   * in the one vocabulary this machine already logs.
+   */
+  deleteArtifact(artifactId: string): Promise<void>;
   /** Reports pool occupancy, used to reclaim the slot. */
   stats(): Promise<{ ok: boolean; value: { size: number } }>;
 }
@@ -229,6 +245,52 @@ export async function runErase(deps: EraseDeps, sessionId: string): Promise<Eras
   // Close every SSE stream for the session. The row is about to go, and a live
   // stream would keep replaying events for a session that no longer exists.
   deps.sse.drop(sessionId);
+
+  // 6b. Remove the published artifact.
+  //
+  // ## Why this was missing, and why it is a step of its own
+  //
+  // `/finalize` renames a staged archive into `<artifactId>/vault.zip` on the
+  // artifact volume. Steps 4–6 above delete the **session** directory and the
+  // container; neither is that path. So the last published vault of every erased
+  // session stayed on the disk for the life of the volume — while
+  // `ERASE_UI_WORDING` said *"We deleted everything this service stored for this
+  // session."* The wording is the bug: the machine was not doing what it said.
+  //
+  // It cannot be done here. The artifact tree is mounted into the orchestrator and
+  // Caddy (PLAN-v3 §4.3), so this process has no path to open and no right to open
+  // one; §4.4 makes the orchestrator the holder of the volume. Hence the verb, and
+  // hence this step.
+  //
+  // ## Where it sits
+  //
+  // After container removal and **before** the row is deleted, because
+  // `sessions.artifact_id` is where the id comes from — read once at the top of the
+  // machine, so the id is the one the row actually had rather than one re-read after
+  // anything has moved it.
+  //
+  // ## Failure
+  //
+  // Recorded like every other step: logged, reported as `failedAt`, and then
+  // **the machine continues** — step 7 still deletes the row, because the row is
+  // what the retry record is and a stranded one is worse than a missing one. The
+  // deletion is idempotent server-side (a not-found artifact is success), so the
+  // repeat that §11's "sweep periodically" performs converges rather than
+  // compounding.
+  const artifactId = session?.artifact_id ?? null;
+  if (artifactId === null) {
+    // Nothing was ever published, so there is nothing to delete. Recorded rather
+    // than skipped, for the same reason `container-removed` is: a reader of the
+    // step list can tell "no artifact" from "removal never attempted".
+    note("artifact-deleted");
+  } else {
+    try {
+      await deps.orchestrator.deleteArtifact(artifactId);
+      note("artifact-deleted");
+    } catch (error) {
+      note("artifact-deleted", error);
+    }
+  }
 
   // 7. Delete the row. Last, so an interruption above leaves a recoverable
   // `erasing` row rather than no trace at all.

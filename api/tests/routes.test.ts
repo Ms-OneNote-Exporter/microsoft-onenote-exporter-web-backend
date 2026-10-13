@@ -755,6 +755,166 @@ describe("POST /api/session/credential refuses a replay", () => {
   );
 });
 
+// ---- the atomic claim on the same route -----------------------------------
+
+describe("POST /api/session/credential claims the login atomically", () => {
+  /**
+   * The same harness, but kept open across two requests.
+   *
+   * The race is not between two HTTP parsers — it is between the moment the handler
+   * reads the row and the moment it writes it, with an `await` across the
+   * orchestrator's ~57 s claim in the middle. So these tests drive one server and
+   * post twice without awaiting the first, which is the shape a double-click, two
+   * tabs and a retried request all take.
+   */
+  function harness() {
+    const orchestrator = new FakeOrchestrator({ size: 2 });
+    syncPool(db, orchestrator.slotIds());
+    const binder = new PoolBinder({ db, orchestrator, sse, now: () => Date.now() });
+
+    const submitCredential = vi.fn().mockResolvedValue(undefined);
+    const runner: RunnerAdapter = {
+      submitCredential,
+      listNotebooks: vi.fn().mockResolvedValue(undefined),
+      startExport: vi.fn().mockResolvedValue(undefined),
+      publishArtifact: vi.fn().mockResolvedValue(undefined),
+      abortExport: vi.fn().mockResolvedValue(undefined),
+    };
+
+    return {
+      claimForLogin: vi.spyOn(binder, "claimForLogin"),
+      submitCredential,
+      emit: vi.spyOn(sse, "emit"),
+      deps: { db, sse, limiter, orchestrator, runner, poolBinder: binder } as ServerDeps,
+    };
+  }
+
+  async function submit(deps: ServerDeps, app: FastifyInstance) {
+    return app.inject({
+      method: "POST",
+      url: "/api/session/credential",
+      headers: {
+        "content-type": "text/plain",
+        "x-microsoft-account": ACCOUNT,
+        cookie: cookieHeader(),
+        origin: ALLOWED,
+        "x-csrf-token": derive(csrfKey, GUID),
+      },
+      payload: "hunter2",
+    });
+  }
+
+  // The live bug, and the one the snapshot guard could never catch: the two
+  // requests both read `auth_state = 'none'`, both passed, and both ran
+  // `claimForLogin` — two containers for one session, with the second overwriting
+  // `sessions.runner_id` and leaking the first with nothing left pointing at it.
+  it("forwards the credential once when two submits arrive together", async () => {
+    seed(GUID, { runnerId: null, auth: "none" });
+    const h = harness();
+    const app = buildServer(config, h.deps);
+    await app.ready();
+    try {
+      const [first, second] = await Promise.all([submit(h.deps, app), submit(h.deps, app)]);
+
+      const accepted = [first, second].filter((r) => r.statusCode === 202);
+      const refused = [first, second].filter((r) => r.statusCode === 409);
+      expect(accepted).toHaveLength(1);
+      expect(refused).toHaveLength(1);
+      expect(refused[0]!.json()).toMatchObject({ reason: "login-in-progress", retryable: false });
+
+      // One password moved. The whole point of §4.7 — "no retry on the credential
+      // route" — is that a second submit cannot restart the login, and this is what
+      // a restart looked like: `auth.json` rotated away for 38 s with nothing in it.
+      expect(h.submitCredential).toHaveBeenCalledTimes(1);
+      // ...and only one container was claimed, which is the resource half.
+      expect(h.claimForLogin).toHaveBeenCalledTimes(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  // The compensation. `beginLogin` claims the login before the container is claimed,
+  // so a claim that then fails must undo it — otherwise the session answers
+  // "still signing in" to every route for the whole of `TTL.loginInProgress`
+  // (15 minutes) with no credential ever submitted. Deleting the `cancelLogin` call
+  // is the revert this test exists for.
+  it.each([
+    ["pool-exhausted", 503],
+    ["orchestrator-unreachable", 502],
+  ] as const)(
+    "gives the session back when the runner claim fails with %s",
+    async (reason, status) => {
+      seed(GUID, { runnerId: null, auth: "none" });
+      const h = harness();
+      vi.spyOn(h.deps.poolBinder!, "claimForLogin").mockResolvedValue({
+        ok: false,
+        reason,
+      } as never);
+      const app = buildServer(config, h.deps);
+      await app.ready();
+      try {
+        const response = await submit(h.deps, app);
+
+        expect(response.statusCode).toBe(status);
+        expect(h.submitCredential).not.toHaveBeenCalled();
+        // The compensation: back to unsigned, and able to try again at once. `none`
+        // rather than the `expired` it started as, which is what the SQL says and is
+        // why this is not `markAuthFailed` — nothing failed, nothing was released.
+        expect(db.getSession(GUID)?.auth_state).toBe("none");
+        expect(db.getSession(GUID)?.state).toBe("created");
+      } finally {
+        await app.close();
+      }
+    },
+  );
+
+  // ...and it is a compensation, not a second claim. It is guarded on
+  // `auth_state = 'authenticating'`, so it cannot roll back a login that succeeded
+  // while this request was still claiming its container.
+  it("does not roll back a login that completed in the meantime", async () => {
+    seed(GUID, { runnerId: null, auth: "none" });
+    const h = harness();
+    vi.spyOn(h.deps.poolBinder!, "claimForLogin").mockImplementation(async () => {
+      // The runner answers `login-success` while the claim is still resolving.
+      db.markAuthenticated(GUID, Date.now());
+      return { ok: false, reason: "orchestrator-unreachable" } as never;
+    });
+    const app = buildServer(config, h.deps);
+    await app.ready();
+    try {
+      const response = await submit(h.deps, app);
+
+      expect(response.statusCode).toBe(502);
+      expect(db.getSession(GUID)?.auth_state).toBe("valid");
+    } finally {
+      await app.close();
+    }
+  });
+
+  // The unwired state still has to reach its 409, not the compensation: nothing was
+  // claimed, so there is nothing to give back. A runner adapter *is* wired — the 501
+  // sits above `beginLogin` deliberately, so without one this never gets here.
+  it("gives the session back when no pool binder is wired", async () => {
+    seed(GUID, { runnerId: null, auth: "none" });
+    const h = harness();
+    const app = buildServer(config, {
+      ...h.deps,
+      poolBinder: undefined,
+    } as ServerDeps);
+    await app.ready();
+    try {
+      const response = await submit(h.deps, app);
+
+      expect(response.statusCode).toBe(409);
+      expect(response.json().error).toBe("no runner bound to this session");
+      expect(h.submitCredential).not.toHaveBeenCalled();
+      expect(db.getSession(GUID)?.auth_state).toBe("none");
+    } finally {
+      await app.close();
+    }
+  });
+});
+
 // ---- POST /api/session/notebooks -----------------------------------------
 
 describe("POST /api/session/notebooks", () => {
@@ -895,6 +1055,161 @@ describe("POST /api/export", () => {
         });
       }
       expect(limiter.activeExports).toBe(0);
+    } finally {
+      await app.close();
+    }
+  });
+
+  // ---- §8.1's per-session half, under concurrency --------------------------
+  //
+  // The guard used to be a read of `session.export_state` off the request's
+  // snapshot followed, two awaits later, by an **unconditional** UPDATE. Six
+  // requests in flight therefore all read "no export", all passed, and all queued
+  // one — and the row ended up holding the *last* writer's id, so the export the
+  // user was told about in `export-queued` was not the one that ran.
+  //
+  // Everything here runs against a real server and the real `Db`, because the race
+  // is between two statements in a database and a stubbed `db` would be asserting
+  // the stub. `Promise.all` over one `app.inject` is enough: Fastify starts each
+  // handler on the microtask queue, so they interleave where two concurrent
+  // requests would.
+  async function exportHarness() {
+    const orchestrator = new FakeOrchestrator({ size: 1 });
+    syncPool(db, orchestrator.slotIds());
+    const poolBinder = new PoolBinder({ db, orchestrator, sse, now: () => Date.now() });
+    const startExport = vi.fn().mockResolvedValue(undefined);
+    const runner: RunnerAdapter = {
+      submitCredential: vi.fn().mockResolvedValue(undefined),
+      listNotebooks: vi.fn().mockResolvedValue(undefined),
+      startExport,
+      publishArtifact: vi.fn().mockResolvedValue(undefined),
+      abortExport: vi.fn().mockResolvedValue(undefined),
+    };
+    const app = buildServer(config, {
+      db,
+      sse,
+      limiter,
+      orchestrator,
+      runner,
+      poolBinder,
+    } as ServerDeps);
+    await app.ready();
+    return { app, startExport };
+  }
+
+  const exportHeaders = () => ({
+    "content-type": "application/json",
+    cookie: cookieHeader(),
+    origin: ALLOWED,
+    "x-csrf-token": derive(csrfKey, GUID),
+  });
+
+  it("lets exactly one of six simultaneous exports through", async () => {
+    seed(GUID, { state: "authenticated", runnerId: "slot-1" });
+    const { app, startExport } = await exportHarness();
+    try {
+      const responses = await Promise.all(
+        [1, 2, 3, 4, 5, 6].map((n) =>
+          app.inject({
+            method: "POST",
+            url: "/api/export",
+            headers: exportHeaders(),
+            payload: JSON.stringify({ notebook: `Notebook ${n}` }),
+          }),
+        ),
+      );
+
+      const accepted = responses.filter((r) => r.statusCode === 202);
+      const refused = responses.filter((r) => r.statusCode === 409);
+      expect(accepted).toHaveLength(1);
+      expect(refused).toHaveLength(5);
+      for (const r of refused) {
+        expect(r.json().error).toBe("an export is already running");
+      }
+
+      // ...and only the winner reached the runner. Five runners told to walk the
+      // same vault is the resource half of the bug; a refusal that still started a
+      // walk is worse than no fix at all.
+      expect(startExport).toHaveBeenCalledTimes(1);
+
+      // The row holds the **winner's** id and notebook, not a loser's. Before the fix
+      // this was whichever request happened to write last, which is what makes the
+      // rest invisible: five exports queued, and the one the user was told about in
+      // `export-queued` was not the one that ran.
+      const winner = [1, 2, 3, 4, 5, 6][responses.indexOf(accepted[0]!)];
+      const stored = JSON.parse(db.getSession(GUID)?.export_state ?? "{}");
+      expect(stored.id).toBe(accepted[0]!.json().id);
+      expect(stored.notebook).toBe(`Notebook ${winner}`);
+    } finally {
+      await app.close();
+    }
+  });
+
+  // A refusal must be a **refusal**: nothing queued, nothing announced. Five
+  // `export-queued` frames for five exports that will never run is what a second
+  // tab sees, and it is why the old version was survivable only by accident.
+  it("emits export-queued only for the export it actually started", async () => {
+    seed(GUID, { state: "authenticated", runnerId: "slot-1" });
+    const emit = vi.spyOn(sse, "emit");
+    const { app } = await exportHarness();
+    try {
+      await Promise.all(
+        [1, 2, 3].map(() =>
+          app.inject({
+            method: "POST",
+            url: "/api/export",
+            headers: exportHeaders(),
+            payload: JSON.stringify({ notebook: "Work" }),
+          }),
+        ),
+      );
+      expect(emit.mock.calls.filter((call) => call[1] === "export-queued")).toHaveLength(1);
+    } finally {
+      await app.close();
+      emit.mockRestore();
+    }
+  });
+
+  // §8.1's global cap is six, so five refused claims that leaked their slot would
+  // cost five of the six. `release()` on the refusal path is what prevents it, and
+  // the leak is invisible until the 429s start.
+  it("does not leak a global slot for any export the §8.1 claim refused", async () => {
+    seed(GUID, { state: "authenticated", runnerId: "slot-1" });
+    const { app } = await exportHarness();
+    try {
+      await Promise.all(
+        [1, 2, 3, 4, 5, 6].map(() =>
+          app.inject({
+            method: "POST",
+            url: "/api/export",
+            headers: exportHeaders(),
+            payload: JSON.stringify({ notebook: "Work" }),
+          }),
+        ),
+      );
+      expect(limiter.activeExports).toBe(0);
+    } finally {
+      await app.close();
+    }
+  });
+
+  // The claim must not throw on a corrupt column: a throw is a 500, the column
+  // survives it, and the session would be refused every export for the life of the
+  // row — the opposite of the read-then-check's `catch`, which treated garbage as
+  // "no export".
+  it("still starts an export when export_state is corrupt", async () => {
+    seed(GUID, { state: "authenticated", runnerId: "slot-1" });
+    db.run(`UPDATE sessions SET export_state = ? WHERE guid = ?`, "{not json", GUID);
+    const { app, startExport } = await exportHarness();
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/export",
+        headers: exportHeaders(),
+        payload: JSON.stringify({ notebook: "Work" }),
+      });
+      expect(response.statusCode).toBe(202);
+      expect(startExport).toHaveBeenCalledTimes(1);
     } finally {
       await app.close();
     }

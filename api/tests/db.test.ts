@@ -138,6 +138,229 @@ describe("sessions", () => {
   });
 });
 
+/**
+ * `beginExport` — §8.1's per-session half, as one statement.
+ *
+ * The property under test is that **exactly one** of a set of simultaneous claims
+ * succeeds. A read-then-check cannot have it; an unconditional UPDATE cannot have
+ * it either. Every test here is written so that reverting the guard in the SQL
+ * turns it red: dropping the `AND (…)` clause makes "one winner" fail, and
+ * replacing the claim with an unconditional write makes every "refused" test fail.
+ */
+describe("beginExport", () => {
+  const EXPORT_ID = "E".repeat(43);
+  const queued = (id: string) => JSON.stringify({ state: "queued", id });
+
+  function stored(): string | null {
+    return db.getSession(GUID)?.export_state ?? null;
+  }
+
+  it("starts an export when there is none", () => {
+    seedSession(GUID, { state: "authenticated" });
+    expect(db.beginExport(GUID, "Work", queued(EXPORT_ID))).toBe(true);
+
+    const row = db.getSession(GUID);
+    expect(row?.state).toBe("exporting");
+    expect(row?.notebook).toBe("Work");
+    expect(JSON.parse(row?.export_state ?? "{}")).toMatchObject({
+      state: "queued",
+      id: EXPORT_ID,
+    });
+  });
+
+  // The whole point, and the bug: six requests, one row, one winner. Before this
+  // was an atomic conditional UPDATE, the route read `export_state` and then wrote
+  // it unconditionally — so all six read "no export" and all six queued one.
+  it("gives the export to exactly one of six simultaneous claims", () => {
+    seedSession(GUID, { state: "authenticated" });
+
+    const winners = [1, 2, 3, 4, 5, 6].filter((n) =>
+      db.beginExport(GUID, `Notebook ${n}`, queued(EXPORT_ID)),
+    );
+
+    expect(winners).toHaveLength(1);
+    // And the row carries that one, not the last — the loser's notebook never
+    // reached disk, which is what "the export that won is the export that runs".
+    expect(db.getSession(GUID)?.notebook).toBe(`Notebook ${winners[0]}`);
+  });
+
+  it.each(["queued", "running"] as const)(
+    "refuses while an export is %s",
+    (state) => {
+      seedSession(GUID, { state: "exporting" });
+      db.run(
+        `UPDATE sessions SET export_state = ? WHERE guid = ?`,
+        JSON.stringify({ state, id: EXPORT_ID }),
+        GUID,
+      );
+
+      expect(db.beginExport(GUID, "Work", queued("F".repeat(43)))).toBe(false);
+      // Untouched: a refused claim must not have written the loser's id over the
+      // winner's, or the in-flight export would become untrackable.
+      expect(stored()).toBe(JSON.stringify({ state, id: EXPORT_ID }));
+    },
+  );
+
+  it.each(["done", "partial", "failed", "none"])(
+    "allows a new export once the last one is %s",
+    (state) => {
+      seedSession(GUID, { state: "authenticated" });
+      db.run(
+        `UPDATE sessions SET export_state = ? WHERE guid = ?`,
+        JSON.stringify({ state, id: EXPORT_ID }),
+        GUID,
+      );
+
+      expect(db.beginExport(GUID, "Work", queued("F".repeat(43)))).toBe(true);
+      expect(JSON.parse(stored() ?? "{}").id).toBe("F".repeat(43));
+    },
+  );
+
+  // `NULL NOT IN ('queued','running')` is **NULL**, not true, so without an explicit
+  // `IS NULL` term a session that had never exported — `export_state = NULL` — and
+  // one whose column is `{}` would both be treated as "an export is already
+  // running" and refused forever.
+  it("allows an export when the column is NULL", () => {
+    seedSession(GUID, { state: "authenticated" });
+    expect(stored()).toBeNull();
+    expect(db.beginExport(GUID, "Work", queued(EXPORT_ID))).toBe(true);
+  });
+
+  it("allows an export when the column is valid JSON with no state", () => {
+    // The other half of the NULL-state trap: `{}` parses, `json_extract` returns
+    // NULL for the missing path, and SQL's three-valued logic would reject it.
+    seedSession(GUID, { state: "authenticated" });
+    db.run(`UPDATE sessions SET export_state = ? WHERE guid = ?`, "{}", GUID);
+    expect(db.beginExport(GUID, "Work", queued(EXPORT_ID))).toBe(true);
+  });
+
+  // `json_extract` **throws** on malformed JSON. A throw out of this method is a
+  // 500 from the route, and a corrupt column would have turned "this session may
+  // export" into "this session can never export again" — the opposite of the
+  // read-then-check's `catch`, which treated garbage as no export.
+  it("allows an export when the column is not valid JSON, rather than throwing", () => {
+    seedSession(GUID, { state: "authenticated" });
+    db.run(`UPDATE sessions SET export_state = ? WHERE guid = ?`, "{not json", GUID);
+
+    // A throw out of this method is a 500 from the route, and the corrupt column
+    // would survive it — so the session would be refused forever, which is the
+    // opposite of the read-then-check's `catch`.
+    expect(db.beginExport(GUID, "Work", queued(EXPORT_ID))).toBe(true);
+    expect(stored()).toBe(queued(EXPORT_ID));
+  });
+
+  it("reports false for a session that does not exist", () => {
+    expect(db.beginExport("00000000-0000-0000-0000-000000000000", "Work", queued(EXPORT_ID))).toBe(
+      false,
+    );
+  });
+
+  // `completeExport` reads `artifact_id`, and `markExportStranded`'s comment names
+  // this exact row as one whose download was destroyed by an over-eager write. The
+  // claim must not touch it either.
+  it("leaves a finished artifact alone when it refuses a second export", () => {
+    seedSession(GUID, { state: "exporting" });
+    db.run(
+      `UPDATE sessions SET export_state = ?, artifact_id = ?, artifact_partial = 1
+        WHERE guid = ?`,
+      JSON.stringify({ state: "running", id: EXPORT_ID }),
+      EXPORT_ID,
+      GUID,
+    );
+
+    expect(db.beginExport(GUID, "Other", queued("F".repeat(43)))).toBe(false);
+    const row = db.getSession(GUID);
+    expect(row?.artifact_id).toBe(EXPORT_ID);
+    expect(row?.artifact_partial).toBe(1);
+  });
+});
+
+/**
+ * `beginLogin` and `cancelLogin` — the credential route's claim and its undo.
+ *
+ * Same shape as `beginExport`: the assertion is that exactly one of a set of
+ * simultaneous claims wins, which a snapshot read followed by an unconditional
+ * write cannot satisfy.
+ */
+describe("beginLogin / cancelLogin", () => {
+  function authState(): string | undefined {
+    return db.getSession(GUID)?.auth_state;
+  }
+
+  // The three states a real user reaches by signing in again. A guard that is
+  // stricter than this locks out every returning user; one that is looser accepts a
+  // credential on a session that never asked to be signed in.
+  it.each(["none", "expired", "failed"] as const)("claims a session that is %s", (auth) => {
+    seedSession(GUID, { auth_state: auth, state: "authenticated" });
+    expect(db.beginLogin(GUID, NOW)).toBe(true);
+
+    const row = db.getSession(GUID);
+    expect(row?.auth_state).toBe("authenticating");
+    expect(row?.state).toBe("authenticating");
+    expect(row?.last_activity_at).toBe(NOW);
+  });
+
+  it.each(["valid", "authenticating"] as const)("refuses a session that is %s", (auth) => {
+    seedSession(GUID, { auth_state: auth });
+    expect(db.beginLogin(GUID, NOW)).toBe(false);
+    expect(authState()).toBe(auth);
+  });
+
+  // The live bug: two submits served from one snapshot both passed the read
+  // guard, both claimed a container, and the second overwrote `runner_id` —
+  // leaking the first with nothing left pointing at it.
+  it("gives the login to exactly one of six simultaneous submits", () => {
+    seedSession(GUID, { auth_state: "none" });
+
+    const winners = [1, 2, 3, 4, 5, 6].filter(() => db.beginLogin(GUID, NOW));
+    expect(winners).toHaveLength(1);
+  });
+
+  it("does not move a session whose login is already valid", () => {
+    // The compensation's whole safety property: it is guarded on
+    // `authenticating`, so a login that completed in the meantime survives it.
+    seedSession(GUID, { auth_state: "valid", state: "authenticated" });
+    expect(db.cancelLogin(GUID)).toBe(false);
+    expect(db.getSession(GUID)?.state).toBe("authenticated");
+  });
+
+  it("undoes a claim that was never handed a credential", () => {
+    // Without this the session reports "still signing in" to every route for the
+    // whole of `TTL.loginInProgress` (15 minutes) with nothing in flight.
+    seedSession(GUID, { auth_state: "none", state: "created" });
+    expect(db.beginLogin(GUID, NOW)).toBe(true);
+    expect(db.cancelLogin(GUID)).toBe(true);
+
+    const row = db.getSession(GUID);
+    expect(row?.auth_state).toBe("none");
+    expect(row?.state).toBe("created");
+    // And the session can log in again straight away, which is the point.
+    expect(db.beginLogin(GUID, NOW)).toBe(true);
+  });
+
+  it("leaves a session that never claimed anything alone", () => {
+    seedSession(GUID, { auth_state: "expired", state: "authenticated" });
+    expect(db.cancelLogin(GUID)).toBe(false);
+    const row = db.getSession(GUID);
+    expect(row?.auth_state).toBe("expired");
+    expect(row?.state).toBe("authenticated");
+  });
+
+  // `cancelLogin` is not `markAuthFailed`, and the difference is load-bearing:
+  // `markAuthFailed` records a *reported* login failure, drives
+  // `releaseForAuthFailure` and sets `failed`. Nothing failed here — no credential
+  // was ever submitted — so the session must come back as simply unsigned.
+  it("does not record a failure, so no slot is released and nothing is alerted on", () => {
+    seedSession(GUID, { auth_state: "none", state: "created" });
+    db.beginLogin(GUID, NOW);
+    db.cancelLogin(GUID);
+
+    const row = db.getSession(GUID);
+    expect(row?.auth_state).not.toBe("failed");
+    expect(row?.runner_id).toBeNull();
+  });
+});
+
 describe("claimRunner", () => {
   beforeEach(() => {
     db.registerRunner("slot-1", "c1", "idle");

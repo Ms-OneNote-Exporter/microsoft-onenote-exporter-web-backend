@@ -305,6 +305,89 @@ export class Db {
   }
 
   /**
+   * beginLogin atomically takes the right to submit a credential for a session.
+   *
+   * ## Why this exists, given there was already a guard on this route
+   *
+   * `POST /api/session/credential` read `session.auth_state` from a snapshot taken
+   * before the request did any work, checked it for `valid` / `authenticating`, and
+   * only then claimed a container. **A read is not a lock.** Two submits arriving
+   * together were served from the same snapshot, so both read `none`, both passed,
+   * and both ran `claimForLogin` — two containers for one session, the second
+   * overwriting `sessions.runner_id` so the first was leaked with nothing left
+   * pointing at it.
+   *
+   * The window is not theoretical: the guard is above an `await` that reaches the
+   * orchestrator's claim, which is ~57 s of real work (see
+   * `CONTAINER_VERB_TIMEOUT_MS`). A user who double-submits, or two tabs, or a
+   * retried request, all land inside it.
+   *
+   * So the check and the write are one statement. SQLite serialises the write, so
+   * exactly one caller sees a changed row; the loser is told `false` and answers 409
+   * `login-in-progress` without claiming anything.
+   *
+   * ## Why the accepted states are `none`, `expired` and `failed`
+   *
+   * Those are the three states a real user reaches when they sign in again, and all
+   * three must be able to. `valid` is refused (it is already signed in) and
+   * `authenticating` is refused (a submit is already on its way) — both of which the
+   * *caller* distinguishes for its message; the claim itself only has to refuse
+   * them.
+   *
+   * Returns whether a row changed: `true` means this caller owns the login, `false`
+   * means somebody else already does.
+   */
+  beginLogin(guid: string, now: number): boolean {
+    return (
+      this.run(
+        `UPDATE sessions
+            SET auth_state = 'authenticating', state = 'authenticating',
+                last_activity_at = ?
+          WHERE guid = ? AND auth_state IN ('none', 'expired', 'failed')`,
+        now,
+        guid,
+      ) > 0
+    );
+  }
+
+  /**
+   * cancelLogin undoes a `beginLogin` that could not finish.
+   *
+   * ## Why the compensation is needed at all
+   *
+   * `beginLogin` claims the login *before* the container is claimed, because a
+   * container claim is ~57 s and holding an unclaimed session across that is the
+   * race this fixes. But it also writes `auth_state = 'authenticating'`, which is a
+   * **lie** until the credential is actually handed over — and a claim that then
+   * fails (no idle slot, control plane unreachable, a pool that disagrees with the
+   * orchestrator) leaves a session answering *"still signing in"* to every route
+   * for the whole of `TTL.loginInProgress`, 15 minutes, with nothing in flight.
+   *
+   * That is the same trap `markExportStranded` and the export route's start-failure
+   * path document, one column over: a writer that sets a state nobody will ever
+   * clear, on a row the sweeper skips.
+   *
+   * So every exit from the claim that is not a forwarded credential calls this. It
+   * is guarded on `auth_state = 'authenticating'`, so it can only ever undo *this*
+   * call: a login that succeeded in the meantime has already moved to `valid`, and
+   * this is a no-op against it rather than a rollback of a real session.
+   *
+   * Not `markAuthFailed`. That records a runner-reported *login failure*, sets
+   * `failed`, releases the slot and drives `releaseForAuthFailure`. Nothing failed
+   * here — no credential was ever submitted — so none of that applies.
+   */
+  cancelLogin(guid: string): boolean {
+    return (
+      this.run(
+        `UPDATE sessions
+            SET auth_state = 'none', state = 'created'
+          WHERE guid = ? AND auth_state = 'authenticating'`,
+        guid,
+      ) > 0
+    );
+  }
+
+  /**
    * markAuthenticated records that the runner saved a usable auth.json.
    *
    * Called when the runner publishes `login-success`, which it does only after it
@@ -374,6 +457,70 @@ export class Db {
    */
   setNotebooks(guid: string, names: readonly string[]): void {
     this.run(`UPDATE sessions SET notebooks = ? WHERE guid = ?`, JSON.stringify(names), guid);
+  }
+
+  /**
+   * beginExport atomically starts an export, or refuses because one is running.
+   *
+   * ## Why this exists, given there was already a guard on this route
+   *
+   * §8.1 is "one active export per session", and the route enforced it by reading
+   * `session.export_state` out of a snapshot, parsing it, and answering 409 when it
+   * said `queued` or `running` — and then, ~40 lines and two awaits later,
+   * performing an **unconditional** `UPDATE ... WHERE guid = ?`.
+   *
+   * That is a read-then-check, and six simultaneous exports all read the same row,
+   * all saw no active export, and all wrote one. §8.1 held only as long as nothing
+   * overlapped, which is not a property a concurrency limit can have: the limit is
+   * six *globally* (§8.1's second half) and nothing bounded the per-session half.
+   *
+   * The check and the write are now one statement, so SQLite decides which caller
+   * wins. The losers get `false` and answer 409 without having queued anything.
+   *
+   * ## Why `json_valid` and the `IS NULL` term
+   *
+   * `export_state` is a TEXT column holding JSON, and `json_extract` **throws** on
+   * malformed JSON. A throw out of a route handler is a 500, and a corrupt column
+   * would have turned "this session may export" into "this session can never
+   * export again" — the exact opposite of the old behaviour, which caught the parse
+   * error and treated a corrupt column as no export.
+   *
+   * So `NOT json_valid(export_state)` comes first and lets the row through, which
+   * is that same reading, now expressed in SQL. SQLite evaluates `OR` terms
+   * left to right and stops at the first true one, so the `json_extract` calls are
+   * never reached for a malformed column.
+   *
+   * `json_extract(es, '$.state') IS NULL` is the other half of the same care:
+   * `NULL NOT IN ('queued','running')` is **NULL**, not true, so `{}` — valid JSON
+   * with no `state` — would fall through the whole `OR` chain and be treated as
+   * "an export is already running". A session that had never exported has exactly
+   * that column.
+   *
+   * ## `state = 'exporting'` is in the SET list, not a separate statement
+   *
+   * Same reason `completeExport` does its work in one statement: a reader between
+   * two writes would see an `exporting` row whose `export_state` still reads the
+   * previous export's terminal state, or vice versa, and the snapshot is built from
+   * both columns.
+   *
+   * Returns whether a row changed — `true` means this caller started the export,
+   * `false` means one was already in flight (or the session is gone).
+   */
+  beginExport(guid: string, notebook: string, exportState: string): boolean {
+    return (
+      this.run(
+        `UPDATE sessions
+            SET state = 'exporting', notebook = ?, export_state = ?
+          WHERE guid = ?
+            AND (export_state IS NULL
+                 OR NOT json_valid(export_state)
+                 OR json_extract(export_state, '$.state') IS NULL
+                 OR json_extract(export_state, '$.state') NOT IN ('queued', 'running'))`,
+        notebook,
+        exportState,
+        guid,
+      ) > 0
+    );
   }
 
   /**

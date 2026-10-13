@@ -71,6 +71,7 @@ interface Seen {
   headers?: Record<string, unknown>;
   body?: string;
   url?: string;
+  method?: string;
 }
 
 /**
@@ -84,6 +85,7 @@ function stubFetch(status: number, body: string, seen?: Seen): typeof fetch {
   return (async (url: string, init?: RequestInit) => {
     if (seen) {
       seen.url = String(url);
+      seen.method = init?.method;
       seen.headers = init?.headers as Record<string, unknown>;
       seen.body =
         typeof init?.body === "string"
@@ -191,6 +193,49 @@ describe("OrchestratorClient", () => {
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.kind).toBe("conflict");
+  });
+
+  // The ninth verb. `finalize` publishes an artifact into
+  // `<artifactId>/vault.zip` on a volume this process cannot see (PLAN-v3
+  // §4.3/§4.4), so without a way to say "and now take it away" an erased session's
+  // vault stayed on the disk while the api told the user everything was deleted.
+  //
+  // The signed path is the assertion, not the method: a verb that reached the
+  // orchestrator unsigned would be an open endpoint, and it is the one deletion
+  // verb on this surface.
+  it("sends a signed POST /delete-artifact carrying only the artifact id", async () => {
+    const seen: Seen = {};
+    const c = client(stubFetch(200, JSON.stringify({ deleted: true }), seen));
+
+    const result = await c.deleteArtifact(ARTIFACT_ID);
+
+    expect(result.ok).toBe(true);
+    expect(seen.method).toBe("POST");
+    expect(seen.url).toBe("http://orchestrator:9100/delete-artifact");
+    // One field, and it is an identifier: this is the verb that removes a
+    // directory, so anything else on the schema would be a way to name a path.
+    expect(JSON.parse(seen.body ?? "{}")).toEqual({ artifactId: ARTIFACT_ID });
+    expect(seen.headers?.["x-msout-sig"]).toBe(
+      computeSignature(SECRET, TS, "POST", "/delete-artifact", Buffer.from(seen.body ?? "", "utf8")),
+    );
+  });
+
+  // Idempotent by contract, and the client has to be able to say so: erase is
+  // best-effort and retried, and "already gone" is the outcome it wanted.
+  it("reports success for an artifact that was already gone", async () => {
+    const c = client(stubFetch(200, JSON.stringify({ deleted: true })));
+    await expect(c.deleteArtifact(ARTIFACT_ID)).resolves.toMatchObject({ ok: true });
+  });
+
+  // A refusal is typed, not thrown, and not flattened to `ok: false`: the erase
+  // machine's step is the only record that a published vault survived, so it has to
+  // be able to say *how* it failed.
+  it("maps a server error to a typed unexpected, not a throw", async () => {
+    const c = client(stubFetch(500, JSON.stringify({ error: "internal error" })));
+    const result = await c.deleteArtifact(ARTIFACT_ID);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.kind).toBe("unexpected");
   });
 
   it("maps pool exhaustion to a typed error, not a throw", async () => {

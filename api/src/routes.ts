@@ -106,6 +106,13 @@ export interface RouteDeps {
  * Checking membership rather than trusting the column means a corrupt or
  * hand-edited value cannot put the client in a state it has no rendering for —
  * the same reason the snapshot's parser tolerates garbage.
+ *
+ * **It is a fast path, not the concurrency guard.** `db.beginExport` is what
+ * enforces §8.1; this set exists so a session with an export already in flight is
+ * refused *before* the container rebind, and so the two 409s stay
+ * distinguishable. Both agree on what "no export" means — `beginExport` carries
+ * the same `json_valid` / `state IS NULL` reading — so a column that this accepts
+ * is a column that one does too.
  */
 const EXPORT_STATES = new Set(["none", "queued", "running", "done", "partial", "failed"]);
 
@@ -623,6 +630,36 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
       });
     }
 
+    // **The guard above is a courtesy, not the guard.**
+    //
+    // It reads `session.auth_state` off a snapshot taken before this request did
+    // any work, and this handler then spends up to ~57 s inside an `await` before
+    // the credential moves. Two submits that arrive together are both served from
+    // the *same* snapshot, so both see `none`, both pass, and both run
+    // `claimForLogin` — two containers for one session, with the second
+    // overwriting `sessions.runner_id` and leaking the first with nothing left
+    // pointing at it.
+    //
+    // `beginLogin` is the real guard: one conditional UPDATE, so SQLite decides
+    // which caller wins. `false` means another submit got there first and this one
+    // has claimed nothing — not even the container it was about to ask for.
+    //
+    // It runs *after* the snapshot check rather than instead of it, because the
+    // two refusals are different facts and the frontend reads the difference:
+    // `already-authenticated` says "you are signed in", `login-in-progress` says
+    // "wait, one is already running". `beginLogin` refuses both, and would answer
+    // the first as the second.
+    //
+    // Also below the 501 above, which the long comment there pins.
+    if (!deps.db.beginLogin(session.guid, now())) {
+      capStream(request.body as Readable, MAX_CREDENTIAL_BYTES).destroy();
+      return reply.code(409).send({
+        error: "a sign-in is already in progress for this session",
+        retryable: false,
+        reason: "login-in-progress",
+      });
+    }
+
     // The credential reaches the runner through the orchestrator's claim, so a
     // session needs a container before it can accept one. Binding is lazy —
     // here, at login — rather than at session creation, so a session that is
@@ -635,63 +672,87 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
       if (deps.poolBinder === undefined) {
         // No pool manager wired, which is the unwired state. Honest, and the
         // same 409 as before.
+        //
+        // The `cancelLogin` is not optional here: `beginLogin` has already written
+        // `authenticating`, and returning without undoing it would leave a session
+        // that reports "still signing in" to every route for `TTL.loginInProgress`
+        // when no credential was ever submitted. Every exit from below that is not a
+        // forwarded credential pays it, which is why it is a `finally` over the claim
+        // rather than a line in each `return`.
+        deps.db.cancelLogin(session.guid);
         return reply.code(409).send({ error: "no runner bound to this session" });
       }
 
-      const bound = await deps.poolBinder.claimForLogin(session);
-      if (!bound.ok) {
-        // §2.6: name the cause rather than showing a countdown to a slot that
-        // will not move. "Every session is busy" and "the control plane cannot
-        // start runners" are different advice, and the user cannot tell them apart.
-        //
-        // Four outcomes now, and `retryable` is the honest answer for each:
-        //
-        //   busy             -> wait; a slot frees up
-        //   pool cannot fill -> wait does NOT help; something is misconfigured
-        //   control plane unreachable -> transient, retry
-        //   slot conflict    -> this process and the orchestrator disagree about the
-        //                       pool, which is an operator problem, not a user's
-        request.log.info(
-          { reason: bound.reason, fillError: bound.fillError ?? null },
-          "runner claim failed",
-        );
-        const cannotFill = bound.reason === "pool-exhausted" && bound.fillError !== undefined;
-        // A conflict means every slot this process offered was refused, after the
-        // retries. It is **not** unreachability: the orchestrator answered, clearly, and
-        // the answer was "no". Reporting it as an unreachable control plane told the
-        // user to retry a login that could not succeed, and told whoever read the log
-        // that a component was down while it was answering a 409 in milliseconds.
-        //
-        // Reported as 409 rather than 5xx because nothing about a retry fixes it. The
-        // pool has to be reconciled, and that is the api's problem to resolve — see
-        // `claimForLogin`'s retry, which handles the drift case, and the boot fix in
-        // the orchestrator that removes the cause.
-        if (bound.reason === "slot-conflict") {
-          return reply.code(409).send({
-            error: "the service's view of its runner pool is out of date",
-            retryable: false,
-            cause: "pool-diverged",
-          });
+      // **`cancelLogin` is compensation, not a second guard.** `beginLogin` claimed
+      // the login above so the claim could not be raced; this undoes that claim when
+      // no credential followed it. It is guarded on
+      // `auth_state = 'authenticating'`, so a login that *did* complete in the
+      // meantime is left alone.
+      let handedOver = false;
+      try {
+        const bound = await deps.poolBinder.claimForLogin(session);
+        if (bound.ok) {
+          handedOver = true;
+        } else {
+          // §2.6: name the cause rather than showing a countdown to a slot that
+          // will not move. "Every session is busy" and "the control plane cannot
+          // start runners" are different advice, and the user cannot tell them apart.
+          //
+          // Four outcomes now, and `retryable` is the honest answer for each:
+          //
+          //   busy             -> wait; a slot frees up
+          //   pool cannot fill -> wait does NOT help; something is misconfigured
+          //   control plane unreachable -> transient, retry
+          //   slot conflict    -> this process and the orchestrator disagree about the
+          //                       pool, which is an operator problem, not a user's
+          request.log.info(
+            { reason: bound.reason, fillError: bound.fillError ?? null },
+            "runner claim failed",
+          );
+          const cannotFill = bound.reason === "pool-exhausted" && bound.fillError !== undefined;
+          // A conflict means every slot this process offered was refused, after the
+          // retries. It is **not** unreachability: the orchestrator answered, clearly, and
+          // the answer was "no". Reporting it as an unreachable control plane told the
+          // user to retry a login that could not succeed, and told whoever read the log
+          // that a component was down while it was answering a 409 in milliseconds.
+          //
+          // Reported as 409 rather than 5xx because nothing about a retry fixes it. The
+          // pool has to be reconciled, and that is the api's problem to resolve — see
+          // `claimForLogin`'s retry, which handles the drift case, and the boot fix in
+          // the orchestrator that removes the cause.
+          if (bound.reason === "slot-conflict") {
+            return reply.code(409).send({
+              error: "the service's view of its runner pool is out of date",
+              retryable: false,
+              cause: "pool-diverged",
+            });
+          }
+          const slotExpiring = bound.reason === "slot-expiring";
+          return reply
+            .code(bound.reason === "pool-exhausted" || slotExpiring ? 503 : 502)
+            .send({
+              error: cannotFill
+                ? "the service cannot start a browser right now"
+                : bound.reason === "pool-exhausted" || slotExpiring
+                  ? "every session is busy"
+                  : "runner control plane unreachable",
+              // Still retryable: a misconfiguration gets fixed and the pool refills.
+              // But a client that has been told "busy" and is still failing after a
+              // few attempts now has something to escalate with.
+              retryable: true,
+              ...(cannotFill
+                ? { cause: "pool-unfillable" }
+                : slotExpiring
+                  ? { cause: "slot-expiring" }
+                  : {}),
+            });
         }
-        const slotExpiring = bound.reason === "slot-expiring";
-        return reply
-          .code(bound.reason === "pool-exhausted" || slotExpiring ? 503 : 502)
-          .send({
-            error: cannotFill
-              ? "the service cannot start a browser right now"
-              : bound.reason === "pool-exhausted" || slotExpiring
-                ? "every session is busy"
-                : "runner control plane unreachable",
-            // Still retryable: a misconfiguration gets fixed and the pool refills.
-            // But a client that has been told "busy" and is still failing after a
-            // few attempts now has something to escalate with.
-            retryable: true,
-            ...(cannotFill
-              ? { cause: "pool-unfillable" }
-              : slotExpiring
-                ? { cause: "slot-expiring" }
-                : {}),
-          });
+      } finally {
+        // Every refusal above returns from inside this `try`, so the `finally` is
+        // the only thing that covers all of them — and it must not be a line copied
+        // into each one, because the next refusal added would forget it. That is the
+        // whole reason this is a `try/finally` around the claim.
+        if (!handedOver) deps.db.cancelLogin(session.guid);
       }
     }
 
@@ -767,6 +828,21 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
                   ? "unreachable"
                   : "unexpected";
             return { ok: false, errorKind: kind };
+          },
+          // The published archive, on the volume this process cannot see
+          // (PLAN-v3 §4.3/§4.4), so it is the orchestrator's to remove. Typed as
+          // `void` because the machine has no local record to key on the answer —
+          // unlike `remove`, whose `errorKind` decides the `runners` row's fate. Any
+          // failure is thrown, because "not deleted" is the one thing the step must
+          // not be able to say quietly.
+          deleteArtifact: async (artifactId: string) => {
+            const result = await deps.orchestrator.deleteArtifact(artifactId);
+            if (result.ok) return;
+            throw new Error(
+              result.error.kind === "unreachable"
+                ? `delete-artifact unreachable: ${result.error.cause}`
+                : `delete-artifact refused: ${result.error.kind}`,
+            );
           },
           // The erase machine only needs to know whether the orchestrator is
           // reachable, so a typed failure is flattened rather than propagated —
@@ -948,6 +1024,25 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
     // §8.1: one active export per session. Driven from the stored state rather
     // than from anything the client sent, so a second tab cannot start a second
     // export by lying about the first.
+    //
+    // **This is a fast path, not the guard.** `db.beginExport` below is what
+    // enforces §8.1, and this read cannot: it is a snapshot taken before the
+    // request does any work, so six simultaneous exports all pass it. What it is
+    // for is *ordering* — a session with an export in flight must be refused
+    // before the rebind below, which claims a container. Claiming one for a session
+    // that is already exporting would tie up a pool slot for a request that can
+    // only ever be a 409, and on a two-slot pool that is the difference between one
+    // wasted slot and one user locked out.
+    //
+    // It was also this block's position that made the two 409s distinguishable: a
+    // stranded export answers "an export is already running" and a session that
+    // merely has no runner answers "no runner bound to this session", and both are
+    // 409. The claim below cannot tell them apart — it refuses on the same
+    // condition in both cases — so the fast path has to stay where it is.
+    //
+    // A corrupt column must not block an export; it is treated as no export. That
+    // reading is preserved in `beginExport`'s `json_valid` guard, so the two
+    // halves agree on what "no export" means.
     const stored = session.export_state;
     if (stored !== null) {
       try {
@@ -995,8 +1090,24 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
       }
 
       const exportId = generateArtifactId();
-      deps.db.run(
-        `UPDATE sessions SET state = 'exporting', notebook = ?, export_state = ? WHERE guid = ?`,
+      // **The §8.1 claim, and the only writer of `queued`/`running` in this process
+      // at request time.** One conditional UPDATE: it starts the export only if the
+      // stored one is not already in flight, so SQLite — not this handler — decides
+      // which of six simultaneous requests wins. The five that lose get the same 409
+      // and have queued nothing, claimed nothing and emitted nothing.
+      //
+      // It sits here rather than above the rebind for two reasons, both of which
+      // the fast path above cannot see:
+      //
+      //   - a refused claim must not have consumed a global slot, and
+      //   - a claim held across the rebind's `await` — which is ~57 s of
+      //     orchestrator work — would write `state = 'exporting'` and
+      //     `export_state = 'queued'` for an export that may never start, leaving a
+      //     session the sweeper skips (`state = 'exporting'`) and a route that
+      //     refuses it forever. That is the same trap the start-failure path below
+      //     exists to undo, one step earlier.
+      const claimed = deps.db.beginExport(
+        session.guid,
         notebook,
         JSON.stringify({
           state: "queued",
@@ -1007,8 +1118,11 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
           startedAt: now(),
           finishedAt: null,
         }),
-        session.guid,
       );
+      if (!claimed) {
+        release();
+        return reply.code(409).send({ error: "an export is already running" });
+      }
       deps.sse.emit(session.guid, "export-queued", { id: exportId, notebook });
 
       if (deps.runner === undefined) {

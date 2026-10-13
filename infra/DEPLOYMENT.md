@@ -15,6 +15,10 @@ SHA=$(git rev-parse HEAD)                              # here, where git exists
 ssh root@<host>
   cd /opt/msout && tar xzf /root/msout.tar.gz --exclude=.env --exclude=secrets && rm /root/msout.tar.gz
   sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=$SHA|" .env        # REQUIRED — see below
+  sed -i "s|^RUNNER_IMAGE=.*|RUNNER_IMAGE=ghcr.io/ms-one-note-exporter/msout-runner:$SHA|" .env
+  sh infra/check-env.sh           # FIRST: .env values are literal. One holding $(...) is a
+                                  # silent total outage — the pool cannot create a runner and
+                                  # every login answers 409 pool-diverged. Observed 2026-10-13.
   docker compose config --quiet            # refuses rather than defaulting
   set -a && . ./.env && set +a            # compose interpolates at read time
   docker compose --profile runner build api orchestrator runner

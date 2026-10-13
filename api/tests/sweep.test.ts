@@ -1171,11 +1171,20 @@ describe("sweep", () => {
   });
 
   it("releases a login in progress past 15 minutes and marks auth expired", async () => {
+    // **The key was `auth`, not `auth_state`, and the test was passing anyway.**
+    //
+    // `seedSession` reads `overrides.auth_state`; `auth` is not a key of
+    // `SessionRow` at all, so the fixture silently seeded `auth_state = 'none'` —
+    // no login in progress — and this branch fired on `state` alone. The moment the
+    // branch was also guarded on `auth_state` (issue #49) the fixture stopped
+    // describing the case and the test went red, which is the only reason anyone
+    // finds out that a fixture was a fiction. It now says what it meant.
+    //
     // The auth.json may be half-written, so the next login must not trust it.
     seedRunners(1);
     seedSession(GUID, {
       state: "authenticating",
-      auth: "authenticating",
+      auth_state: "authenticating",
       runner_id: "slot-1",
       last_activity_at: now - TTL.loginInProgress - 1,
     });
@@ -1489,6 +1498,147 @@ describe("sweep authFailedReleased", () => {
     // Release was attempted but failed; slot remains bound.
     expect(report.authFailedReleased).toBe(0);
     expect(db.getSession(GUID)?.runner_id).toBe("slot-1");
+  });
+});
+
+/**
+ * Issue #49: a login Microsoft **refused** is not a login that timed out.
+ *
+ * ## The shape
+ *
+ * `markAuthFailed` writes `auth_state = 'failed'` and deliberately does not touch
+ * `state` — the login is still the session's current phase, so retrying from the
+ * sign-in screen is not a new session. The sweeper's login-expiry branch was guarded
+ * on `state` alone, so fifteen minutes after a mistyped password it fired, overwrote
+ * `auth_state` with `'expired'` and emitted `challenge-expired`. The user was told
+ * their MFA window had closed; the truth was that their password was wrong, and the
+ * refusal had been sitting unreadable in the database the whole time.
+ *
+ * The fix adds `auth_state === "authenticating"` to the guard, so the branch is now
+ * only about a login genuinely still in flight. **Removing either term turns the
+ * first test below red** — that is what makes it a regression test and not a
+ * description.
+ *
+ * ## What falls through once it no longer matches
+ *
+ * A refused login now reaches the idle branch and the auth-failed branch below it,
+ * which it used to skip over via the expiry branch's `continue`. Both are pinned
+ * here, because "does not do the wrong thing" is only half a claim — the other half
+ * is that the right thing still happens to the row.
+ */
+describe("sweep does not reclassify a refused login", () => {
+  it("leaves auth_state failed past 15 minutes instead of expiring it", async () => {
+    // The bug, as one scenario: a wrong password, the clock run forward past
+    // `TTL.loginInProgress`, one sweep. Before the fix this ended with
+    // `loginExpired === 1`, `auth_state === "expired"` and a `challenge-expired`
+    // frame on the wire.
+    seedRunners(1);
+    seedSession(GUID, {
+      state: "authenticating",
+      auth_state: "failed",
+      runner_id: "slot-1",
+      // Past the login deadline, which is the whole point: this is the clock that
+      // used to decide the password had "expired".
+      last_activity_at: now - TTL.loginInProgress - 1,
+      // Controlled explicitly so the idle branch cannot decide this test's outcome.
+      idle_expires_at: now + TTL.authenticatedIdle,
+    });
+    const frames = watch(sse, GUID);
+    const { client, released } = orchestratorStub({ release: "ok" });
+    const binder = new PoolBinder(options(client));
+
+    const report = await sweep(options(client), binder);
+
+    // The branch did not fire — not the counter alone, which a changed
+    // implementation could satisfy some other way, but the row it would have written.
+    expect(report.loginExpired).toBe(0);
+    expect(db.getSession(GUID)?.auth_state).toBe("failed");
+    // The lie the user was told, asserted on the wire rather than on the counter:
+    // no MFA prompt was ever outstanding, so nothing expired.
+    expect(frames().map((f) => f.type)).not.toContain("challenge-expired");
+    // And the slot was freed anyway, on the very tick the failure was noticed —
+    // which is the other half of the same fix. A quarter-hour of lockout on a
+    // two-slot pool was the cost of the branch that must not fire.
+    expect(report.authFailedReleased).toBe(1);
+    expect(released).toEqual(["slot-1"]);
+    expect(db.getSession(GUID)?.runner_id).toBeNull();
+  });
+
+  it("releases a refused login whose idle deadline has passed, without promoting it", async () => {
+    // **The fall-through case: the refused login now reaches the idle branch.**
+    //
+    // Before the fix the expiry branch `continue`d, so a failed session never got
+    // here. Now it does, and `releaseForIdle`'s UPDATE does three things to this
+    // row — releases the slot, writes `state = 'authenticated'`, and promotes
+    // `auth_state` `'authenticating'` → `'valid'`. The last one is the one that
+    // would have turned a refused login into a working session, and `auth_state` is
+    // already `'failed'`, so its `CASE` leaves it alone. That is the property worth
+    // pinning, because the alternative — a failed login reachable through
+    // `/api/export` with no auth.json anywhere — is silent.
+    seedRunners(1);
+    seedSession(GUID, {
+      state: "authenticating",
+      auth_state: "failed",
+      runner_id: "slot-1",
+      last_activity_at: now - TTL.loginInProgress - 1,
+      idle_expires_at: now - 1,
+    });
+    const { client } = orchestratorStub({ release: "ok" });
+    const binder = new PoolBinder(options(client));
+
+    const report = await sweep(options(client), binder);
+
+    // It really released — asserted here because "nothing happened" and "the right
+    // thing happened" both end in a row nobody can use, and only the counter and
+    // the nulled `runner_id` tell them apart.
+    expect(report.idleReleased).toBe(1);
+    expect(db.getSession(GUID)?.runner_id).toBeNull();
+    // Not promoted. This is the gate every authenticated route reads
+    // (`routes.ts`: `if (session.auth_state === "valid")`), so `auth_state` alone
+    // decides whether this row is a signed-in session — and `releaseForIdle` does
+    // rewrite `state` to `'authenticated'` on the way past, which is precisely why
+    // the assertion cannot be made on `state`.
+    expect(db.getSession(GUID)?.auth_state).toBe("failed");
+    expect(db.getSession(GUID)?.auth_state === "valid").toBe(false);
+    // And the auth-failed branch still runs: the in-memory row read at the top of
+    // the loop still names the slot, so its counter is what an operator reads.
+    expect(report.authFailedReleased).toBe(1);
+  });
+
+  it("leaves a runner-less refused login alone entirely, until the 12h cap", async () => {
+    // **The other fall-through case, and the one production actually hits.**
+    //
+    // The previous tick's auth-failed branch already released the slot, so this is
+    // what most refused logins look like on their next sweep: no runner, a failed
+    // auth_state, a `state` that is still `authenticating` — which is a row no
+    // login-expiry branch may act on. It must survive untouched until the absolute
+    // cap, because a retry on the sign-in screen claims a fresh slot onto this same
+    // session (the `claimForLogin` test above).
+    seedSession(GUID, {
+      state: "authenticating",
+      auth_state: "failed",
+      runner_id: null,
+      last_activity_at: now - TTL.loginInProgress - 1,
+      // Past, deliberately: this is the idle branch's own deadline and the case
+      // where it must turn out to be a no-op rather than a rewrite.
+      idle_expires_at: now - 1,
+    });
+    const { client, calls } = orchestratorStub({ release: "ok" });
+    const binder = new PoolBinder(options(client));
+
+    const report = await sweep(options(client), binder);
+
+    // Nothing to release, so nothing was asked for — `releaseForIdle` returns
+    // early on a null `runner_id` rather than calling the orchestrator.
+    expect(report.idleReleased).toBe(0);
+    expect(report.authFailedReleased).toBe(0);
+    expect(calls).not.toContain("/release");
+    // The row is untouched and still there: not deleted by any branch, and still
+    // short of the 12-hour cap.
+    expect(db.getSession(GUID)).toBeDefined();
+    expect(db.getSession(GUID)?.state).toBe("authenticating");
+    expect(db.getSession(GUID)?.auth_state).toBe("failed");
+    expect(report.absoluteExpired).toBe(0);
   });
 });
 

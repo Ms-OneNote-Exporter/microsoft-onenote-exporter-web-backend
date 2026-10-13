@@ -27,10 +27,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { boot, splitListen, SWEEP_INTERVAL, type Booted } from "../src/index.js";
+import { boot, createAuthOutcomeHandler, splitListen, SWEEP_INTERVAL, type BootLog, type Booted } from "../src/index.js";
 import { FakeOrchestrator } from "../mock/fake-orchestrator.js";
 import { OrchestratorApi } from "../src/orchestrator-client.js";
 import { ConfigError } from "../src/config.js";
+import { Db } from "../src/db.js";
+import { SseHub } from "../src/sse.js";
+import { generateCsrfKey, hashSecret } from "../src/session.js";
 
 let dir: string;
 let booted: Booted | undefined;
@@ -195,5 +198,161 @@ describe("the sweep interval", () => {
     // §2.5's rule — an expired session is never resurrected — would be true on
     // paper and late in practice.
     expect(SWEEP_INTERVAL.ms).toBeLessThan(SWEEP_INTERVAL.shortestTtlMs);
+  });
+});
+
+/**
+ * Issue #49: the api has to *say* a login was refused.
+ *
+ * ## Why this file rather than `auth-state.test.ts`
+ *
+ * That file drives the adapter's own callback and asserts what lands in the
+ * database — correctly, because the adapter is transport and stores nothing. But
+ * the callback the adapter actually receives is wired in `boot`, and for fifteen
+ * minutes of a user's life it wrote the refusal to the database and emitted
+ * nothing. The database is the authority; the browser is SSE-only. So the gap is
+ * not in a module, it is in the wiring, and wiring is what this file exists to
+ * cover.
+ *
+ * ## Why the event is enough on its own
+ *
+ * `auth-state` already exists and `App.tsx` handles it generically by re-reading
+ * `GET /api/session/status`, which reports `auth_state: "failed"`. No frontend
+ * change, no new event name, no new vocabulary — this is the missing signal, not a
+ * missing feature.
+ */
+describe("createAuthOutcomeHandler", () => {
+  const GUID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+
+  let outcomeDb: Db;
+  let outcomeSse: SseHub;
+  let logged: { level: string; msg: string }[];
+
+  /** A log that keeps its lines instead of printing them. */
+  const log: BootLog = {
+    info: (msg) => void logged.push({ level: "info", msg }),
+    warn: (msg) => void logged.push({ level: "warn", msg }),
+    error: (msg) => void logged.push({ level: "error", msg }),
+  };
+
+  /** The callback `boot` hands the adapter, built over the real db and hub. */
+  function handler() {
+    return createAuthOutcomeHandler({ db: outcomeDb, sse: outcomeSse, log });
+  }
+
+  /**
+   * The rows a browser would receive, read off the wire.
+   *
+   * Bytes rather than hub internals, for the reason `sweep.test.ts`'s `watch` gives:
+   * the question is "what does the browser get told", and it is answerable only by
+   * the frame a browser could parse.
+   */
+  function watch(guid: string): () => { type: string; data: unknown }[] {
+    const written: string[] = [];
+    outcomeSse.attach(
+      guid,
+      {
+        write: (chunk: string) => {
+          written.push(String(chunk));
+          return true;
+        },
+        end: () => undefined,
+      } as never,
+      null,
+    );
+    return () =>
+      written
+        .join("")
+        .split("\n\n")
+        .filter((frame) => frame.trim() !== "" && !frame.startsWith(":"))
+        .map((frame) => {
+          const out: { type: string; data: unknown } = { type: "", data: null };
+          for (const line of frame.split("\n")) {
+            if (line.startsWith("event: ")) out.type = line.slice("event: ".length);
+            else if (line.startsWith("data: ")) out.data = line.slice("data: ".length);
+          }
+          return out;
+        });
+  }
+
+  beforeEach(() => {
+    logged = [];
+    outcomeDb = new Db(":memory:");
+    outcomeSse = new SseHub();
+    outcomeDb.createSession({
+      guid: GUID,
+      secretHash: hashSecret("S".repeat(43)),
+      csrfKey: generateCsrfKey(),
+      now: Date.now(),
+      expiresAt: Date.now() + 3_600_000,
+    });
+    // The one state a login is in when the runner reports how it went: a claim has
+    // bound a slot and `auth_state` is awaiting an answer. Not a convenient shape —
+    // it is the shape, and `markAuthFailed`'s `WHERE auth_state = 'authenticating'`
+    // is what makes anything the handler does conditional on it.
+    outcomeDb.run(
+      `UPDATE sessions SET state = 'authenticating', auth_state = 'authenticating',
+                          runner_id = 'slot-1'
+        WHERE guid = ?`,
+      GUID,
+    );
+  });
+
+  afterEach(() => {
+    outcomeDb.close();
+  });
+
+  it("emits auth-state failed when the runner refuses a login", () => {
+    // **The whole of #49 on this side.** Before this, the refusal was written to the
+    // database and sent to nobody, and the next thing the user was told was the
+    // sweeper's `challenge-expired` fifteen minutes later.
+    const frames = watch(GUID);
+
+    handler()(GUID, "failed");
+
+    // On the wire, because the wire is the only thing the browser has. Delete the
+    // emit in `index.ts` and this goes red while every database assertion below
+    // still passes — which is what makes it a test of the signal rather than of the
+    // write.
+    expect(frames().map((f) => f.type)).toContain("auth-state");
+    expect(frames().find((f) => f.type === "auth-state")?.data).toBe(
+      JSON.stringify({ state: "failed" }),
+    );
+  });
+
+  it("still records the failure, so the row and the event agree", () => {
+    // The event is a nudge, never the record: it says "re-read the status", and what
+    // it re-reads has to say `failed`. An emit without the write would leave the
+    // client refreshing to an authenticating session and showing a spinner.
+    handler()(GUID, "failed");
+
+    expect(outcomeDb.getSession(GUID)?.auth_state).toBe("failed");
+  });
+
+  it("emits nothing extra on a successful login", () => {
+    // The mirror, and the reason the failure needed saying at all: success already
+    // has a signal — the runner's own `login-success` frame is forwarded verbatim
+    // and the client refreshes on it. A second `auth-state` here would be a frame
+    // per successful sign-in that nobody asked for.
+    const frames = watch(GUID);
+
+    handler()(GUID, "authenticated");
+
+    expect(outcomeDb.getSession(GUID)?.auth_state).toBe("valid");
+    expect(frames().map((f) => f.type)).not.toContain("auth-state");
+  });
+
+  it("warns instead of emitting twice when the runner repeats a failure", () => {
+    // A reconnecting pump replays its buffer, so a duplicate `login-failed` is a
+    // real event rather than a hypothetical. The second one writes nothing
+    // (`markAuthFailed`'s guard), so it must not announce a change that did not
+    // happen — the warning is the record of it.
+    handler()(GUID, "failed");
+    logged = [];
+
+    handler()(GUID, "failed");
+
+    expect(outcomeDb.getSession(GUID)?.auth_state).toBe("failed");
+    expect(logged.map((l) => l.level)).toEqual(["warn"]);
   });
 });

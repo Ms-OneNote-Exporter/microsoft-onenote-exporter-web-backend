@@ -633,9 +633,31 @@ export class Db {
    * `markExportStranded`, which carries the guards — and which requires
    * `runner_id IS NULL` to fire at all, so the two statements have to stay in that
    * order for the repair to happen.
+   *
+   * ## Why `runnerId` is part of the WHERE clause (F8)
+   *
+   * The unguarded form was `WHERE guid = ?`, which clears whatever the column
+   * holds **at the moment the statement runs** — including a runner bound after
+   * the caller's snapshot was taken. That is the dispossession this whole
+   * mechanism exists to prevent, arriving through the repair: the sweeper holds a
+   * dead-runner's slot id, a claim lands a live one on the same row in the
+   * meantime, and the unstick statement takes the live binding away from a session
+   * that is using it.
+   *
+   * Guarding on the exact id makes the write idempotent against a snapshot that
+   * has aged: `0` rows changed means "this is no longer the binding I was asked to
+   * clear", which is the correct outcome and leaves the newer binding alone.
+   *
+   * The return value is that change count, so a caller can tell a clear from a
+   * no-op — `markExportStranded`'s `runner_id IS NULL` guard is meaningless if the
+   * clear silently did not happen.
    */
-  clearSessionRunner(guid: string): void {
-    this.run(`UPDATE sessions SET runner_id = NULL WHERE guid = ?`, guid);
+  clearSessionRunner(guid: string, runnerId: string): number {
+    return this.run(
+      `UPDATE sessions SET runner_id = NULL WHERE guid = ? AND runner_id = ?`,
+      guid,
+      runnerId,
+    );
   }
 
   /**
@@ -991,11 +1013,27 @@ export class Db {
     });
   }
 
-  /** releaseRunner frees a runner slot. */
-  releaseRunner(runnerId: string): void {
-    this.run(
-      `UPDATE runners SET status = 'idle', session_guid = NULL WHERE id = ?`,
-      runnerId,
+  /**
+   * releaseRunner frees a runner slot.
+   *
+   * ## Why it returns a number (F1)
+   *
+   * The statement is conditional the moment `expectedSessionGuid` is supplied, and
+   * a `void` return cannot tell a caller which branch it took. Callers that have
+   * just *released a container* need the difference: `0` means the row was not
+   * ours to free — somebody re-bound it between our read and our write — and the
+   * honest answer to that is "do not report this release as complete".
+   *
+   * `expectedSessionGuid` is the dual-reconciler guard (§4.9). Without it the
+   * statement is unconditional and byte-identical to what it always was, so every
+   * existing caller keeps its behaviour and none of them has to be audited for a
+   * guard they did not ask for.
+   */
+  releaseRunner(runnerId: string, expectedSessionGuid?: string): number {
+    return this.run(
+      `UPDATE runners SET status = 'idle', session_guid = NULL
+         WHERE id = ?${expectedSessionGuid !== undefined ? " AND session_guid = ?" : ""}`,
+      ...(expectedSessionGuid !== undefined ? [runnerId, expectedSessionGuid] : [runnerId]),
     );
   }
 

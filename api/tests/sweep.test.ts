@@ -1084,6 +1084,107 @@ describe("PoolBinder.releaseForIdle", () => {
     expect(await new PoolBinder(options(client)).releaseForIdle(db.getSession(GUID)!)).toBe(false);
     expect(calls).not.toContain("/release");
   });
+
+  // §4.9. The whole safety argument of a guarded write is that it is a no-op when
+  // the snapshot it came from has aged, and the only way to see that is to hand the
+  // binder a `SessionRow` that disagrees with the row.
+  //
+  // Constructed rather than raced, because the window it describes is a `/release`
+  // round trip wide: `sweep` reads every session at the top of the tick, then walks
+  // that list with an orchestrator call between the decision and the write. The
+  // snapshot below is exactly what the binder holds in that window.
+  it("leaves a binding that has moved on alone, because the snapshot is stale", async () => {
+    seedRunners(2);
+    seedSession(GUID, { state: "authenticated", auth_state: "valid", runner_id: "slot-2" });
+    // The tick read the session before slot-2 was claimed; it is deciding about the
+    // idle deadline of slot-1, which is what the row said then.
+    const stale = { ...db.getSession(GUID)!, runner_id: "slot-1" };
+    const { client } = orchestratorStub({ release: "ok" });
+
+    expect(await new PoolBinder(options(client)).releaseForIdle(stale)).toBe(true);
+
+    // The unguarded `WHERE guid = ?` cleared this, and the session was left naming a
+    // slot the orchestrator had never been asked to release — so a container it was
+    // actively using became unreachable, and the pool handed the slot to somebody
+    // else. Both records agreed afterwards, which is what makes it unrepairable.
+    expect(db.getSession(GUID)?.runner_id).toBe("slot-2");
+  });
+
+  it("still releases the slot it decided about, stale snapshot or not", async () => {
+    // The complement, and the reason the guard is a WHERE clause rather than an
+    // early return: "this is no longer the session's binding" says nothing about
+    // "the container should not have been released".
+    seedRunners(2);
+    seedSession(GUID, { state: "authenticated", auth_state: "valid", runner_id: "slot-2" });
+    const stale = { ...db.getSession(GUID)!, runner_id: "slot-1" };
+    const { client, released } = orchestratorStub({ release: "ok" });
+
+    await new PoolBinder(options(client)).releaseForIdle(stale);
+
+    expect(released).toEqual(["slot-1"]);
+  });
+});
+
+/**
+ * releaseForAuthFailure's guard — §4.9 again, and the window is wider here.
+ *
+ * A failed login is precisely the state a user leaves by signing in again, so this
+ * branch is the one a re-login is most likely to land in the middle of: the snapshot
+ * says `runner_id = slot-1`, the `/release` round trip runs, and the user submits a
+ * credential that claims slot-2 and writes it.
+ */
+describe("PoolBinder.releaseForAuthFailure", () => {
+  it("leaves a binding that has moved on alone, because the snapshot is stale", async () => {
+    seedRunners(2);
+    seedSession(GUID, {
+      state: "authenticating",
+      auth_state: "failed",
+      runner_id: "slot-2",
+    });
+    const stale = { ...db.getSession(GUID)!, runner_id: "slot-1" };
+    const { client } = orchestratorStub({ release: "ok" });
+
+    expect(await new PoolBinder(options(client)).releaseForAuthFailure(stale)).toBe(true);
+
+    expect(db.getSession(GUID)?.runner_id).toBe("slot-2");
+  });
+
+  it("still releases the slot it decided about, stale snapshot or not", async () => {
+    seedRunners(2);
+    seedSession(GUID, {
+      state: "authenticating",
+      auth_state: "failed",
+      runner_id: "slot-2",
+    });
+    const stale = { ...db.getSession(GUID)!, runner_id: "slot-1" };
+    const { client, released } = orchestratorStub({ release: "ok" });
+
+    await new PoolBinder(options(client)).releaseForAuthFailure(stale);
+
+    expect(released).toEqual(["slot-1"]);
+  });
+
+  // ...and the guarded form has to leave the *other* fields alone too, because the
+  // reason this method exists is that its delta is deliberately the smallest one:
+  // `releaseForIdle`'s UPDATE would write `state = 'authenticated'` beside an
+  // `auth_state = 'failed'`, which is a signed-in-looking snapshot for a refused
+  // login.
+  it("writes nothing at all when the binding has moved on", async () => {
+    seedRunners(2);
+    seedSession(GUID, {
+      state: "authenticating",
+      auth_state: "failed",
+      runner_id: "slot-2",
+      idle_expires_at: now + 1000,
+    });
+    const stale = { ...db.getSession(GUID)!, runner_id: "slot-1" };
+    const before = db.getSession(GUID)!;
+    const { client } = orchestratorStub({ release: "ok" });
+
+    await new PoolBinder(options(client)).releaseForAuthFailure(stale);
+
+    expect(db.getSession(GUID)).toEqual(before);
+  });
 });
 
 // ---- sweep ----------------------------------------------------------------

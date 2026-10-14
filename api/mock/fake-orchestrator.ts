@@ -120,13 +120,60 @@ export class FakeOrchestrator {
     return [...this.#slots.keys()];
   }
 
+  /**
+   * claim binds a slot to a session, and starts a container on it.
+   *
+   * `slotId` names the slot the caller already holds a SQLite claim on, and it is
+   * **taken literally** — bound, or a 409, never silently substituted. That is the
+   * real contract (`orchestrator/internal/server/server.go`, `handleClaim`: *"When the
+   * request names a slot, that slot is taken or the claim conflicts. It is never
+   * silently substituted"*), and it is the property `PoolBinder`'s mismatch branch
+   * exists to survive an orchestrator that broke it.
+   *
+   * This fake modelled the *unnamed* contract only, because `claim` grew its third
+   * argument after this file was written and the parameter was never added. A fake
+   * that quietly picked a different slot could not reproduce the one thing it exists
+   * to let a test see — and, worse, it handed back the session's **existing** slot
+   * with its **existing** container whenever the api had just re-bound a session, so
+   * a test could not tell a fresh container from a reused broken one. That is the
+   * same lesson the api's own stub file records: a fixture that only works because the
+   * code under test discards half of it is a second implementation of the wrong thing.
+   *
+   * Omitting `slotId` keeps the original behaviour: any free slot, idempotent for a
+   * session that already holds one, which is what a caller retrying after a network
+   * blip needs.
+   */
   async claim(
     sessionGuid: string,
     _sessionExpiresAt: Date,
+    slotId?: string,
   ): Promise<OrchestratorResult<{ slotId: string; containerId: string }>> {
     if (this.#claimDelayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, this.#claimDelayMs));
     }
+
+    if (slotId !== undefined) {
+      const named = this.#slots.get(slotId);
+      if (named === undefined) {
+        // Not "try another". An unknown slot is a disagreement about pool
+        // membership, which `syncPool` exists to prevent, and `api` reads the 409
+        // as `slot-conflict` rather than as exhaustion.
+        return { ok: false, error: { kind: "conflict", status: 409 } };
+      }
+      if (named.sessionGuid === sessionGuid) {
+        // A retry of a claim this session already holds. Answering with the slot it
+        // has is what stops a retry after a network blip from leaking a second one.
+        return { ok: true, value: { slotId: named.slotId, containerId: named.containerId } };
+      }
+      if (named.sessionGuid !== null) {
+        // Held by somebody else. The real one refuses rather than displacing them,
+        // so a fake that stole it would let a test exercise a path a deployment
+        // cannot take.
+        return { ok: false, error: { kind: "conflict", status: 409 } };
+      }
+      return this.#bind(named, sessionGuid);
+    }
+
     // Re-claiming an already-bound session returns its existing slot, because the
     // real orchestrator's claim is idempotent per slot and a client may retry
     // after a network blip.
@@ -144,11 +191,19 @@ export class FakeOrchestrator {
       // Exhaustion. The real one answers 409 for a full pool.
       return { ok: false, error: { kind: "conflict", status: 409 } };
     }
+    return this.#bind(free, sessionGuid);
+  }
+
+  /** #bind takes a slot that is known to be free and starts a container on it. */
+  #bind(slot: FakeSlot, sessionGuid: string): OrchestratorResult<{
+    slotId: string;
+    containerId: string;
+  }> {
     this.#seq++;
-    free.sessionGuid = sessionGuid;
-    free.containerId = `mock${String(this.#seq).padStart(6, "0")}`;
-    free.createdAtMs = this.#now();
-    return { ok: true, value: { slotId: free.slotId, containerId: free.containerId } };
+    slot.sessionGuid = sessionGuid;
+    slot.containerId = `mock${String(this.#seq).padStart(6, "0")}`;
+    slot.createdAtMs = this.#now();
+    return { ok: true, value: { slotId: slot.slotId, containerId: slot.containerId } };
   }
 
   async release(slotId: string): Promise<OrchestratorResult<{ released: boolean }>> {

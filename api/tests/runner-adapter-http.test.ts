@@ -46,7 +46,6 @@ import { hashSecret } from "../src/session.js";
 import {
   HttpRunnerAdapter,
   RunnerCallError,
-  unsupportedChallenge,
   type ExportFinishedInput,
 } from "../src/runner-adapter-http.js";
 import { SseHub } from "../src/sse.js";
@@ -505,7 +504,7 @@ describe("runner events reach the api's own vocabulary", () => {
     expect((challenge?.data as { kind?: string }).kind).toBe("phone-approval");
   });
 
-  it("names a code challenge as unsupported instead of letting it expire", async () => {
+  it("carries a code challenge instead of failing the login", async () => {
     const runner = await fakeRunner();
     const adapter = adapterFor(runner);
 
@@ -523,13 +522,17 @@ describe("runner events reach the api's own vocabulary", () => {
     await adapter.listNotebooks(SESSION);
     const events = await sub.received();
 
-    const failed = events.find((e) => e.type === "login-failed");
-    expect((failed?.data as { reason?: string }).reason).toBe("challenge-not-supported");
-    // The message names the gap rather than saying "sign-in failed", which for an
-    // account that works everywhere else is the most confusing thing to say.
-    expect((failed?.data as { message?: string }).message).toBe(unsupportedChallenge);
-    expect(unsupportedChallenge).toMatch(/code/i);
-    expect(unsupportedChallenge).toMatch(/approve/i);
+    // Carried. This used to emit `login-failed {reason: "challenge-not-supported"}`
+    // instead — which told a user with a working password that their sign-in had
+    // failed, at the exact moment the runner was waiting for the code in their hand.
+    const challenge = events.find((e) => e.type === "challenge");
+    expect((challenge?.data as { kind?: string }).kind).toBe("code");
+    expect((challenge?.data as { label?: string }).label).toBe("Enter the code we sent you");
+
+    // And no failure is invented. A `login-failed` here would also call
+    // `onAuthOutcome("failed")` in production, marking the session's auth state
+    // refused while the login it belongs to is still waiting.
+    expect(events.find((e) => e.type === "login-failed")).toBeUndefined();
   });
 
   it("carries an export's progress through with its counts", async () => {
@@ -764,6 +767,59 @@ describe("the other three verbs", () => {
 
     expect(runner.seen[0]!.method).toBe("DELETE");
     expect(runner.seen[0]!.url).toBe(`/sessions/${SESSION}`);
+  });
+
+  it("hands an MFA code to the runner on the session's own route", async () => {
+    const runner = await fakeRunner();
+    const adapter = adapterFor(runner);
+
+    await adapter.answerChallenge(SESSION, "123456");
+
+    // The far side is the assertion. A method that built the right URL and dropped
+    // the value on the floor would pass every assertion about the request's shape.
+    expect(runner.seen[0]!.method).toBe("POST");
+    expect(runner.seen[0]!.url).toBe(`/sessions/${SESSION}/mfa`);
+    expect(runner.seen[0]!.contentType).toContain("application/json");
+    const body = JSON.parse(runner.seen[0]!.body.toString("utf8")) as Record<string, unknown>;
+    expect(body).toEqual({ code: "123456" });
+    // The token is the control on this route too, and it is why the assertion is on
+    // the request that arrived rather than on the call that was made.
+    expect(runner.seen[0]!.token).toBe(TOKEN);
+  });
+
+  it("reports a runner with no prompt pending, rather than a silent success", async () => {
+    // The runner answers 409 when nothing is waiting — the challenge expired, or it
+    // was a push approval that needs no code. Resolving here would tell the user
+    // "we are still waiting for your code" when the wait is over.
+    const runner = await fakeRunner();
+    const adapter = adapterFor(runner);
+
+    runner.answerWith(409, { error: "no challenge is waiting for a code" });
+    const error = await adapter.answerChallenge(SESSION, "123456").catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(RunnerCallError);
+    expect(((error as RunnerCallError).failure as { kind: string }).kind).toBe(
+      "not-ready",
+    );
+  });
+
+  it("sends no challenge event of its own, because the api publishes that", async () => {
+    // `challenge-seen` is the api's event, emitted by `routes.ts`. An adapter that
+    // emitted it as well would give the browser two of them — the same duplication
+    // `login-started` already had a comment about, and one no route-level test would
+    // see because they drive a fake adapter.
+    //
+    // Settled rather than read immediately: `received(0)` returns on the first call,
+    // so asserting against it before the call settles would pass for the wrong
+    // reason.
+    const runner = await fakeRunner();
+    const adapter = adapterFor(runner);
+
+    const sub = subscribe(runner.sse);
+    await adapter.answerChallenge(SESSION, "123456");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(framesFrom(sub.res)).toEqual([]);
   });
 });
 

@@ -55,13 +55,44 @@ export class MockRunner implements RunnerAdapter, RunnerEraseControl {
   #nextLogin: LoginScript;
 
   /**
-   * The account from the last submitCredential call.
+   * answerChallenge records the code and lets the scripted login finish.
+   *
+   * **A mock, so it must not pretend to verify anything.** The real
+   * `answerChallenge` resolves a prompt inside `microsoft-webauth` and has no way to
+   * know whether the code was right either — so a mock that checked the digits would
+   * be a second, more permissive implementation of the thing, and a development run
+   * would pass where production failed.
+   *
+   * What it does is what the real one does observably: record what arrived, and let
+   * the pending login complete. The real runner answers 409 when no prompt is
+   * pending; this one always succeeds, because the mock's `mfa-code` script is a
+   * promise the mock itself controls.
+   */
+  async answerChallenge(sessionId: string, code: string): Promise<void> {
+    this.lastChallengeCode = code;
+    // The scripted login emitted its `challenge` and then returned, having promised
+    // the user a way to answer. Finishing here is what makes that promise true, and
+    // emitting `challenge-seen` is the api's own event rather than the runner's, so
+    // it is left to `routes.ts` — exactly as it is on the real path.
+    this.finishLoginSuccess(sessionId);
+  }
+
+  /** The account from the last submitCredential call.
    *
    * For the dev controls only. Deliberately not emitted as an SSE event, because
    * that would put a user's Microsoft account identifier into a frame a browser
    * holds in memory for the life of the session.
    */
   lastAccount: string | null = null;
+
+  /**
+   * The code from the last `answerChallenge` call.
+   *
+   * For the dev controls only, and for the same reason as `lastAccount`: a code is a
+   * secret for as long as it is valid, so it is never emitted as an SSE event and
+   * never written to a log.
+   */
+  lastChallengeCode: string | null = null;
 
   /** Live export abort controllers, so abort can actually cancel a run. */
   readonly #running = new Map<string, AbortController>();

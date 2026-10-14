@@ -6,9 +6,10 @@
  * cookie was set, the live-update stream attached, and the login could not
  * complete past the password field.
  *
- * ## The four routes, and what each is for
+ * ## The routes, and what each is for
  *
  *   POST /sessions/:guid/login       the credential, as bytes
+ *   POST /sessions/:guid/mfa         a typed MFA code, mid-login
  *   POST /sessions/:guid/notebooks   list
  *   POST /sessions/:guid/exports     export
  *   POST /sessions/:guid/exports/:id/abort
@@ -48,19 +49,18 @@
  * does not name this stack's own runner is a misconfiguration or an attack, and
  * both deserve a refusal rather than a connection attempt.
  *
- * ## What this does not implement, and says so
+ * ## Answering a `challenge` of kind `code`
  *
- * **Answering a `challenge` of kind `code`.** The runner waits 120 seconds and
- * then fails; there is no route to hand it a typed code, and the api has no UI to
- * collect one. Rather than let that present as a login that mysteriously
- * succeeds-with-nothing, `unsupportedChallenge` is raised where a caller can see
- * it and a test asserts the refusal. The number-match path — push approval, the
- * common case — needs nothing from the user and works.
+ * Implemented: `answerChallenge` calls the runner's `POST /sessions/:guid/mfa`,
+ * which resolves the pending prompt inside `@msout/microsoft-webauth`.
  *
- * Building that route is a deliberate separate piece of work: a runner route, an
- * adapter method, an api route, and a frontend screen. Doing it here would make
- * this change unreviewable and would put a new UI in the stack while the
- * credential path is still unproven.
+ * It was not, once. The runner waits 120 seconds and then fails, and this adapter
+ * turned that into a `login-failed {reason: "challenge-not-supported"}` on the
+ * theory that a refusal was better than silence. It was worse than silence: the
+ * account's credentials were fine, the runner was waiting for the very code the user
+ * had in front of them, and this component answered "sign-in failed". The
+ * number-match path never showed it, because it needs nothing from the user and
+ * works. See `#handleFrame`.
  */
 
 import type { Readable as ReadableType } from "node:stream";
@@ -614,6 +614,34 @@ export class HttpRunnerAdapter implements RunnerAdapter {
   }
 
   /**
+   * answerChallenge hands a typed MFA code to the runner.
+   *
+   * **A fast control verb, on the default timeout, deliberately.** It is a value
+   * pushed into a login that is already running, and the runner resolves the package's
+   * pending prompt synchronously — so the runner's answer is immediate. Sharing
+   * `publishArtifact`'s 30-minute budget would be the wrong way round: a long budget
+   * does not make this call slower, it makes a wedged runner hold a sign-in open for
+   * half an hour before anybody is told.
+   *
+   * The code travels in the body as JSON, and that is the one thing on this path that
+   * *is* parsed. The credential route's rule is about a password and the bytes that
+   * carry it; a six-digit code is not a secret worth a bespoke transport, and the
+   * runner's `/mfa` route validates its shape before using it.
+   *
+   * A 409 from the runner — no prompt pending — is a `RunnerCallError` rather than a
+   * silent success, because the two are different answers to a user: "your code was
+   * late" and "we are still waiting" want different advice.
+   */
+  async answerChallenge(sessionId: string, code: string): Promise<void> {
+    await this.#call({
+      method: "POST",
+      path: `/sessions/${encodeURIComponent(sessionId)}/mfa`,
+      sessionId,
+      json: { code },
+    });
+  }
+
+  /**
    * publishArtifact asks the runner to stream the finished vault into staging.
    *
    * The artifact id travels in the **body**, never in the path: it is the api's
@@ -1130,7 +1158,20 @@ export class HttpRunnerAdapter implements RunnerAdapter {
       return;
     }
 
-    const published = publish(
+    // The return value is deliberately ignored.
+    //
+    // It used to be read here: a `challenge` of kind `code` returned
+    // `"challenge-code"`, and this method answered `login-failed` with
+    // `challenge-not-supported`. **That was a second failure invented by this
+    // component.** The runner was waiting — for up to 120 seconds — for exactly the
+    // code the user had in front of them, and the api turned the request for it into
+    // "sign-in failed". The number-match path worked because it needs nothing from
+    // the user; every account that got a typed code was told their correct credentials
+    // did not work.
+    //
+    // Both challenge kinds are now carried the same way, and the frontend asks for
+    // the code. See `answerChallenge` above and `POST /api/session/challenge/answer`.
+    publish(
       this.#sse,
       sessionId,
       raw,
@@ -1140,35 +1181,18 @@ export class HttpRunnerAdapter implements RunnerAdapter {
       (input, terminal) => this.#finishExport(input, terminal),
       this.#now,
     );
-    if (published === "challenge-code") {
-      // Reported, not silently dropped and not silently accepted. See the header:
-      // there is no route to answer a typed code and pretending otherwise would
-      // leave the user watching a login that cannot finish.
-      this.#sse.emit(sessionId, "login-failed", {
-        reason: "challenge-not-supported",
-        message: unsupportedChallenge,
-      });
-    }
   }
 }
 
 /**
- * unsupportedChallenge is what a user is told when Microsoft asks for a typed
- * code.
- *
- * Named rather than generic because "sign-in failed" for an account that works
- * everywhere else is the most confusing message this product can produce. This
- * one says which part is missing and nothing else.
- */
-export const unsupportedChallenge =
-  "this account needs a sign-in code, which this service does not collect yet. " +
-  "Approve the push notification instead, or use an account without a code prompt.";
-
-/**
  * publish maps one runner event onto the api's own vocabulary and emits it.
  *
- * Returns `"challenge-code"` when a `challenge` of kind `code` arrived, so the
- * caller can react to the one kind it cannot carry.
+ * Every challenge kind is carried, including `code`. It used to return
+ * `"challenge-code"` so the caller could refuse the one kind it could not carry — and
+ * the caller turned that into a `login-failed` for accounts whose credentials were
+ * perfectly good. The frontend asks for the code now (`ChallengeAnswer`), so there is
+ * nothing left to refuse. The return is kept because it still says what each `switch`
+ * arm did, and nothing reads it to make a decision any more.
  *
  * Field-by-field with a type check on each, because this is the seam where two
  * implementations of one contract meet and every serious bug in this project has
@@ -1194,7 +1218,7 @@ function publish(
   ) => void,
   onExportFinished?: (input: ExportFinishedInput, terminal: ExportTerminal) => void,
   now: () => number = Date.now,
-): "published" | "dropped" | "challenge-code" {
+): "published" | "dropped" {
   const str = (key: string): string => (typeof raw[key] === "string" ? (raw[key] as string) : "");
   const num = (key: string): number =>
     typeof raw[key] === "number" && Number.isFinite(raw[key] as number) ? (raw[key] as number) : 0;
@@ -1243,12 +1267,19 @@ function publish(
     case "challenge": {
       const kind = str("kind");
       if (kind === "code") {
+        // **No `number`.** There is nothing on screen to read for a typed code — it
+        // arrives by SMS or email — and a field carrying `null` here would be a
+        // second thing for the frontend to have to know the difference about.
+        //
+        // Carried, not refused. This used to return a marker so the caller could
+        // fail the login; the runner now has a route that takes the code, so the
+        // only honest thing to do with this event is deliver it.
         sse.emit(sessionId, "challenge", {
           kind,
           label: str("label"),
           expiresAt: nullableStr("expiresAt"),
         });
-        return "challenge-code";
+        return "published";
       }
       // `number` is the phone-approval code, and it is the whole reason the
       // number-match path is worth supporting: a headless login has no Microsoft

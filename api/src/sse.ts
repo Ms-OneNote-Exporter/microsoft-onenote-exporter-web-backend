@@ -31,6 +31,11 @@ export const EVENT_TYPES = [
   "login-started",
   "challenge",
   "challenge-expired",
+  // The api's own event, not the runner's: it says a code was accepted onto a
+  // pending prompt. Deliberately next to the two names it is about — the frontend
+  // transcribes this array with an order-sensitive `toEqual`, so the position is
+  // load-bearing, exactly as `listing-log`'s is.
+  "challenge-seen",
   "login-success",
   "login-failed",
   "auth-expired",

@@ -149,20 +149,32 @@ export interface RunnerAdapter {
    */
   publishArtifact(input: PublishArtifactInput): Promise<void>;
 
-  // ---------------------------------------------------------------------
-  // Not in this interface, deliberately, and worth stating because its
-  // absence is a real product gap rather than an oversight:
-  //
-  //   answerChallenge(sessionId, challengeId, code)
-  //
-  // The runner can be asked for a typed MFA code (`kind: "code"`) and then waits
-  // 120 seconds and fails — `login()` has no way to be handed a code mid-flow, and
-  // the runner has no route to receive one. The number-match path needs nothing
-  // from the user, so it works. A code path needs a runner route, this method, an
-  // api route and a frontend screen, and none of those exist.
-  //
-  // Until they do, `HttpRunnerAdapter` refuses that challenge with a named reason
-  // rather than letting it expire silently. See `unsupportedChallenge`.
+  /**
+   * Hand a typed MFA code to the login that is waiting for one.
+   *
+   * ## The gap this used to document instead of filling
+   *
+   * The interface used to carry a comment saying this method was deliberately
+   * absent: the runner could be asked for a `challenge` of kind `code` and then
+   * waited out its 120 seconds, because `login()` had no way to be handed a code
+   * mid-flow. `HttpRunnerAdapter` refused that challenge with a named reason, and a
+   * user with a phone and a code could not sign in at all.
+   *
+   * The runner has a `/sessions/:guid/mfa` route now, so the answer is a call rather
+   * than a refusal.
+   *
+   * **Resolving means "accepted", not "accepted as correct".** Whether the code was
+   * the right one is not knowable here: the package resolves the prompt and carries
+   * on, and a wrong code surfaces as `login-failed` on the session's event stream
+   * minutes later. So this throws for a call that could not be made and resolves for
+   * one that was — including one the runner answered 409 to because no prompt was
+   * pending, which arrives as a `RunnerCallError`.
+   *
+   * `(sessionId, code)` rather than the `challengeId` the old comment proposed: the
+   * runner holds exactly one pending login prompt per process, so an id would be a
+   * second identifier that cannot disagree with anything.
+   */
+  answerChallenge(sessionId: string, code: string): Promise<void>;
 
   /**
    * Abort a running export.

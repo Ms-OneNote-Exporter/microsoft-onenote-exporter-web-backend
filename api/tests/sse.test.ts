@@ -432,6 +432,10 @@ describe("event types", () => {
       "login-started",
       "challenge",
       "challenge-expired",
+      // The api's own event, next to the two it is about. The frontend transcribes
+      // this array with an order-sensitive `toEqual`, so its position here is the
+      // same pin as `listing-log`'s.
+      "challenge-seen",
       "login-success",
       "login-failed",
       "auth-expired",

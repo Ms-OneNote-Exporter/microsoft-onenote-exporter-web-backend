@@ -45,6 +45,10 @@ vi.mock("@msout/microsoft-onenote-list-notebooks", () => ({
 vi.mock("@msout/microsoft-webauth", () => ({
   login: vi.fn(async () => true),
   LOGIN_REASONS: ["unknown"],
+  // Present because `packages()` reads the whole surface. Vitest's mock proxy throws
+  // on an undefined export, so a mock missing one fails every unrelated route in the
+  // file with a 500 that says nothing about what it was testing.
+  answerChallenge: vi.fn(() => true),
 }));
 
 vi.mock("@msout/microsoft-onenote-export-notebook", () => ({

@@ -9,6 +9,7 @@ import { SseHub } from "../src/sse.js";
 import { RateLimiter } from "../src/rate-limit.js";
 import { CSRF_COOKIE, SESSION_COOKIE } from "../src/csrf.js";
 import { deriveCsrfToken, generateCsrfKey, hashSecret } from "../src/session.js";
+import { RunnerCallError } from "../src/runner-adapter-http.js";
 import type { RunnerAdapter } from "../src/runner-adapter.js";
 import { PoolBinder, syncPool } from "../src/sweep.js";
 import { FakeOrchestrator } from "../mock/fake-orchestrator.js";
@@ -647,6 +648,7 @@ describe("POST /api/session/credential refuses a replay", () => {
       startExport: vi.fn().mockResolvedValue(undefined),
       publishArtifact: vi.fn().mockResolvedValue(undefined),
       abortExport: vi.fn().mockResolvedValue(undefined),
+      answerChallenge: vi.fn().mockResolvedValue(undefined),
     };
 
     return {
@@ -779,6 +781,7 @@ describe("POST /api/session/credential claims the login atomically", () => {
       startExport: vi.fn().mockResolvedValue(undefined),
       publishArtifact: vi.fn().mockResolvedValue(undefined),
       abortExport: vi.fn().mockResolvedValue(undefined),
+      answerChallenge: vi.fn().mockResolvedValue(undefined),
     };
 
     return {
@@ -969,6 +972,221 @@ describe("POST /api/session/notebooks", () => {
   });
 });
 
+// ---- POST /api/session/challenge/answer ----------------------------------
+
+/**
+ * Answering a typed MFA code.
+ *
+ * The route exists because `@msout/microsoft-webauth` reads `process.stdin` for a
+ * code, which a container does not have: a `challenge` of kind `code` used to hang
+ * for 120 seconds and then be reported as "sign-in failed" by this component, for an
+ * account whose credentials were perfectly good.
+ *
+ * The three refusals below are the ones that must happen **before** anything is
+ * forwarded — an unauthenticated caller must not be able to resolve somebody else's
+ * pending prompt, and a blank code must not burn the user's one chance to answer.
+ */
+describe("POST /api/session/challenge/answer", () => {
+  const answerChallenge = vi.fn().mockResolvedValue(undefined);
+
+  function harness() {
+    answerChallenge.mockClear();
+    const runner: RunnerAdapter = {
+      submitCredential: vi.fn().mockResolvedValue(undefined),
+      listNotebooks: vi.fn().mockResolvedValue(undefined),
+      startExport: vi.fn().mockResolvedValue(undefined),
+      publishArtifact: vi.fn().mockResolvedValue(undefined),
+      abortExport: vi.fn().mockResolvedValue(undefined),
+      answerChallenge,
+    };
+    return { emit: vi.spyOn(sse, "emit"), deps: { db, sse, limiter, runner } as ServerDeps };
+  }
+
+  async function post(
+    deps: ServerDeps,
+    body: unknown,
+    headers: Record<string, string> = {},
+  ) {
+    const app = buildServer(config, deps);
+    await app.ready();
+    try {
+      return await app.inject({
+        method: "POST",
+        url: "/api/session/challenge/answer",
+        headers: {
+          "content-type": "application/json",
+          cookie: cookieHeader(),
+          origin: ALLOWED,
+          "x-csrf-token": derive(csrfKey, GUID),
+          ...headers,
+        },
+        payload: JSON.stringify(body),
+      });
+    } finally {
+      await app.close();
+    }
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("403s without a CSRF token, and forwards nothing", async () => {
+    // The structural layer (§3.3). A cross-origin page that could post a code here
+    // could resolve a pending prompt for a session it does not hold — so the refusal
+    // has to be the hook's, before the handler runs at all.
+    seed(GUID, { auth: "authenticating" });
+    const h = harness();
+    const response = await post(h.deps, { code: "123456" }, { "x-csrf-token": "" });
+
+    expect(response.statusCode).toBe(403);
+    expect(answerChallenge).not.toHaveBeenCalled();
+  });
+
+  it("403s from a foreign origin", async () => {
+    // Origin is the other half of the same layer, and it is checked in the same hook.
+    seed(GUID, { auth: "authenticating" });
+    const h = harness();
+    const response = await post(h.deps, { code: "123456" }, { origin: FOREIGN });
+
+    expect(response.statusCode).toBe(403);
+    expect(answerChallenge).not.toHaveBeenCalled();
+  });
+
+  it("400s an empty code, and forwards nothing", async () => {
+    // A blank would resolve the package's pending prompt with nothing: the user's one
+    // chance to answer, spent on a typo, turning into a login failure.
+    seed(GUID, { auth: "authenticating" });
+    const h = harness();
+    for (const code of ["", "   ", undefined, 42, null]) {
+      const response = await post(h.deps, { code });
+      expect(response.statusCode, JSON.stringify({ code })).toBe(400);
+    }
+    expect(answerChallenge).not.toHaveBeenCalled();
+  });
+
+  it("400s a code longer than 32 characters, and forwards nothing", async () => {
+    // The same bound the runner applies, so a body this route calls valid is not
+    // refused there. The boundary is the assertion: 32 is accepted, 33 is not.
+    seed(GUID, { auth: "authenticating" });
+    const h = harness();
+
+    expect((await post(h.deps, { code: "1".repeat(33) })).statusCode).toBe(400);
+    expect(answerChallenge).not.toHaveBeenCalled();
+
+    expect((await post(h.deps, { code: "1".repeat(32) })).statusCode).toBe(202);
+    expect(answerChallenge).toHaveBeenCalledTimes(1);
+  });
+
+  it("202s a valid code, forwards it unchanged, and says so on the stream", async () => {
+    seed(GUID, { auth: "authenticating" });
+    const h = harness();
+    const response = await post(h.deps, { code: "123456" });
+
+    expect(response.statusCode).toBe(202);
+    expect(response.json()).toEqual({ accepted: true });
+
+    // The far side is the assertion. A route that validated the body and returned 202
+    // without calling the adapter would pass every status assertion above.
+    expect(answerChallenge).toHaveBeenCalledTimes(1);
+    expect(answerChallenge).toHaveBeenCalledWith(GUID, "123456");
+
+    // Exactly one `challenge-seen`: a second tab reads it and stops showing an input
+    // for a prompt that is already answered.
+    const seen = h.emit.mock.calls.filter(([, type]) => type === "challenge-seen");
+    expect(seen).toHaveLength(1);
+    expect(seen[0]![0]).toBe(GUID);
+  });
+
+  it("forwards the code exactly as typed rather than trimming it", async () => {
+    // Same rule as the credential: a transformation applied here is a value the user
+    // cannot inspect again once it has been handed over.
+    seed(GUID, { auth: "authenticating" });
+    const h = harness();
+    const response = await post(h.deps, { code: " 123456 " });
+
+    expect(response.statusCode).toBe(202);
+    expect(answerChallenge).toHaveBeenCalledWith(GUID, " 123456 ");
+  });
+
+  it("answers for a session that is still authenticating, because that is the only time a challenge exists", async () => {
+    // **No `requireAuthenticated` here, and this is the test that says why.** Every
+    // other runner route refuses a session that is not `valid`, and a challenge only
+    // exists while the session is `authenticating` — so that guard would refuse every
+    // request the route exists to make.
+    seed(GUID, { auth: "authenticating" });
+    const h = harness();
+    const response = await post(h.deps, { code: "123456" });
+
+    expect(response.statusCode).toBe(202);
+  });
+
+  it("401s without a session cookie", async () => {
+    // The refusal is the hook's, not the handler's: `onRequest` answers before a
+    // route runs, which is why the handler's own `session === null` guard cannot be
+    // reached from a test at all. That is the property — one place decides, every
+    // route inherits it — and this asserts the outcome rather than the line.
+    seed(GUID, { auth: "authenticating" });
+    const h = harness();
+    const response = await post(h.deps, { code: "123456" }, { cookie: "" });
+
+    expect(response.statusCode).toBe(401);
+    expect(answerChallenge).not.toHaveBeenCalled();
+  });
+
+  it("rejects a body with unknown fields", async () => {
+    // A caller that sent `email` and got a 202 would reasonably conclude it was set.
+    seed(GUID, { auth: "authenticating" });
+    const h = harness();
+    const response = await post(h.deps, { code: "123456", email: "someone@example.com" });
+
+    expect(response.statusCode).toBe(400);
+    expect(answerChallenge).not.toHaveBeenCalled();
+  });
+
+  it("reports a runner that could not be reached, rather than a wrong code", async () => {
+    // The failure this route can name honestly. A 409 from the runner means no prompt
+    // is pending — the challenge expired, or it was a push approval needing no code —
+    // and that is a different thing to tell a user than "sign-in failed".
+    seed(GUID, { auth: "authenticating" });
+    const h = harness();
+    answerChallenge.mockRejectedValueOnce(
+      new RunnerCallError(
+        { kind: "not-ready", reason: "conflict" },
+        "the runner refused the request: no challenge is waiting for a code",
+      ),
+    );
+    const response = await post(h.deps, { code: "123456" });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json().reason).toBe("not-ready:conflict");
+    // Nothing was answered, so nothing is announced.
+    expect(h.emit.mock.calls.filter(([, type]) => type === "challenge-seen")).toHaveLength(0);
+  });
+
+  it("501s when no runner is wired, which is the unwired state", async () => {
+    seed(GUID, { auth: "authenticating" });
+    const app = buildServer(config, deps());
+    await app.ready();
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/session/challenge/answer",
+        headers: {
+          "content-type": "application/json",
+          cookie: cookieHeader(),
+          origin: ALLOWED,
+          "x-csrf-token": derive(csrfKey, GUID),
+        },
+        payload: JSON.stringify({ code: "123456" }),
+      });
+      expect(response.statusCode).toBe(501);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
 // ---- POST /api/export -----------------------------------------------------
 
 describe("POST /api/export", () => {
@@ -1084,6 +1302,7 @@ describe("POST /api/export", () => {
       startExport,
       publishArtifact: vi.fn().mockResolvedValue(undefined),
       abortExport: vi.fn().mockResolvedValue(undefined),
+      answerChallenge: vi.fn().mockResolvedValue(undefined),
     };
     const app = buildServer(config, {
       db,

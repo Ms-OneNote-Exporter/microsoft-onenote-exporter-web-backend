@@ -85,6 +85,21 @@ const KEEPALIVE_MS = 15_000;
 const PROGRESS_HEARTBEAT_MS = 15_000;
 
 /**
+ * How long an MFA code may be, in characters.
+ *
+ * A shape check rather than a sanitiser, for the reason the artifact id's is: "reject
+ * anything that is not a code" is smaller and more obviously complete than "strip the
+ * characters that are not one". Six digits is what Microsoft sends; eight covers the
+ * app-name-prefixed forms some tenants get, and 32 leaves room without being a bound
+ * so loose it stops meaning anything.
+ *
+ * The api applies the same number, so a code that reached it intact is a code this
+ * route accepts — two different limits would produce a 400 here for a body the api
+ * had already called valid, with nothing in the message saying which.
+ */
+const MAX_CHALLENGE_CODE_CHARS = 32;
+
+/**
  * The packages, loaded lazily.
  *
  * Lazy so that `/healthz` answers on a container whose Chromium is missing, and
@@ -120,12 +135,18 @@ export interface RunExportStats {
 
 async function packages(): Promise<{
   login: (options: Record<string, unknown>) => Promise<boolean>;
+  answerChallenge: (code: string) => boolean;
   listNotebooks: (options: Record<string, unknown>) => Promise<Notebook[]>;
   runExport: (options: Record<string, unknown>) => Promise<RunExportStats>;
   LOGIN_REASONS: readonly string[];
 }> {
   const webauth = (await import("@msout/microsoft-webauth")) as unknown as {
     login: (o: Record<string, unknown>) => Promise<boolean>;
+    // Synchronous, and a **boolean**: it resolves a pending `promptUser` call and
+    // reports whether one was there. The false branch is the load-bearing half —
+    // "no prompt is waiting" is a different answer from "the code was wrong", and
+    // only this process is in a position to tell them apart.
+    answerChallenge: (code: string) => boolean;
     LOGIN_REASONS: readonly string[];
   };
   // Typed by what the package actually returns — see `Notebook` and the comment on it.
@@ -139,6 +160,7 @@ async function packages(): Promise<{
   };
   return {
     login: webauth.login,
+    answerChallenge: webauth.answerChallenge,
     LOGIN_REASONS: webauth.LOGIN_REASONS,
     listNotebooks: list.listNotebooks,
     runExport: exporter.runExport,
@@ -365,6 +387,70 @@ export function buildApp(
     })();
 
     // 202: the login runs for minutes. The outcome arrives on the event stream.
+    return reply.code(202).send({ accepted: true });
+  });
+
+  // ---- mfa ----------------------------------------------------------------
+
+  /**
+   * Hands a typed MFA code to the login that is waiting for one.
+   *
+   * ## Why this route exists at all
+   *
+   * `@msout/microsoft-webauth` asks for a code by calling `promptUser`, which reads
+   * `process.stdin`. **In a container there is no stdin to read**: the prompt is a
+   * promise that nothing will ever resolve, so a `challenge` of kind `code` became a
+   * login that sat until the package's own timeout and then failed, with a message
+   * that named a timeout rather than a missing way to answer.
+   *
+   * `answerChallenge` (0.1.12) is the out-of-band half of that: it resolves the
+   * pending `promptUser` call from outside the process. This route is the outside.
+   *
+   * ## It deliberately does not claim the job slot
+   *
+   * The login holds the slot for its whole duration — including the minutes it is
+   * waiting for this code — so a `busyBody` check here would refuse every code the
+   * route exists to deliver, and `slot.claim` would throw for the same reason. The
+   * work this route performs is not a job: it is a value handed to one that is
+   * already running.
+   *
+   * ## 409 is an answer, not a failure
+   *
+   * `false` from the package means no prompt was pending — the challenge expired, or
+   * it was a push-approval that needs no code. Saying so is the difference between a
+   * user who typed a code too late and a user told "sign-in failed" with a login that
+   * never had anything to answer.
+   */
+  app.post("/sessions/:guid/mfa", async (req, reply) => {
+    const { guid } = req.params as { guid: string };
+    // The guid is still validated: this route does no filesystem work, but every
+    // other `/sessions/:guid` route validates it, and a session route that accepts
+    // anything is the first step towards one that does something with it.
+    if (sessionPaths(config.dataRoot, guid) === null) {
+      return reply.code(400).send({ error: "bad guid" });
+    }
+
+    const body = req.body as { code?: unknown } | undefined;
+    const code = typeof body?.code === "string" ? body.code : "";
+    // Whitespace-only is refused, and the value is **not** trimmed on the way out:
+    // what the user typed is what the package receives. Refusing a blank is a shape
+    // check, and trimming would be a transformation of a value nobody can inspect
+    // again once it has been handed over.
+    if (code.trim() === "") return reply.code(400).send({ error: "missing code" });
+    if (code.length > MAX_CHALLENGE_CODE_CHARS) {
+      return reply.code(400).send({ error: `code must be at most ${MAX_CHALLENGE_CODE_CHARS} characters` });
+    }
+
+    // Loaded here for the same reason the login route loads `login` here: a container
+    // whose Chromium is missing must fail on the request that needs it, not at boot.
+    const { answerChallenge } = await packages();
+
+    if (!answerChallenge(code)) {
+      return reply.code(409).send({ error: "no challenge is waiting for a code" });
+    }
+
+    // 202, not 200: the code has been handed over, not verified. A wrong code is
+    // discovered by the login, which answers `login-failed` on the event stream.
     return reply.code(202).send({ accepted: true });
   });
 

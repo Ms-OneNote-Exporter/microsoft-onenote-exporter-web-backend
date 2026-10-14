@@ -467,6 +467,19 @@ describe("the export heartbeat", () => {
     });
 
     const address = await start();
+    // Wait for the package's own first frame before moving the clock.
+    //
+    // The walk does not begin the instant the route answers: the runner empties
+    // `out/` first, and that is real filesystem work, which a fake clock does not
+    // wait for. Advancing fifteen seconds against a walk that has not started
+    // ticks a heartbeat whose `lastProgress` is still null, which publishes
+    // nothing — and the assertion below would then be measuring that rather than
+    // the mechanism it is about.
+    //
+    // The sibling test above already does this. This one did not, while its own
+    // comment described an ordering ("One frame from the package, then the
+    // heartbeat re-publishing it") that it assumed rather than waited for.
+    await frames(address);
     await vi.advanceTimersByTimeAsync(HEARTBEAT_MS);
     await vi.advanceTimersByTimeAsync(HEARTBEAT_MS);
 

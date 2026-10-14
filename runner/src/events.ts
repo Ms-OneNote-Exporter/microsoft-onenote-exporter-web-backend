@@ -73,7 +73,20 @@ export type RunnerEvent =
   | { type: "export-started"; id: string }
   | { type: "export-progress"; id: string; progress: ExportProgress }
   | { type: "export-log"; id: string; line: string }
-  | { type: "export-done"; id: string; notebook: string; pages: number; sections: number; assets: number; failedSections: number; failedPages: number; failedGroups: number; notebookNotFound?: boolean; walkFailed?: boolean }
+  | { type: "export-done"; id: string; notebook: string; pages: number; sections: number; assets: number; failedSections: number; failedPages: number; failedGroups: number; notebookNotFound?: boolean; walkFailed?: boolean; /**
+   * A machine-readable slug for a failure that happened *before* the walk, so a
+   * consumer can tell "the walk broke" from "the walk never started".
+   *
+   * `walkFailed` alone cannot: it is one bit, and it means "no usable vault was
+   * produced", which is true of both. The message below is the human half of the
+   * same distinction.
+   *
+   * Unrecognised slugs are ignored rather than rejected — a runner built against
+   * an older api must not be able to make a terminal unreadable.
+   */
+  failure?: string;
+  /** The sentence a user can act on. Present only alongside `failure`. */
+  message?: string }
   | { type: "export-partial"; id: string; reason: string }
   | { type: "export-aborted"; id: string }
   | { type: "error"; message: string };

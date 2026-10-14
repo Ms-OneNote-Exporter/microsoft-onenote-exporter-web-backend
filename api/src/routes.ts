@@ -116,6 +116,22 @@ export interface RouteDeps {
  */
 const EXPORT_STATES = new Set(["none", "queued", "running", "done", "partial", "failed"]);
 
+/**
+ * How long an MFA code may be, in characters.
+ *
+ * **The same number the runner applies** (`MAX_CHALLENGE_CODE_CHARS` in
+ * `runner/src/index.ts`). Two different limits would produce a 400 here for a body
+ * the runner would have accepted, or a 400 there for a body this route called valid,
+ * and neither message would say which side was the tighter one.
+ *
+ * Six digits is what Microsoft sends and eight covers the app-name-prefixed forms
+ * some tenants get; 32 leaves headroom without being a bound so loose it stops
+ * meaning anything. It is a shape check, not a sanitiser — "reject anything longer"
+ * is smaller and more obviously complete than stripping the characters that are not
+ * a digit, which would silently alter a code nobody can read back.
+ */
+const MAX_CHALLENGE_CODE_CHARS = 32;
+
 
 /**
  * parseJsonObject reads a body as a plain object with unknown fields rejected.
@@ -784,6 +800,101 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
 
     // Accepted, not succeeded. The outcome is a `challenge` / `login-success` /
     // `login-failed` event on the session's stream.
+    return reply.code(202).send({ accepted: true });
+  });
+
+  // ---- POST /api/session/challenge/answer --------------------------------
+
+  /**
+   * Hands a typed MFA code to the login that is waiting for one.
+   *
+   * ## Why this exists
+   *
+   * `@msout/microsoft-webauth` asks for a code by reading `process.stdin`, which a
+   * container does not have. So a `challenge` of kind `code` became a login that hung
+   * for its 120 seconds and then failed — and this api turned that into
+   * `login-failed {reason: "challenge-not-supported"}` rather than asking the user
+   * for the code they were already holding.
+   *
+   * The runner's `POST /sessions/:guid/mfa` resolves that pending prompt. This is the
+   * route the browser reaches it through.
+   *
+   * ## No `requireAuthenticated` here, and that is the point
+   *
+   * Every other runner route refuses a session that is not `valid`. **This one is only
+   * ever called while the session is `authenticating`** — that is the entire window
+   * in which a challenge exists — so that guard would refuse every request that
+   * needed to be made.
+   *
+   * Authentication and CSRF still apply: they run in the `onRequest` hook above, so
+   * this route is unreachable without the session cookie and the `X-CSRF-Token`
+   * header, and the 403 for a missing token is the hook's, not a check re-done here.
+   *
+   * ## 202 means accepted, not correct
+   *
+   * The runner hands the code to the package and resolves the prompt. Whether the
+   * code was the right one is not knowable here — a wrong code surfaces as
+   * `login-failed` on the session's stream minutes later, which is the same path a
+   * wrong password takes and is the one that reports it.
+   */
+  app.post("/api/session/challenge/answer", async (request, reply) => {
+    const session = request.ctx.session;
+    if (session === null) {
+      return reply.code(401).send({ error: "unauthorised" });
+    }
+
+    const body = await parseJsonObject(request, 64 * 1024, ["code"]);
+    if (body === null) {
+      return reply.code(400).send({ error: "malformed request body" });
+    }
+
+    // The code is checked by shape and forwarded **unchanged**: no trimming, no
+    // normalisation. What the user typed is what the runner hands the package, for
+    // the same reason the credential is never altered — a transformation applied
+    // here is a value the user cannot inspect again once it has been handed over.
+    //
+    // Blank is refused rather than forwarded. A code of nothing but spaces would
+    // resolve the package's pending prompt with nothing, burning the user's one
+    // chance to answer and turning a typo into a login failure.
+    const code = asString(body.code);
+    if (code === undefined || code.trim() === "") {
+      return reply.code(400).send({ error: "code is required" });
+    }
+    // The same bound the runner applies, so a body this route calls valid is not
+    // refused there — and so a 400 always names the same limit on both sides.
+    if (code.length > MAX_CHALLENGE_CODE_CHARS) {
+      return reply.code(400).send({ error: "code is too long" });
+    }
+
+    if (deps.runner === undefined) {
+      return reply.code(501).send({ error: "challenge answering not wired yet" });
+    }
+
+    try {
+      await deps.runner.answerChallenge(session.guid, code);
+    } catch (error) {
+      // A transport failure, not a wrong code. The only failure this route can name
+      // honestly: the runner was not reached, refused the token, or had no prompt
+      // pending. Which of those it was is in the adapter's classification, and the
+      // user is told the one thing that is true in all of them — nothing is waiting
+      // any more — rather than "sign-in failed".
+      const failure = runnerFailure(error);
+      request.log.error(
+        { session: session.guid, failure: failure.kind, status: failure.status },
+        "challenge could not be answered",
+      );
+      return reply.code(failure.status).send({
+        error: failure.message,
+        reason: failure.kind,
+        retryable: failure.retryable,
+      });
+    }
+
+    // Published so a second tab does not keep showing an input for a prompt that is
+    // already answered. It says the code was **accepted**, not that it was right —
+    // only the login can know that, and it says so on this same stream.
+    deps.sse.emit(session.guid, "challenge-seen", {});
+
     return reply.code(202).send({ accepted: true });
   });
 

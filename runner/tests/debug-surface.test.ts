@@ -40,6 +40,7 @@ const ROUTE_TABLE = [
   ["GET", "/healthz"],
   ["GET", "/events"],
   ["POST", "/sessions/:guid/login"],
+  ["POST", "/sessions/:guid/mfa"],
   ["POST", "/sessions/:guid/notebooks"],
   ["POST", "/sessions/:guid/exports"],
   ["POST", "/sessions/:guid/exports/:id/abort"],

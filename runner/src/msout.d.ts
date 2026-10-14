@@ -55,6 +55,20 @@ declare module "@msout/microsoft-webauth" {
     authFilePath: string;
   }): Promise<{ authenticated: boolean; reason: string; detail: string }>;
 
+  /**
+   * Resolves a pending `promptUser` call with a code, for callers that receive the
+   * code out of band rather than on stdin.
+   *
+   * **Synchronous, and it returns whether it did anything.** `true` means a prompt
+   * was waiting and has been answered; `false` means none was — the challenge
+   * expired, or it was a push-approval that needs no code.
+   *
+   * That distinction is the whole reason this is declared to return a boolean rather
+   * than `void`: "the code was wrong" and "there was nothing to answer" are different
+   * answers to a user, and only the caller that asked can tell them apart.
+   */
+  export function answerChallenge(code: string): boolean;
+
   /** The frozen reason union. A caller asserts its mapping table against this. */
   export const LOGIN_REASONS: readonly string[];
   /** The frozen event-name union. */

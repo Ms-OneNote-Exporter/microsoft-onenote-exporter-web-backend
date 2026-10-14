@@ -319,4 +319,73 @@ describe("the event pump follows a session onto the runner it was rebound onto",
     adapter.stopAll();
     expect(await until(() => runner.openStreams === 0)).toBe(true);
   });
+
+  // #93, on this file's subject. A re-login after a failed one now claims a **new**
+  // container and releases the old one, so the session's address changes for a
+  // second reason: not a rebind of a signed-in session, but the stale container's
+  // release. The pump has one job either way — read the runner the session actually
+  // holds — so it is the same assertion with a different cause, and it is worth
+  // having separately: the claim and the release are two steps, and a pump that
+  // followed the first and not the second would go on reading a container that no
+  // longer exists.
+  it("moves the pump off a released container when a re-login claims another", async () => {
+    const stale = await countingRunner();
+    const fresh = await countingRunner();
+    const finished: ExportFinishedInput[] = [];
+
+    let address = stale.aliasUrl;
+    const adapter = new HttpRunnerAdapter({
+      addressFor: () => address,
+      token: TOKEN,
+      sse: fresh.sse,
+      onExportFinished: (input) => {
+        finished.push(input);
+      },
+      timeoutMs: 2_000,
+      fetchImpl: (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(typeof input === "string" ? input : input.toString());
+        if (url.hostname.startsWith("msout-runner-")) url.hostname = "127.0.0.1";
+        return fetch(url, init);
+      },
+    });
+
+    // The failed login ran on the stale container and opened a pump there.
+    stale.frames = [];
+    await adapter.listNotebooks(SESSION);
+    await adapter.drain();
+    expect(stale.eventStreamRequests).toBe(1);
+    const staleRequests = stale.eventStreamRequests;
+
+    // `releaseStaleRunner` freed it and the fresh claim named the other slot, which
+    // is what `sessions.runner_id` now holds.
+    address = fresh.aliasUrl;
+
+    fresh.frames = [exportDoneFrame()];
+    await adapter.startExport({
+      sessionId: SESSION,
+      exportId: "export-1",
+      notebook: "MS is great",
+      signal: new AbortController().signal,
+    });
+    await adapter.drain();
+
+    // The event came off the runner that is actually bound — the whole point.
+    expect(fresh.eventStreamRequests).toBe(1);
+    expect(finished).toHaveLength(1);
+    expect(finished[0]).toMatchObject({ sessionId: SESSION, partial: false });
+
+    // **The old stream was stopped, not forgotten**, and nothing re-opens against a
+    // container the session no longer holds. Asserted on the request count rather
+    // than on socket liveness, for the reason the test above gives: a close is
+    // delivered by the event loop, so a liveness assertion at this instant holds
+    // whether or not the pump was torn down. The count on `fresh` staying at 1 is
+    // the other half — one stream per session, never two.
+    await adapter.listNotebooks(SESSION);
+    await adapter.drain();
+    expect(stale.eventStreamRequests).toBe(staleRequests);
+    expect(fresh.eventStreamRequests).toBe(1);
+
+    adapter.stopAll();
+    expect(await until(() => fresh.openStreams === 0)).toBe(true);
+  });
 });

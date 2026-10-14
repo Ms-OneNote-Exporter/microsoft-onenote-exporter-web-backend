@@ -684,91 +684,150 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
     //
     // It runs *after* the framing checks above on purpose: a request that is
     // oversized, unframed or the wrong content type must not create a container.
-    if (session.runner_id === null) {
-      if (deps.poolBinder === undefined) {
-        // No pool manager wired, which is the unwired state. Honest, and the
-        // same 409 as before.
-        //
-        // The `cancelLogin` is not optional here: `beginLogin` has already written
-        // `authenticating`, and returning without undoing it would leave a session
-        // that reports "still signing in" to every route for `TTL.loginInProgress`
-        // when no credential was ever submitted. Every exit from below that is not a
-        // forwarded credential pays it, which is why it is a `finally` over the claim
-        // rather than a line in each `return`.
-        deps.db.cancelLogin(session.guid);
-        return reply.code(409).send({ error: "no runner bound to this session" });
-      }
+    //
+    // **Every login claims, not only a session that has no runner (#93).**
+    //
+    // This used to be `if (session.runner_id === null)`, and the guard was wrong in
+    // a way the rest of the file took care to document: a session whose *first*
+    // login failed still has `runner_id` set — nothing clears it until the
+    // sweeper's auth-failed branch, up to 30 seconds later — so the retry skipped
+    // the claim entirely and handed the password to the container the failed
+    // attempt ran in. A Chromium process whose cookie jar was just refuted, in a
+    // state this process cannot see, possibly already unwinding. The slot-budget
+    // floor went with it: it is checked inside the claim, so a retry could land on
+    // a container seconds from being recycled and the sign-in would die on its own
+    // with nothing in any log.
+    //
+    // Claiming unconditionally is what makes "a fresh container per login" true,
+    // and the old binding is then released below rather than reused.
+    const staleRunnerId = session.runner_id;
 
-      // **`cancelLogin` is compensation, not a second guard.** `beginLogin` claimed
-      // the login above so the claim could not be raced; this undoes that claim when
-      // no credential followed it. It is guarded on
-      // `auth_state = 'authenticating'`, so a login that *did* complete in the
-      // meantime is left alone.
-      let handedOver = false;
-      try {
-        const bound = await deps.poolBinder.claimForLogin(session);
-        if (bound.ok) {
-          handedOver = true;
-        } else {
-          // §2.6: name the cause rather than showing a countdown to a slot that
-          // will not move. "Every session is busy" and "the control plane cannot
-          // start runners" are different advice, and the user cannot tell them apart.
-          //
-          // Four outcomes now, and `retryable` is the honest answer for each:
-          //
-          //   busy             -> wait; a slot frees up
-          //   pool cannot fill -> wait does NOT help; something is misconfigured
-          //   control plane unreachable -> transient, retry
-          //   slot conflict    -> this process and the orchestrator disagree about the
-          //                       pool, which is an operator problem, not a user's
-          request.log.info(
-            { reason: bound.reason, fillError: bound.fillError ?? null },
-            "runner claim failed",
-          );
-          const cannotFill = bound.reason === "pool-exhausted" && bound.fillError !== undefined;
-          // A conflict means every slot this process offered was refused, after the
-          // retries. It is **not** unreachability: the orchestrator answered, clearly, and
-          // the answer was "no". Reporting it as an unreachable control plane told the
-          // user to retry a login that could not succeed, and told whoever read the log
-          // that a component was down while it was answering a 409 in milliseconds.
-          //
-          // Reported as 409 rather than 5xx because nothing about a retry fixes it. The
-          // pool has to be reconciled, and that is the api's problem to resolve — see
-          // `claimForLogin`'s retry, which handles the drift case, and the boot fix in
-          // the orchestrator that removes the cause.
-          if (bound.reason === "slot-conflict") {
-            return reply.code(409).send({
-              error: "the service's view of its runner pool is out of date",
-              retryable: false,
-              cause: "pool-diverged",
-            });
-          }
-          const slotExpiring = bound.reason === "slot-expiring";
-          return reply
-            .code(bound.reason === "pool-exhausted" || slotExpiring ? 503 : 502)
-            .send({
-              error: cannotFill
-                ? "the service cannot start a browser right now"
-                : bound.reason === "pool-exhausted" || slotExpiring
-                  ? "every session is busy"
-                  : "runner control plane unreachable",
-              // Still retryable: a misconfiguration gets fixed and the pool refills.
-              // But a client that has been told "busy" and is still failing after a
-              // few attempts now has something to escalate with.
-              retryable: true,
-              ...(cannotFill
-                ? { cause: "pool-unfillable" }
-                : slotExpiring
-                  ? { cause: "slot-expiring" }
-                  : {}),
-            });
+    if (deps.poolBinder === undefined) {
+      // No pool manager wired, which is the unwired state. Honest, and the same
+      // 409 as before.
+      //
+      // **Above the claim, and above every use of `poolBinder`**, because the claim
+      // is now unconditional. Inside a `runner_id === null` arm it was only reached
+      // by a session with no runner; a session that had one would have walked past
+      // it and forwarded a credential to a container nothing can release.
+      //
+      // The `cancelLogin` is not optional here: `beginLogin` has already written
+      // `authenticating`, and returning without undoing it would leave a session
+      // that reports "still signing in" to every route for `TTL.loginInProgress`
+      // when no credential was ever submitted. Every exit from below that is not a
+      // forwarded credential pays it, which is why it is a `finally` over the claim
+      // rather than a line in each `return`.
+      //
+      // The cap is created and destroyed here for the same reason it is on the 501
+      // and the 409 paths above: §4.7 lists "capStream created even on the refusal
+      // path" as load-bearing, and a caller who understates `Content-Length` and
+      // sends 4 MB must still be cut off at 4 KB when the answer is a 409.
+      capStream(request.body as Readable, MAX_CREDENTIAL_BYTES).destroy();
+      deps.db.cancelLogin(session.guid);
+      return reply.code(409).send({ error: "no runner bound to this session" });
+    }
+
+    // **`cancelLogin` is compensation, not a second guard.** `beginLogin` claimed
+    // the login above so the claim could not be raced; this undoes that claim when
+    // no credential followed it. It is guarded on
+    // `auth_state = 'authenticating'`, so a login that *did* complete in the
+    // meantime is left alone.
+    let handedOver = false;
+    try {
+      const bound = await deps.poolBinder.claimForLogin(session);
+      if (bound.ok) {
+        handedOver = true;
+      } else {
+        // §2.6: name the cause rather than showing a countdown to a slot that
+        // will not move. "Every session is busy" and "the control plane cannot
+        // start runners" are different advice, and the user cannot tell them apart.
+        //
+        // Four outcomes now, and `retryable` is the honest answer for each:
+        //
+        //   busy             -> wait; a slot frees up
+        //   pool cannot fill -> wait does NOT help; something is misconfigured
+        //   control plane unreachable -> transient, retry
+        //   slot conflict    -> this process and the orchestrator disagree about the
+        //                       pool, which is an operator problem, not a user's
+        request.log.info(
+          { reason: bound.reason, fillError: bound.fillError ?? null },
+          "runner claim failed",
+        );
+        const cannotFill = bound.reason === "pool-exhausted" && bound.fillError !== undefined;
+        // A conflict means every slot this process offered was refused, after the
+        // retries. It is **not** unreachability: the orchestrator answered, clearly, and
+        // the answer was "no". Reporting it as an unreachable control plane told the
+        // user to retry a login that could not succeed, and told whoever read the log
+        // that a component was down while it was answering a 409 in milliseconds.
+        //
+        // Reported as 409 rather than 5xx because nothing about a retry fixes it. The
+        // pool has to be reconciled, and that is the api's problem to resolve — see
+        // `claimForLogin`'s retry, which handles the drift case, and the boot fix in
+        // the orchestrator that removes the cause.
+        if (bound.reason === "slot-conflict") {
+          return reply.code(409).send({
+            error: "the service's view of its runner pool is out of date",
+            retryable: false,
+            cause: "pool-diverged",
+          });
         }
-      } finally {
-        // Every refusal above returns from inside this `try`, so the `finally` is
-        // the only thing that covers all of them — and it must not be a line copied
-        // into each one, because the next refusal added would forget it. That is the
-        // whole reason this is a `try/finally` around the claim.
-        if (!handedOver) deps.db.cancelLogin(session.guid);
+        const slotExpiring = bound.reason === "slot-expiring";
+        return reply
+          .code(bound.reason === "pool-exhausted" || slotExpiring ? 503 : 502)
+          .send({
+            error: cannotFill
+              ? "the service cannot start a browser right now"
+              : bound.reason === "pool-exhausted" || slotExpiring
+                ? "every session is busy"
+                : "runner control plane unreachable",
+            // Still retryable: a misconfiguration gets fixed and the pool refills.
+            // But a client that has been told "busy" and is still failing after a
+            // few attempts now has something to escalate with.
+            retryable: true,
+            ...(cannotFill
+              ? { cause: "pool-unfillable" }
+              : slotExpiring
+                ? { cause: "slot-expiring" }
+                : {}),
+          });
+      }
+    } finally {
+      // Every refusal above returns from inside this `try`, so the `finally` is
+      // the only thing that covers all of them — and it must not be a line copied
+      // into each one, because the next refusal added would forget it. That is the
+      // whole reason this is a `try/finally` around the claim.
+      if (!handedOver) deps.db.cancelLogin(session.guid);
+    }
+
+    // **The old container is released here, after the claim — never before.**
+    //
+    // Reversing it is the tempting simplification and it is wrong: releasing first
+    // opens a window in which the session holds *no* container, and if the claim
+    // then fails — pool exhausted, orchestrator unreachable, slot conflict — the
+    // user is worse off than before the request, with the binding that was there a
+    // moment ago destroyed and nothing put back. Claim-first means the stale
+    // container is released only once a better one exists, and a failed claim
+    // leaves the old one untouched.
+    //
+    // In the other direction the window is harmless by construction: the claim has
+    // already written `sessions.runner_id` with the new slot, so the stale
+    // container is referenced by nothing `runner_id` can reach. That is also why
+    // the release cannot dispossess the new binding — `releaseStaleRunner` guards
+    // its session write on the id it was given, which by now no longer matches.
+    //
+    // **A failed release is logged, not fatal.** The login has already succeeded
+    // from the user's point of view — a working container exists and the
+    // credential is about to be handed to it — so the only cost of a failed
+    // release is a container nothing points at, which the sweeper's orphan branch
+    // reclaims on its next tick. Answering 503 here would tell a user whose sign-in
+    // is in progress that it failed.
+    if (handedOver && staleRunnerId !== null) {
+      const released = await deps.poolBinder.releaseStaleRunner(session.guid, staleRunnerId);
+      if (!released) {
+        request.log.info(
+          { session: session.guid, runner: staleRunnerId },
+          "stale runner not released; continuing with the fresh claim",
+        );
       }
     }
 

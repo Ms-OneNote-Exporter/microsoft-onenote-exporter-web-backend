@@ -575,6 +575,97 @@ describe("reconcileRunners", () => {
   });
 });
 
+/**
+ * releaseRunner's guard, and the return value it needs to be a guard at all.
+ *
+ * §4.9's dual-reconciler mechanism: two processes keep independent records of the
+ * same pool, and every write that a stale snapshot could make destructive carries
+ * the value it read as a predicate. `runners.session_guid` is the half of the
+ * binding the caller *didn't* read in a lot of places, which is why it is the one
+ * the predicate tests.
+ */
+describe("releaseRunner", () => {
+  const OTHER = "00000000-0000-0000-0000-000000000000";
+
+  beforeEach(() => {
+    db.registerRunner("slot-1", "c1", "claimed");
+    db.run(`UPDATE runners SET session_guid = ? WHERE id = 'slot-1'`, GUID);
+  });
+
+  const row = () => db.get<{ status: string; session_guid: string | null }>(
+    `SELECT status, session_guid FROM runners WHERE id = 'slot-1'`,
+  );
+
+  it("frees the row and reports one change when the session is the one it read", () => {
+    // The positive case, and the reason `1` is worth returning: a caller that has
+    // just destroyed a container needs to distinguish "the row is free" from "the
+    // row was not mine", and `void` threw that away.
+    expect(db.releaseRunner("slot-1", GUID)).toBe(1);
+    expect(row()).toEqual({ status: "idle", session_guid: null });
+  });
+
+  it("changes nothing and reports no change when the row names another session", () => {
+    // The guard's whole job. A slot re-bound between a caller's read and its write
+    // belongs to somebody else now; clearing it hands a container another session
+    // is using back to the pool while that session still believes it has one.
+    expect(db.releaseRunner("slot-1", OTHER)).toBe(0);
+    // Byte-for-byte unchanged, not merely "still bound somewhere".
+    expect(row()).toEqual({ status: "claimed", session_guid: GUID });
+  });
+
+  it("stays unconditional without the parameter, so existing callers are unaffected", () => {
+    // Backward compatibility is the reason the parameter is optional rather than
+    // required. `reclaimOrphanBindings` must stay unguarded (F6) — its own predicate
+    // is a `session_guid` with no session row, so a guard could never match — and a
+    // required parameter would have made that a compile error instead of a
+    // documented decision.
+    expect(db.releaseRunner("slot-1")).toBe(1);
+    expect(row()).toEqual({ status: "idle", session_guid: null });
+
+    // ...and it really is unguarded: a row bound to *any* session is freed, which is
+    // the behaviour the unguarded call sites depend on.
+    db.registerRunner("slot-1", "c1", "claimed");
+    db.run(`UPDATE runners SET session_guid = ? WHERE id = 'slot-1'`, OTHER);
+    expect(db.releaseRunner("slot-1")).toBe(1);
+    expect(row()).toEqual({ status: "idle", session_guid: null });
+  });
+
+  it("reports zero for a slot that does not exist, rather than throwing", () => {
+    // A stale id is an ordinary outcome of a re-read — the row was deleted by the
+    // boot reconciler — and it must read as "nothing to free" for the same reason
+    // the guarded mismatch does.
+    expect(db.releaseRunner("slot-9", GUID)).toBe(0);
+  });
+});
+
+/**
+ * clearSessionRunner's guard (F8).
+ *
+ * The same §4.9 predicate one level up: the sweeper's dead-runner repair works from
+ * a tick-old snapshot, and an unguarded `WHERE guid = ?` clears whatever the column
+ * holds *now* — including a live binding a re-login landed in the meantime.
+ */
+describe("clearSessionRunner", () => {
+  it("clears the binding it was given the id for", () => {
+    seedSession(GUID, { runner_id: "slot-1" });
+    expect(db.clearSessionRunner(GUID, "slot-1")).toBe(1);
+    expect(db.getSession(GUID)?.runner_id).toBeNull();
+  });
+
+  it("leaves a binding that has already moved on alone", () => {
+    // The sweeper decided about slot-1; a re-login then claimed slot-2 and wrote
+    // it. The unguarded form would clear *that* — handing a working container away
+    // from a session in the middle of a sign-in, which no reconciler can repair
+    // because both records are then consistent and both wrong.
+    //
+    // The change count is what tells the caller its unstick did not happen, and
+    // `markExportStranded`'s `runner_id IS NULL` guard is meaningless without it.
+    seedSession(GUID, { runner_id: "slot-2" });
+    expect(db.clearSessionRunner(GUID, "slot-1")).toBe(0);
+    expect(db.getSession(GUID)?.runner_id).toBe("slot-2");
+  });
+});
+
 describe("transactions", () => {
   it("commits on success", () => {
     db.transaction(() => {

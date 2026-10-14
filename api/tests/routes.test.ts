@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance } from "fastify";
+import type { Readable } from "node:stream";
 
 import { buildServer, type ServerDeps } from "../src/server.js";
 import { ApiConfig } from "../src/config.js";
@@ -12,8 +13,44 @@ import { deriveCsrfToken, generateCsrfKey, hashSecret } from "../src/session.js"
 import { RunnerCallError } from "../src/runner-adapter-http.js";
 import type { RunnerAdapter } from "../src/runner-adapter.js";
 import { PoolBinder, syncPool } from "../src/sweep.js";
+import { MAX_CREDENTIAL_BYTES } from "../src/credential.js";
 import { FakeOrchestrator } from "../mock/fake-orchestrator.js";
 import { derive, parseSetCookies } from "./helpers.js";
+
+/**
+ * What `capStream` handed back, and whether the route destroyed it.
+ *
+ * §4.7 makes "capStream created even on the refusal path" load-bearing, and the
+ * `.destroy()` is the half that actually stops a transfer — a refusal returns
+ * without reading a byte, so nothing else would.
+ *
+ * `app.inject` cannot observe it: it destroys whatever payload it was handed once
+ * the response is written, so `request.body.destroyed` is true whether the route
+ * destroyed it or never looked at it, and an assertion on it passes for the wrong
+ * reason either way. Wrapping `capStream` records the call the *route* makes, which
+ * is the thing under test. `importOriginal` keeps every other export real, and the
+ * wrapper returns the unmodified stream, so nothing else in this file sees a
+ * difference.
+ */
+const capRecords: { limit: number; destroyed: boolean }[] = [];
+
+vi.mock("../src/credential.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/credential.js")>();
+  return {
+    ...actual,
+    capStream: (source: Readable, limit?: number) => {
+      const stream = actual.capStream(source, limit);
+      const record = { limit: limit ?? actual.MAX_CREDENTIAL_BYTES, destroyed: false };
+      capRecords.push(record);
+      const destroy = stream.destroy.bind(stream);
+      stream.destroy = (...args: Parameters<typeof destroy>) => {
+        record.destroyed = true;
+        return destroy(...args);
+      };
+      return stream;
+    },
+  };
+});
 
 /**
  * The route surface, exercised over HTTP. Three groups of concern:
@@ -80,13 +117,29 @@ function seed(guid = GUID, opts: { state?: string; runnerId?: string | null; aut
     now: Date.now(),
     expiresAt: Date.now() + TTL,
   });
+  const runnerId = opts.runnerId === undefined ? "slot-1" : opts.runnerId;
   db.run(
     `UPDATE sessions SET state = ?, runner_id = ?, auth_state = ? WHERE guid = ?`,
     opts.state ?? "authenticated",
-    opts.runnerId === undefined ? "slot-1" : opts.runnerId,
+    runnerId,
     opts.auth ?? "valid",
     guid,
   );
+  // **The pool row is seeded with the session row, not after it (F3).**
+  //
+  // `sessions.runner_id` is only half a binding; `runners.session_guid` is the
+  // other half, and everything downstream reads both. Seeding one without the
+  // other produced a state the process cannot be in — a session naming a slot that
+  // names nobody — which made #93's release a no-op in every fixture that wanted to
+  // test it, and would have left `releaseStaleRunner`'s guarded `releaseRunner`
+  // matching nothing while the test still read as a pass.
+  //
+  // `syncPool` (the harness's own call) registers the row as `idle` with a NULL
+  // guid, so this overwrites rather than skips.
+  if (runnerId !== null) {
+    db.registerRunner(runnerId, `ctr-${runnerId}`, "claimed");
+    db.run(`UPDATE runners SET session_guid = ? WHERE id = ?`, guid, runnerId);
+  }
 }
 
 function cookieHeader(guid = GUID, secret = SECRET): string {
@@ -915,6 +968,339 @@ describe("POST /api/session/credential claims the login atomically", () => {
     } finally {
       await app.close();
     }
+  });
+
+  // **Same refusal, for a session that already has a runner** — which it did not
+  // reach before #93. The `poolBinder === undefined` check used to sit inside
+  // `if (session.runner_id === null)`, so a bound session walked straight past it
+  // and handed its password to a container that nothing in the process can release,
+  // keep warm or account for. Moving the check above every use of `poolBinder` is
+  // what makes the unwired state answer honestly in both shapes.
+  it("refuses a bound session too when no pool binder is wired", async () => {
+    seed(GUID, { runnerId: "slot-1", auth: "none" });
+    const h = harness();
+    const app = buildServer(config, {
+      ...h.deps,
+      poolBinder: undefined,
+    } as ServerDeps);
+    await app.ready();
+    try {
+      const response = await submit(h.deps, app);
+
+      expect(response.statusCode).toBe(409);
+      expect(response.json().error).toBe("no runner bound to this session");
+      // Not forwarded: there is no pool manager, so there is no container this
+      // process could create, account for, or reclaim.
+      expect(h.submitCredential).not.toHaveBeenCalled();
+      expect(h.claimForLogin).not.toHaveBeenCalled();
+      // The compensation still runs. `beginLogin` wrote `authenticating` above, and
+      // a session left claiming to be signing in for 15 minutes when no credential
+      // was ever submitted is the exact state this route refuses to create.
+      expect(db.getSession(GUID)?.auth_state).toBe("none");
+      // ...and the binding it arrived with is untouched, because this refusal reads
+      // the row rather than writing it.
+      expect(db.getSession(GUID)?.runner_id).toBe("slot-1");
+    } finally {
+      await app.close();
+    }
+  });
+
+  // F9: §4.7 lists "capStream created even on the refusal path" as load-bearing, and
+  // a caller who understates `Content-Length` and sends 4 MB must be cut off at 4 KB
+  // *whatever the answer is*. `.destroy()` is what stops the transfer: the handler
+  // is returning without reading a byte, so nothing else would.
+  //
+  // Observable through the stream `capStream` hands back, which is why that module is
+  // wrapped rather than asserted through the socket: `app.inject` destroys whatever
+  // payload it was handed once the response is written, so `destroyed` on the request
+  // body is true either way and cannot tell the two paths apart. The wrapper records
+  // the call the *route* makes, which is the thing under test.
+  it("destroys the capped body on the no-pool-binder refusal (F9)", async () => {
+    seed(GUID, { runnerId: "slot-1", auth: "none" });
+    const h = harness();
+    capRecords.length = 0;
+    const app = buildServer(config, {
+      ...h.deps,
+      poolBinder: undefined,
+    } as ServerDeps);
+    await app.ready();
+    try {
+      const response = await submit(h.deps, app);
+
+      expect(response.statusCode).toBe(409);
+      // Created — §4.7's "even on the refusal path" is about creation, not about
+      // destroying, and a path that skipped both would pass a status-only assertion.
+      expect(capRecords).toHaveLength(1);
+      expect(capRecords[0]!.limit).toBe(MAX_CREDENTIAL_BYTES);
+      expect(capRecords[0]!.destroyed).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+// ---- #93: a login always claims a fresh container ---------------------------
+
+/**
+ * Re-login after a failure, which is where the old `if (session.runner_id === null)`
+ * skipped the claim entirely.
+ *
+ * The shape every test here sets up is the same one: a session bound to `slot-1`
+ * whose previous login **failed**, plus a fake orchestrator that agrees slot-1 is
+ * really bound to it. Both halves matter — the SQLite row without the orchestrator's
+ * binding would let the claim hand back the very slot under test, and the
+ * orchestrator's binding without the row would leave nothing to release.
+ */
+describe("POST /api/session/credential claims a fresh container on every login", () => {
+  function harness() {
+    const orchestrator = new FakeOrchestrator({ size: 2 });
+    syncPool(db, orchestrator.slotIds());
+    const binder = new PoolBinder({ db, orchestrator, sse, now: () => Date.now() });
+
+    const submitCredential = vi.fn().mockResolvedValue(undefined);
+    const runner: RunnerAdapter = {
+      submitCredential,
+      listNotebooks: vi.fn().mockResolvedValue(undefined),
+      startExport: vi.fn().mockResolvedValue(undefined),
+      publishArtifact: vi.fn().mockResolvedValue(undefined),
+      abortExport: vi.fn().mockResolvedValue(undefined),
+      answerChallenge: vi.fn().mockResolvedValue(undefined),
+    };
+
+    return {
+      orchestrator,
+      binder,
+      claimForLogin: vi.spyOn(binder, "claimForLogin"),
+      releaseStaleRunner: vi.spyOn(binder, "releaseStaleRunner"),
+      submitCredential,
+      emit: vi.spyOn(sse, "emit"),
+      deps: { db, sse, limiter, orchestrator, runner, poolBinder: binder } as ServerDeps,
+    };
+  }
+
+  /**
+   * The container the failed login ran in, recorded on **both** sides.
+   *
+   * Both, because the binding has two halves and a fixture that seeds one produces
+   * a state the process cannot be in. Without the orchestrator's half the claim
+   * hands back slot-1 and there is nothing to observe; without SQLite's half there
+   * is no row to release and the session's binding is a fiction.
+   *
+   * Returns the container id, which is the discriminator every assertion below is
+   * built on.
+   */
+  async function occupy(orchestrator: FakeOrchestrator): Promise<string> {
+    const claimed = await orchestrator.claim(GUID, new Date(Date.now() + TTL));
+    if (!claimed.ok) throw new Error("fixture: the fake pool could not bind slot-1");
+    db.run(
+      `UPDATE runners SET status = 'active', container_id = ? WHERE id = ?`,
+      claimed.value.containerId,
+      claimed.value.slotId,
+    );
+    return claimed.value.containerId;
+  }
+
+  const boundRunner = () =>
+    db.get<{ runner_id: string }>(`SELECT runner_id FROM sessions WHERE guid = ?`, GUID)?.runner_id;
+
+  const containerOf = (slot: string | null) =>
+    slot === null
+      ? null
+      : db.get<{ container_id: string }>(`SELECT container_id FROM runners WHERE id = ?`, slot)
+          ?.container_id;
+
+  async function post(deps: ServerDeps) {
+    const app = buildServer(config, deps);
+    await app.ready();
+    try {
+      return await app.inject({
+        method: "POST",
+        url: "/api/session/credential",
+        headers: {
+          "content-type": "text/plain",
+          "x-microsoft-account": ACCOUNT,
+          cookie: cookieHeader(),
+          origin: ALLOWED,
+          "x-csrf-token": derive(csrfKey, GUID),
+        },
+        payload: "hunter2",
+      });
+    } finally {
+      await app.close();
+    }
+  }
+
+  // The whole of #93, in one assertion. Before this, `session.runner_id` was
+  // non-null, so `claimForLogin` was skipped: no second container, no slot-budget
+  // check, and the password went to the Chromium process whose cookie jar had just
+  // been refuted.
+  //
+  // **`containerId`, not `slotId`, is the discriminator** — deliberately both, even
+  // though the named-slot contract alone would separate them. A slot id only says
+  // which *position* was drawn; what #93 is about is that the thing answering holds
+  // a process nobody has inspected since a rejected password, so the assertion that
+  // matters is that the container identity is new. Reverting the claim to reuse the
+  // old binding leaves both facts wrong in a way that only one of these catches.
+  it("claims a fresh container and releases the one the failed login ran in", async () => {
+    const h = harness();
+    seed(GUID, { state: "authenticating", auth: "failed", runnerId: "slot-1" });
+    const staleContainerId = await occupy(h.orchestrator);
+
+    const response = await post(h.deps);
+
+    expect(response.statusCode).toBe(202);
+    // The claim that used to be skipped.
+    expect(h.claimForLogin).toHaveBeenCalledTimes(1);
+    expect(h.releaseStaleRunner).toHaveBeenCalledWith(GUID, "slot-1");
+    expect(h.submitCredential).toHaveBeenCalledTimes(1);
+
+    // A different container, on a different slot, and it is the one now bound.
+    const now = boundRunner();
+    expect(now).not.toBe("slot-1");
+    expect(containerOf(now)).toBeTruthy();
+    expect(containerOf(now)).not.toBe(staleContainerId);
+
+    // ...and the stale slot is free on *both* sides. A release that only moved the
+    // SQLite row would leave the orchestrator holding the container, which is the
+    // §0.9.10 lockout one field over.
+    expect(
+      db.get<{ status: string; session_guid: string | null }>(
+        `SELECT status, session_guid FROM runners WHERE id = 'slot-1'`,
+      ),
+    ).toEqual({ status: "idle", session_guid: null });
+  });
+
+  // **Claim first, release second (F2).** The order is the safety property: release
+  // first and a claim that then fails has destroyed a working binding and put
+  // nothing back. This drives exactly that sequence — the pool is full, so the claim
+  // cannot succeed — and asserts the old container is still there afterwards.
+  it("keeps the old container when the fresh claim fails", async () => {
+    seed(GUID, { state: "authenticating", auth: "failed", runnerId: "slot-1" });
+    const h = harness();
+    const staleContainerId = await occupy(h.orchestrator);
+    // Fill the other slot with somebody else, on **both** sides, so the draw really
+    // is empty. A fake-only binding would be a disagreement this process would
+    // repair rather than a pool that is full, and the test would then be asserting
+    // the repair's answer rather than the claim's.
+    const other = await h.orchestrator.claim(OTHER_GUID, new Date(Date.now() + TTL));
+    if (!other.ok) throw new Error("fixture: the fake pool could not fill slot-2");
+    db.run(
+      `UPDATE runners SET status = 'active', container_id = ?, session_guid = ? WHERE id = ?`,
+      other.value.containerId,
+      OTHER_GUID,
+      other.value.slotId,
+    );
+
+    const response = await post(h.deps);
+
+    expect(response.statusCode).toBe(503);
+    // Nothing was released on the way to failing.
+    expect(h.releaseStaleRunner).not.toHaveBeenCalled();
+    expect(h.submitCredential).not.toHaveBeenCalled();
+    // The session is left exactly as it was bound: a broken container it can still
+    // be retried on, and no slot freed on the orchestrator's side for nothing.
+    expect(boundRunner()).toBe("slot-1");
+    expect(containerOf("slot-1")).toBe(staleContainerId);
+  });
+
+  // The same order, seen from the other side: a release that fails is logged and the
+  // login still succeeds. By the time it runs a working container exists and the
+  // credential is about to reach it, so refusing here would report a sign-in as
+  // failed that has not.
+  it("keeps the fresh login when the stale release fails", async () => {
+    seed(GUID, { state: "authenticating", auth: "failed", runnerId: "slot-1" });
+    const h = harness();
+    await occupy(h.orchestrator);
+    vi.spyOn(h.orchestrator, "release").mockResolvedValue({
+      ok: false,
+      error: { kind: "unreachable" },
+    } as never);
+
+    const response = await post(h.deps);
+
+    expect(response.statusCode).toBe(202);
+    expect(h.submitCredential).toHaveBeenCalledTimes(1);
+    // Bound to the new container. The failed release cost a container nothing
+    // points at, which the sweeper's orphan branch reclaims — it did not cost the
+    // session its runner, and it did not become the user's problem.
+    expect(boundRunner()).not.toBe("slot-1");
+    expect(containerOf(boundRunner())).toBeTruthy();
+  });
+
+  // The §4.7 guard at routes.ts:633, which runs *above* everything in this file's
+  // subject. A session that is already signed in must not have its runner replaced
+  // however healthy it is — the credential route is not a rebind, and
+  // `claimBindingWrite("login")` would write `auth_state = 'authenticating'` over a
+  // `valid` account and push a signed-in user back to the sign-in form.
+  it("leaves a session that is already signed in completely alone", async () => {
+    seed(GUID, { state: "authenticated", auth: "valid", runnerId: "slot-1" });
+    const h = harness();
+    const liveContainerId = await occupy(h.orchestrator);
+
+    const response = await post(h.deps);
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ reason: "already-authenticated", retryable: false });
+    expect(h.claimForLogin).not.toHaveBeenCalled();
+    expect(h.releaseStaleRunner).not.toHaveBeenCalled();
+    expect(h.submitCredential).not.toHaveBeenCalled();
+    expect(boundRunner()).toBe("slot-1");
+    expect(containerOf("slot-1")).toBe(liveContainerId);
+  });
+
+  // The atomic claim, re-asked for the shape that #93 changed. The existing
+  // double-submit test seeds `runnerId: null` — one session, one free slot, the
+  // easy case. This is the one that regressed: with a container already bound, a
+  // second submit that got past the snapshot guard used to forward the password
+  // straight into the first one's login.
+  it("forwards the credential once when two submits race on a bound session", async () => {
+    seed(GUID, { state: "authenticating", auth: "failed", runnerId: "slot-1" });
+    const h = harness();
+    await occupy(h.orchestrator);
+    const app = buildServer(config, h.deps);
+    await app.ready();
+    try {
+      const submitHere = () =>
+        app.inject({
+          method: "POST",
+          url: "/api/session/credential",
+          headers: {
+            "content-type": "text/plain",
+            "x-microsoft-account": ACCOUNT,
+            cookie: cookieHeader(),
+            origin: ALLOWED,
+            "x-csrf-token": derive(csrfKey, GUID),
+          },
+          payload: "hunter2",
+        });
+      const [first, second] = await Promise.all([submitHere(), submitHere()]);
+
+      expect([first, second].filter((r) => r.statusCode === 202)).toHaveLength(1);
+      expect([first, second].filter((r) => r.statusCode === 409)).toHaveLength(1);
+      expect(h.submitCredential).toHaveBeenCalledTimes(1);
+      // One claim, and therefore one release. Two would be two containers created
+      // for one session, with the second unreferenced the moment it was made.
+      expect(h.claimForLogin).toHaveBeenCalledTimes(1);
+      expect(h.releaseStaleRunner).toHaveBeenCalledTimes(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  // A first login has no stale runner, so the release must not run at all. Asserted
+  // because "release the runner this session was on" reads fine as a description of
+  // something that would happily release a *different* session's slot if it were
+  // reached — and the guard for that is the branch, not the callee.
+  it("releases nothing on a first login, because there is nothing stale", async () => {
+    seed(GUID, { runnerId: null, auth: "none" });
+    const h = harness();
+
+    const response = await post(h.deps);
+
+    expect(response.statusCode).toBe(202);
+    expect(h.claimForLogin).toHaveBeenCalledTimes(1);
+    expect(h.releaseStaleRunner).not.toHaveBeenCalled();
+    expect(boundRunner()).not.toBeNull();
   });
 });
 

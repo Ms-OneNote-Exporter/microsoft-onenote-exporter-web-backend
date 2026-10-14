@@ -58,9 +58,16 @@ let db: Db;
 let runner: MockRunner;
 let csrfKey: string;
 let app: Awaited<ReturnType<typeof build>>;
+/**
+ * The fake pool the running server is bound to.
+ *
+ * Module-level only so the verbatim loop below can put a slot back the way the
+ * sweeper does between two first submits. See that reset for why it has to.
+ */
+let orchestrator: FakeOrchestrator;
 
 async function build() {
-  const orchestrator = new FakeOrchestrator({ size: 1 });
+  orchestrator = new FakeOrchestrator({ size: 1 });
   syncPool(db, orchestrator.slotIds());
   const sse = new SseHub({ now: () => Date.now() });
   const instance = buildServer(config, {
@@ -206,8 +213,17 @@ describe("the account on the credential route", () => {
       // so without this reset iterations two to five answer 409 and the loop stops
       // testing byte equality at all. It is five different account spellings, not
       // five sign-ins, that is the subject here.
+      //
+      // The **slot** goes back too, since #93: every login claims a container of its
+      // own rather than reusing whatever `runner_id` names, so "a first submit"
+      // means unbound on both sides. Without this, iteration two is a re-login that
+      // asks a one-slot pool for a second slot, gets `every session is busy`, and
+      // the loop stops testing what it says it tests. The reset is the sweeper's
+      // `releaseForIdle`, performed by hand because this fixture runs no sweeper.
+      await orchestrator.release("slot-1");
+      db.run(`UPDATE runners SET status = 'idle', session_guid = NULL`);
       db.run(
-        `UPDATE sessions SET state = 'created', auth_state = 'none' WHERE guid = ?`,
+        `UPDATE sessions SET state = 'created', auth_state = 'none', runner_id = NULL WHERE guid = ?`,
         GUID,
       );
       const response = await app.inject({

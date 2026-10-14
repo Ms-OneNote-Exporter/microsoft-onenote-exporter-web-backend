@@ -538,8 +538,29 @@ export class PoolBinder {
     mode: ClaimMode,
     excluded: Set<string>,
   ): Promise<ClaimResult> {
+    // **The row `claimRunner` just drew, and `status = 'claimed'` is what makes it
+    // that row rather than another one.**
+    //
+    // This used to read `WHERE session_guid = ?` alone, which assumed one row per
+    // session. #93 broke the assumption: a re-login claims a *second* slot while the
+    // previous one is still bound, and the stale release runs afterwards. For that
+    // window **two** `runners` rows carry the same `session_guid` — the stale one,
+    // left `active` by the last claim, and the one `claimRunner` has just moved to
+    // `claimed`.
+    //
+    // Unguarded, this could hand back the stale row. The orchestrator then answers
+    // with *that* slot, `claimBindingWrite` writes it, and the caller believes the
+    // claim took a fresh container — while the session is still pointed at the one it
+    // was about to release. The release then matches its own guard, tears down the
+    // container the credential is being forwarded to, and leaves a signed-in-looking
+    // session with no runner at all.
+    //
+    // `claimRunner` sets `status = 'claimed'` and nothing else does until this
+    // method's own writes below, so the predicate is exactly "the draw this request
+    // made". The claim failure path already treats a missing row as unreachable
+    // rather than assuming it, and that check is kept.
     const claimed = this.#db.get<{ id: string }>(
-      `SELECT id FROM runners WHERE session_guid = ?`,
+      `SELECT id FROM runners WHERE session_guid = ? AND status = 'claimed'`,
       session.guid,
     );
     if (claimed === undefined) {
@@ -794,6 +815,23 @@ export class PoolBinder {
    *
    * The session row is deliberately kept. Deleting it would log the user out
    * every time their runner idles, which is the opposite of what the TTL is for.
+   *
+   * ## Why the session UPDATE is guarded on `runner_id` (§4.9)
+   *
+   * Every release here works from a **snapshot**: `sweep` reads all sessions at
+   * the top of the tick and walks that list, with an `/release` round trip — tens
+   * of milliseconds, and up to ~57 s of container teardown — between deciding to
+   * release and writing the row. In that window a re-login can land a *live*
+   * binding on the same row.
+   *
+   * `WHERE guid = ?` alone would then clear that live binding: a session that has
+   * just been handed a working container loses it, and the pool hands the slot to
+   * somebody else. The symptom is a login that reports success and then answers
+   * `no runner` for the rest of its life.
+   *
+   * `AND runner_id = ?` makes the write idempotent against an aged snapshot. `0`
+   * rows changed means "this is no longer the binding I was asked to release",
+   * which is the correct answer — and the row it would have clobbered stays.
    */
   async releaseForIdle(session: SessionRow): Promise<boolean> {
     if (session.runner_id === null) return false;
@@ -816,9 +854,10 @@ export class PoolBinder {
       `UPDATE sessions SET runner_id = NULL, state = 'authenticated',
                           auth_state = CASE WHEN auth_state = 'authenticating' THEN 'valid' ELSE auth_state END,
                           idle_expires_at = ?
-        WHERE guid = ?`,
+        WHERE guid = ? AND runner_id = ?`,
       this.#now() + TTL.authenticatedIdle,
       session.guid,
+      session.runner_id,
     );
     this.#log.info("runner released, session retained", {
       session: session.guid,
@@ -857,6 +896,20 @@ export class PoolBinder {
    * later, because it is guarded on `state` (which `markAuthFailed` does not
    * change) rather than on `auth_state`. So the release was **late, not
    * missing** — and this fix simply makes it immediate.
+   *
+   * ## Why the session UPDATE is guarded on `runner_id` (§4.9)
+   *
+   * Same reason as `releaseForIdle`, and the window is wider here rather than
+   * narrower: the snapshot is the tick's `SELECT * FROM sessions`, the `/release`
+   * is a round trip, and between them a user who was shown the sign-in form can
+   * submit a credential — which claims a fresh container and rewrites
+   * `runner_id`. An unguarded `WHERE guid = ?` would then erase that fresh
+   * binding, leaving a container running, a slot held by the orchestrator, and a
+   * session that reports no runner.
+   *
+   * `AND runner_id = ?` bounds the write to the binding this snapshot actually
+   * observed. A `0` is not a failure to report: it means somebody else already
+   * took this session forward, and the newest binding is the right one to keep.
    */
   async releaseForAuthFailure(session: SessionRow): Promise<boolean> {
     if (session.runner_id === null) return false;
@@ -870,7 +923,11 @@ export class PoolBinder {
       return false;
     }
     this.#db.releaseRunner(session.runner_id);
-    this.#db.run(`UPDATE sessions SET runner_id = NULL WHERE guid = ?`, session.guid);
+    this.#db.run(
+      `UPDATE sessions SET runner_id = NULL WHERE guid = ? AND runner_id = ?`,
+      session.guid,
+      session.runner_id,
+    );
     this.#log.info("runner released after a failed login", {
       session: session.guid,
       runner: session.runner_id,
@@ -940,6 +997,110 @@ export class PoolBinder {
       return false;
     }
     this.#db.releaseRunner(session.runner_id);
+    return true;
+  }
+
+  /**
+   * releaseStaleRunner gives back the container a session was on **before** this
+   * login, once it has been handed a fresh one.
+   *
+   * ## Why this exists (#93)
+   *
+   * A session whose first login failed still has `runner_id` set — nothing clears
+   * it until the sweeper's auth-failed branch, up to 30 seconds later — and the
+   * credential route used to skip `claimForLogin` entirely whenever `runner_id`
+   * was non-null. So the retry handed the password to the container the *failed*
+   * attempt ran in: a Chromium process whose cookie jar was just refuted, whose
+   * state is unknown to this process, and whose own state machine may already be
+   * unwinding.
+   *
+   * The slot-budget floor (§2.1) is checked on claim too, and skipping the claim
+   * skipped that as well — so a retry could land on a container seconds from
+   * being recycled, and the sign-in would die on its own with nothing in the log.
+   *
+   * ## Claim first, release second. The order is the safety property.
+   *
+   * Releasing first and then claiming has a window in which the session holds
+   * **no** container: if the claim then fails — pool exhausted, orchestrator
+   * unreachable, slot conflict — the user has been left worse off than before,
+   * because the working binding that was there a moment ago is gone and nothing
+   * replaced it. Claiming first means the old container is only ever released once
+   * a better one is confirmed, and a failed claim leaves the old one exactly where
+   * it was.
+   *
+   * The reverse window is harmless by construction: between the claim and this
+   * release the session points at the new container, so the stale one is
+   * unreferenced and leaking nothing that `runner_id` can reach.
+   *
+   * ## Why the session UPDATE comes before the orchestrator call, and is guarded
+   *
+   * Two separate reasons, and they are why this is not a `releaseForIdle` with a
+   * different name.
+   *
+   * **Order.** The guarded UPDATE is what removes this session's reference to the
+   * container, and doing it before the round trip means the worst case of a failed
+   * `/release` is a container the orchestrator still holds — repaired by the
+   * sweeper's orphan branch — rather than a slot bound in SQLite to a container
+   * that has been destroyed.
+   *
+   * **The guard (§4.9).** `WHERE guid = ? AND runner_id = ?` cannot dispossess a
+   * session. In the route's normal path the claim has *already* overwritten
+   * `runner_id` with the new slot, so this statement changes nothing — which is
+   * precisely the correct outcome, and the reason a `0` is not treated as "stop".
+   * The unguarded form would be a live session's new binding cleared by a stale
+   * snapshot, which is the one failure no reconciler can repair.
+   *
+   * `releaseRunner` is guarded too, on the same principle and for the same reason:
+   * the `runners` row's `session_guid` is the other half of this binding, and an
+   * unconditional clear would free a slot a *new* claim had since taken.
+   *
+   * ## Returns
+   *
+   * `false` only when the orchestrator could not be told, and only after it has
+   * logged. The caller is on a login's critical path and has already done the part
+   * that matters — the new container exists and the credential is on its way — so
+   * this is a logged leak bounded by the idle-time reclaim, not a failed login.
+   */
+  async releaseStaleRunner(guid: string, staleRunnerId: string): Promise<boolean> {
+    // **Guarded, and its change count is deliberately not an early return.**
+    //
+    // After a successful claim this is normally `0` rows: `claimBindingWrite` has
+    // already pointed the session at the new slot. `0` therefore means "there is
+    // nothing here to unbind", not "there is nothing to release" — and treating it
+    // as the latter would skip the `/release` on every single call, which is the
+    // exact leak this method exists to close. The guard is here to stop this write
+    // *disposing* of a newer binding, which it does whether or not it changed a row.
+    const unbound = this.#db.run(
+      `UPDATE sessions SET runner_id = NULL WHERE guid = ? AND runner_id = ?`,
+      guid,
+      staleRunnerId,
+    );
+
+    const released = await this.#orchestrator.release(staleRunnerId);
+    if (!released.ok && released.error.kind !== "conflict") {
+      // The row is already unbound above and the container may still be running, so
+      // this half is left to the sweeper's orphan branch — which is the only thing
+      // that can see it, because nothing here points at it any more. Logging it is
+      // what makes that recoverable rather than silent.
+      this.#log.warn("stale runner could not be released; left to the sweeper", {
+        session: guid,
+        runner: staleRunnerId,
+        error: released.error.kind,
+      });
+      return false;
+    }
+
+    const freed = this.#db.releaseRunner(staleRunnerId, guid);
+    this.#log.info("stale runner released after a fresh claim", {
+      session: guid,
+      runner: staleRunnerId,
+      reason: "stale-runner",
+      // Both halves of the write, because "it logged the release" and "the row was
+      // actually freed" are different facts and only the second one keeps the slot
+      // claimable.
+      unbound: unbound > 0,
+      freed: freed > 0,
+    });
     return true;
   }
 }
@@ -1211,6 +1372,11 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
       // second statement is a no-op and nothing changes — and, worse, the api keeps
       // claiming a slot the orchestrator has handed back, which on a two-slot pool is
       // the lockout one field over.
+      //
+      // The runner id is passed rather than left implicit so the clear is guarded on
+      // it: this tick's snapshot is minutes old, and a re-login that landed a *live*
+      // binding in the meantime must not be unsticked by a repair for a dead
+      // container. A guarded no-op is correct here — the new binding is the truth.
       if (!(await binder.releaseForDeadRunner(session))) {
         // Any release failure that is not a conflict. **Continue with the row intact.**
         // Clearing it anyway would orphan the slot: not released on the orchestrator's
@@ -1218,7 +1384,7 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
         // a container somebody is still using.
         continue;
       }
-      db.clearSessionRunner(session.guid);
+      db.clearSessionRunner(session.guid, session.runner_id);
       const changed = db.markExportStranded({
         guid: session.guid,
         now,
@@ -1444,6 +1610,20 @@ async function reclaimOrphanBindings(
     // *position*, not a container, and the row is what makes the next `claimRunner`
     // able to find it. Removing the row would delete the slot from this process's
     // view of the pool, and `syncPool` would only put it back on a later tick.
+    //
+    // **Deliberately unguarded — no `expectedSessionGuid` (F6).** Every other
+    // release on this path guards its row write against a snapshot that has aged,
+    // because a newer claim must not be dispossessed by an older reader. Guarding
+    // *here* makes the guard a no-op in exactly the case the reconciler exists to
+    // repair: the whole detection is "`runners.session_guid` names a session with
+    // **no row**", so `runners.session_guid = ?` is false for every row this branch
+    // acts on, `changes` is always `0`, and a divergent binding the sweeper spent a
+    // whole `/release` call on would be left in place forever.
+    //
+    // The disposal this guard protects against is not reachable here either: the
+    // liveness re-check above re-reads the session immediately before the release,
+    // and a slot the orchestrator still reports bound for a guid with no row cannot
+    // have been claimed by a live session in between.
     db.releaseRunner(slotId);
     log.warn("released a slot bound to a session that no longer exists", {
       slot: slotId,
@@ -1478,6 +1658,12 @@ async function reclaimOrphanBindings(
       // bound — in the erase-shaped leak it has already removed it — so a release
       // would be asking about a slot it has answered about and told us nothing
       // about. The row is the whole of the damage, and it is this process's own.
+      //
+      // **Unguarded for the same reason as the call above (F6).** The `NOT EXISTS`
+      // this row was selected by is precisely a `session_guid` with no matching
+      // session, so `AND session_guid = ?` could only ever be false — the guard
+      // would be a statement that changes nothing on every row it is asked about,
+      // and a phantom row would be re-reported as a phantom on every tick for ever.
       db.releaseRunner(row.id);
       cleaned++;
       log.warn("cleared a runner row bound to a session that no longer exists", {

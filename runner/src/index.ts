@@ -60,7 +60,7 @@
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import type { Readable } from "node:stream";
 import { createWriteStream, existsSync } from "node:fs";
-import { mkdir, stat } from "node:fs/promises";
+import { mkdir, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import archiver from "archiver";
 import { loadConfig, type RunnerConfig } from "./config.js";
@@ -165,6 +165,71 @@ async function packages(): Promise<{
     listNotebooks: list.listNotebooks,
     runExport: exporter.runExport,
   };
+}
+
+/**
+ * The user-facing message for an export that never started because `out/` could
+ * not be prepared.
+ *
+ * Its own sentence, and not the api's `WALK_FAILED` ("the export stopped
+ * unexpectedly partway through"), because the two are true about different worlds.
+ * Here **nothing stopped partway**: no walk ran, no page was written, and the
+ * session's previous vault is still on disk exactly as it was. A user told the
+ * walk stopped partway would go looking for pages that were never lost, and would
+ * not think to retry — the one action that does help here.
+ */
+const OUT_DIR_UNPREPARED = "the export directory could not be prepared, so nothing was exported.";
+
+/**
+ * Empties `out/` so that the archive a session publishes holds only what this
+ * export writes.
+ *
+ * ## Why this is the runner's job
+ *
+ * The export package says so itself, in `warnIfOutputExists`
+ * (`exporter.js:1492`): *"Files from a previous run that are no longer in the
+ * notebook are left in place, so this is a merge, not a clean mirror. Remove the
+ * folder first for a clean export."* It warns and then does nothing about it,
+ * because the CLI's user is expected to notice. The runner has no user at a
+ * prompt. Without this, a second export in one session ships the first one's
+ * pages — including pages **deleted from OneNote in between**, which is the worst
+ * version of the bug: an archive that looks current and is not.
+ *
+ * The runner is also the only component that can honour the instruction: the
+ * session tree is created for one container and destroyed with it, so nothing
+ * else writes `out/`.
+ *
+ * ## Async, not `rmSync`
+ *
+ * `rmSync` holds the event loop for the whole unlink walk. `out/` is on the
+ * session bind mount, and a vault is thousands of files; blocking there stops
+ * the loop from flushing the route's 202, so the api can time the export-start
+ * out and retry while this process is still halfway through deleting — two
+ * components disagreeing about whether the export started, with a half-emptied
+ * `out/` underneath. Awaited, the reply goes out first and the loop stays free
+ * to answer `/abort` while the delete runs.
+ *
+ * Throws on failure; the caller turns that into a terminal of its own rather than
+ * letting it fall through to the walk-failed path, which would describe a walk
+ * that never started.
+ */
+async function clearExportDir(outDir: string): Promise<{ entries: number; durationMs: number }> {
+  const startedAt = Date.now();
+  // One `readdir`, one level deep. The top of `out/` holds a handful of notebook
+  // folders however large the vault below them is, so this is cheap, and it turns
+  // "cleared out/" from a claim into a number. Its own failure is swallowed: it is
+  // a figure for a log line, and the only two calls that decide whether the export
+  // can run are the two below.
+  const entries = await readdir(outDir).then(
+    (names) => names.length,
+    () => 0,
+  );
+  await rm(outDir, { recursive: true, force: true, maxRetries: 3 });
+  // `0o700`, because `makeSessionDirs` creates it that way. A default-mode mkdir
+  // would quietly widen a directory holding the whole vault, and the next export
+  // would inherit the wider mode.
+  await mkdir(outDir, { recursive: true, mode: 0o700 });
+  return { entries, durationMs: Date.now() - startedAt };
 }
 
 /**
@@ -603,6 +668,56 @@ export function buildApp(
 
     void (async () => {
       try {
+        // ---- the vault starts empty -----------------------------------------
+        //
+        // Inside this `try` and after `packages()`, both deliberately. A throw
+        // here has to be caught — before the try it escapes a detached promise,
+        // and there is no `unhandledRejection` handler in this process
+        // (`RestartPolicy: "no"`), so the container would die holding the job
+        // slot. Before `packages()` it would leak that slot with no export and no
+        // terminal, and the session would sit at `exporting` until the cap.
+        //
+        // After the wipe and not before: an export that cannot clear `out/` must
+        // not then *merge into it*. Running against the leftovers is how a vault
+        // gets published that is silently the union of two notebooks.
+        try {
+          const wiped = await clearExportDir(paths.outDir);
+          // Logged before anything can erase it. The runner's stdout is a
+          // json-file with a size cap and the container is destroyed at session
+          // end, so this line is the only record that a wipe happened at all —
+          // without it, a zip holding the wrong pages has no explanation anywhere.
+          app.log.info({ ...wiped, outDir: paths.outDir }, "cleared out/ for a fresh export");
+        } catch (cause) {
+          app.log.error({ err: cause, outDir: paths.outDir }, "could not clear out/; no export was run");
+          hub.publish(guid, {
+            type: "export-done",
+            id,
+            // The notebook name from the request, for the same reason the catch
+            // below does: the package's `export-done`, its only carrier of it,
+            // was never emitted.
+            notebook: name ?? "",
+            pages: 0,
+            sections: 0,
+            assets: 0,
+            failedSections: 0,
+            failedPages: 0,
+            failedGroups: 0,
+            notebookNotFound: false,
+            // `walkFailed` stays true, and that is not a fallback to the generic
+            // path — it is the one signal the api reads to skip staging entirely.
+            // A false here with all-zero counts classifies as **done**, and the
+            // api would publish whatever survived the failed wipe as this
+            // export's vault. `failure` is what makes this terminal its own
+            // rather than the walk-failed one.
+            walkFailed: true,
+            failure: "export_dir_unprepared",
+            message: OUT_DIR_UNPREPARED,
+          });
+          // `finally` still runs: the heartbeat stops and the slot is released,
+          // exactly as it would have been had the walk finished.
+          return;
+        }
+
         const stats = await runExport({
           authFile: paths.authFile,
           exportDir: paths.outDir,

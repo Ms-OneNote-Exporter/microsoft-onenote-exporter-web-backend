@@ -211,6 +211,163 @@ describe("completeExport", () => {
 
     expect(recorded).toBe(false);
   });
+
+  it("keeps the start the row already held instead of overwriting it with the finish", () => {
+    // **The bug, and the reason this method is patched rather than overwritten.**
+    //
+    // `export-completion.ts` passed `startedAt: input.finishedAt` — a copy-paste —
+    // and the old implementation rebuilt the whole object from its arguments, so
+    // every completed export recorded `"startedAt":<finish>,"finishedAt":<finish>`.
+    // The row claimed the walk took zero time. Observed live twice on the host.
+    //
+    // The start was never missing: `routes.ts` writes it into `export_state` at
+    // queue and again at run start, which is what this row carries.
+    //
+    // The seed is deliberately **valid JSON that contains `startedAt`**. That is
+    // the only shape that can catch this: `export_state: null` takes the ELSE arm,
+    // which writes `startedAt` from the arguments by design and so would pass
+    // either way; and valid JSON *without* `startedAt` has no start to preserve,
+    // so a row claiming `startedAt === finishedAt` would look identical.
+    const START = NOW;
+    const FINISH = NOW + 229_000; // 3m49s. The real export: 29 pages, 8 assets.
+    seed(GUID, {
+      state: "exporting",
+      export_state: JSON.stringify({
+        state: "running",
+        id: ARTIFACT,
+        notebook: "Notebook",
+        progress: { pages: 29, sections: 1, assets: 8 },
+        startedAt: START,
+        finishedAt: null,
+      }),
+    });
+
+    db.completeExport({
+      guid: GUID,
+      artifactId: ARTIFACT,
+      partial: false,
+      partialReason: null,
+      notebook: "Notebook",
+      progress: { pages: 29, sections: 1, assets: 8 },
+      // A mischief value, not the start: even if this method *did* read the
+      // argument, the assertion below would fail. So the test cannot be satisfied
+      // by any implementation that prefers the caller's number.
+      startedAt: FINISH,
+      finishedAt: FINISH,
+      failedSections: 0,
+      failedPages: 0,
+      failedGroups: 0,
+    });
+
+    const parsed = JSON.parse(row().export_state!) as Record<string, unknown>;
+    // The pair, asserted together because the bug is a *relationship* between
+    // them: equal timestamps are the symptom, and one assertion on either field
+    // alone would not catch a writer that simply dropped `startedAt`.
+    expect(parsed.startedAt).toBe(START);
+    expect(parsed.finishedAt).toBe(FINISH);
+    // The regression this most directly guards, stated so a future reader knows
+    // which line to break: restoring `'$.startedAt', ?` to the json_set argument
+    // list turns the row back into "startedAt: 1792000690626, finishedAt:
+    // 1792000690626".
+    expect(parsed.startedAt).not.toBe(parsed.finishedAt);
+    // The terminal fields are still written — preserving the start must not cost
+    // the completion itself.
+    expect(parsed.state).toBe("done");
+    expect(parsed.progress).toEqual({ pages: 29, sections: 1, assets: 8 });
+    // `$.failed` still has to arrive as an object, not as the string
+    // '{"pages":0,...}'. Without `json(?)` this assertion fails, which is why the
+    // patch cannot be spelled with bare parameters.
+    expect(parsed.failed).toEqual({ pages: 0, sections: 0, groups: 0 });
+  });
+
+  it("preserves the row's start on a partial terminal too", () => {
+    // The same patch on the other branch, because `state` and `startedAt` are set
+    // in one `json_set` and a fix applied to only one of them would be invisible
+    // on the half of exports that are partial — the ones where the duration is
+    // most likely to be quoted back to a user afterwards.
+    seed(GUID, {
+      state: "exporting",
+      export_state: JSON.stringify({
+        state: "running",
+        id: ARTIFACT,
+        startedAt: NOW,
+        finishedAt: null,
+      }),
+    });
+
+    db.completeExport({
+      guid: GUID,
+      artifactId: ARTIFACT,
+      partial: true,
+      partialReason: "disk",
+      notebook: "Notebook",
+      progress: { pages: 29, sections: 1, assets: 8 },
+      finishedAt: NOW + 60_000,
+      failedSections: 0,
+      failedPages: 1,
+      failedGroups: 0,
+    });
+
+    const parsed = JSON.parse(row().export_state!) as Record<string, unknown>;
+    expect(parsed.state).toBe("partial");
+    expect(parsed.partialReason).toBe("disk");
+    expect(parsed.startedAt).toBe(NOW);
+    expect(parsed.finishedAt).toBe(NOW + 60_000);
+    expect(parsed.failed).toEqual({ pages: 1, sections: 0, groups: 0 });
+  });
+
+  it("still records a complete terminal object when export_state is not valid JSON", () => {
+    // The ELSE arm, and the reason the patch is guarded rather than unconditional:
+    // `json_set` **throws** on malformed JSON, and this runs in the completion path,
+    // where a throw reaches the outer catch in `index.ts` and abandons every
+    // remaining session for that tick. Mirrors the malformed-JSON cases pinned for
+    // `markExportStranded` in tests/stranded-export.test.ts.
+    //
+    // What it pins: a row too corrupt to patch is still *completed* — the slot is
+    // freed, the artifact is recorded, the user sees a terminal state — and only
+    // `startedAt` has to be invented, because a row that cannot be parsed has no
+    // start in it to preserve.
+    seed(GUID, { state: "exporting" });
+    db.run(
+      `UPDATE sessions SET state = 'exporting', export_state = ? WHERE guid = ?`,
+      "not valid json {",
+      GUID,
+    );
+
+    let recorded = false;
+    // The assertion that matters: no throw. Everything after it is about what the
+    // fallback wrote once the guard let it through.
+    expect(() => {
+      recorded = db.completeExport({
+        guid: GUID,
+        artifactId: ARTIFACT,
+        partial: false,
+        partialReason: null,
+        notebook: "Notebook",
+        progress: { pages: 12, sections: 3, assets: 40 },
+        // No start was passed and none could be recovered, so it falls back to the
+        // finish — which is the old bug's value and is *correct* here: with no
+        // start in the row, "unknown" is the only honest thing to record, and the
+        // alternative is dropping the field and leaving a reader to guess.
+        finishedAt: NOW + 5_000,
+        failedSections: 0,
+        failedPages: 0,
+        failedGroups: 0,
+      });
+    }).not.toThrow();
+
+    expect(recorded).toBe(true);
+    // The completion itself is whole: this is what a user with a corrupt row still
+    // has to get, and it is the part a throw would have cost them.
+    expect(row().state).toBe("authenticated");
+    expect(row().artifact_id).toBe(ARTIFACT);
+    const parsed = JSON.parse(row().export_state!) as Record<string, unknown>;
+    expect(parsed.state).toBe("done");
+    expect(parsed.finishedAt).toBe(NOW + 5_000);
+    expect(parsed.startedAt).toBe(NOW + 5_000);
+    expect(parsed.progress).toEqual({ pages: 12, sections: 3, assets: 40 });
+    expect(parsed.failed).toEqual({ pages: 0, sections: 0, groups: 0 });
+  });
 });
 
 describe("markExportUnpublishable", () => {
@@ -254,6 +411,77 @@ describe("markExportUnpublishable", () => {
     expect(parsed.state).toBe("failed");
     expect(parsed.finishedAt).toBe(NOW + 5_000);
     expect(parsed.error).toBe("could not prepare");
+  });
+
+  it("keeps the start the row already held instead of nulling it", () => {
+    // The same defect as `completeExport`, one line over — and the worse of the
+    // two, because this is the path where the *walk succeeded*: only the archiving
+    // failed. The elapsed time is real and known, and writing `startedAt: null`
+    // over it does not leave a gap, it makes a statement.
+    //
+    // This method has no `startedAt` argument at all, which is deliberate: an
+    // argument the caller would have to invent is what produced the original bug.
+    // So the only correct reading is "preserve whatever the row has".
+    seed(GUID, {
+      state: "exporting",
+      export_state: JSON.stringify({
+        state: "running",
+        id: ARTIFACT,
+        startedAt: NOW,
+        finishedAt: null,
+      }),
+    });
+
+    db.markExportUnpublishable({
+      guid: GUID,
+      error: "could not prepare",
+      artifactId: ARTIFACT,
+      notebook: "Notebook",
+      partialReason: null,
+      finishedAt: NOW + 229_000,
+    });
+
+    const parsed = JSON.parse(row().export_state!) as Record<string, unknown>;
+    expect(parsed.startedAt).toBe(NOW);
+    expect(parsed.startedAt).not.toBeNull();
+    expect(parsed.finishedAt).toBe(NOW + 229_000);
+    // The failure still has to reach the user — preserving the start must not cost
+    // the terminal the path exists to write.
+    expect(parsed.state).toBe("failed");
+    expect(parsed.error).toBe("could not prepare");
+    expect(parsed.notebook).toBe("Notebook");
+    // `progress` is null on purpose here (the walk's counts are not what failed),
+    // and it must arrive as JSON null rather than the string "null".
+    expect(parsed.progress).toBeNull();
+  });
+
+  it("still records the failure when export_state is not valid JSON", () => {
+    // The ELSE arm, for the same reason as `completeExport`: `json_set` throws on
+    // malformed JSON and this runs in the completion path. The user has to get a
+    // terminal state either way, and only `startedAt` is lost.
+    seed(GUID, { state: "exporting" });
+    db.run(
+      `UPDATE sessions SET state = 'exporting', export_state = ? WHERE guid = ?`,
+      "not valid json {",
+      GUID,
+    );
+
+    expect(() =>
+      db.markExportUnpublishable({
+        guid: GUID,
+        error: "could not prepare",
+        artifactId: ARTIFACT,
+        notebook: "Notebook",
+        partialReason: null,
+        finishedAt: NOW + 5_000,
+      }),
+    ).not.toThrow();
+
+    expect(row().state).toBe("authenticated");
+    const parsed = JSON.parse(row().export_state!) as Record<string, unknown>;
+    expect(parsed.state).toBe("failed");
+    expect(parsed.error).toBe("could not prepare");
+    expect(parsed.finishedAt).toBe(NOW + 5_000);
   });
 });
 

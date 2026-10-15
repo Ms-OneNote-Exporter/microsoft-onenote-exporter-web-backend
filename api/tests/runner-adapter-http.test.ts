@@ -1266,6 +1266,45 @@ describe("an export's live counts are handed on, not just published", () => {
     expect(seen).toEqual(["artifact-id"]);
   });
 
+  it("a runner export-started frame reaches the wire as the api's export-started", async () => {
+    // **A characterization test, and the first assertion of this frame at all.**
+    //
+    // The test above is the only other place `export-started` appears here, and it
+    // is a negative one: `onExportProgress` must not fire for it. Nothing asserted
+    // that the frame is published, or that it carries the id the client's export
+    // card is keyed on.
+    //
+    // It is **not** a revert-red pin, and it would be dishonest to claim otherwise:
+    // `export-started` reached this very emit through the chain's trailing `else`,
+    // so naming the branch explicitly changed no behaviour and this passes against
+    // the code from before that change as readily as after it. What it pins is the
+    // frame on the wire — so the next edit to this chain, a seventh case label
+    // added above it, has to fail here rather than quietly publish it under a name
+    // that belongs to a different event.
+    const runner = await fakeRunner();
+    const adapter = adapterFor(runner);
+
+    runner.sseFrames = [frame(1, { type: "export-started", id: "artifact-id" })];
+
+    const sub = subscribe(runner.sse);
+    await adapter.listNotebooks(SESSION);
+    await adapter.drain();
+    // `drain()` settles what the frame started, and starting nothing. The pump
+    // itself is opened without being awaited, so `listNotebooks` returning is not
+    // the stream being open — `received` waits for the frame rather than assuming.
+    await sub.received(1);
+    adapter.stopAll();
+
+    const frames = framesFrom(sub.res);
+    // The whole assertion in one list: one frame, and it is the api's own name
+    // rather than a runner name the frontend has no renderer for.
+    expect(frames.map((f) => f.type)).toEqual(["export-started"]);
+    // And the id with it, and nothing else. The id is what tells a client which
+    // export started when two overlap, so an empty payload is a frame it cannot act
+    // on — and the emit invents no field the client would have to know about.
+    expect(frames[0].data).toEqual({ id: "artifact-id" });
+  });
+
   it("fires once per frame however many browsers are attached", async () => {
     // `#handleFrame` runs on the pump, before any delivery, so the callback
     // counts frames and not subscribers. Two tabs on one session must not double

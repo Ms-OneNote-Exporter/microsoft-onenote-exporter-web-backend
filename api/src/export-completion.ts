@@ -204,7 +204,13 @@ export async function completeExport(
     partialReason: input.partialReason,
     notebook: input.notebook,
     progress: input.progress,
-    startedAt: input.finishedAt,
+    // `startedAt` is deliberately not passed. It was `input.finishedAt` here — a
+    // copy-paste that made every completed export record a walk of zero duration
+    // (`"startedAt":1792000690626,"finishedAt":1792000690626`, live twice). The
+    // real start is not missing from this system: `routes.ts` wrote it into
+    // `export_state` at queue and at run start, and `Db.completeExport` now leaves
+    // that field alone rather than overwriting it with whatever it was handed. A
+    // value passed here could only reintroduce the bug.
     finishedAt: input.finishedAt,
     // **The three counts that used to die here.** They arrived on the runner's
     // terminal frame, decided `partial` versus `done` on line 157, and were then

@@ -796,6 +796,45 @@ export class Db {
    * Always written, including as zeros: a terminal is the one moment where "zero
    * pages failed" is a **measured** zero rather than an absence, and a client
    * that had to tell those apart would be guessing.
+   *
+   * ## Why `export_state` is patched in SQL and not overwritten
+   *
+   * **The terminal write used to throw away the start of the export.** This method
+   * rebuilt the whole object from its own arguments, and the argument it was given
+   * for `startedAt` was `finishedAt` — a copy-paste in `export-completion.ts`. So
+   * every completed export recorded `"startedAt": <finish>,"finishedAt": <finish>`:
+   * a row claiming the walk took zero time, on the live host twice in a row
+   * (`"startedAt":1792000690626,"finishedAt":1792000690626`).
+   *
+   * The real start was never missing. `routes.ts` writes `startedAt: now()` into
+   * `export_state` twice — at queue and again at run start — so the value was in the
+   * row being overwritten. The fix is therefore **not** to supply a better
+   * argument: it is to stop overwriting a field this method does not own.
+   *
+   * `$.startedAt` is deliberately **absent from the `json_set` argument list**.
+   * That omission *is* the fix — `json_set` leaves any path it is not given alone,
+   * and adding `'$.startedAt', ?` back would recreate the original bug in a
+   * spelling that looks deliberate. Deleting the copy-paste at the call site
+   * without this change would have fixed nothing, because `JSON.stringify` wrote
+   * whatever it was handed into every field.
+   *
+   * ### Why one statement and not read-then-write
+   *
+   * Reading the row to find its `startedAt` and writing it back is the obvious
+   * spelling and it is wrong: between the two statements another writer can land,
+   * and the row this method returns is then a value nobody ever measured. The
+   * patch is computed by SQLite from the row it is updating, inside the same
+   * statement that updates it, so there is no window.
+   *
+   * ### The `ELSE` arm is a fallback, not a second behaviour
+   *
+   * `json_set` **throws** on malformed JSON, and a throw in the completion path
+   * reaches the outer catch in `index.ts` and abandons every remaining session for
+   * that tick — so `json_valid` guards the patch, exactly as `markExportStranded`
+   * and `updateExportProgress` already do. When the guard fails the row is not
+   * well-formed JSON, which means there is no `startedAt` in it to preserve, and
+   * this is the one place a fallback is owed: the whole terminal object is written
+   * from the arguments, with `startedAt` taken from the caller if it passed one.
    */
   completeExport(input: {
     readonly guid: string;
@@ -804,7 +843,12 @@ export class Db {
     readonly partialReason: "aborted" | "quota" | "disk" | null;
     readonly notebook: string;
     readonly progress: { pages: number; sections: number; assets: number } | null;
-    readonly startedAt: number;
+    /**
+     * The ELSE-arm fallback only, for a row whose `export_state` is not valid JSON
+     * and therefore holds no start to preserve. Ignored on every ordinary path:
+     * a real export's start is the one already in the row.
+     */
+    readonly startedAt?: number;
     readonly finishedAt: number;
     readonly failedSections: number;
     readonly failedPages: number;
@@ -817,11 +861,39 @@ export class Db {
                 artifact_partial = ?,
                 state = 'authenticated',
                 last_activity_at = ?,
-                export_state = ?
+                export_state = CASE
+                  WHEN json_valid(export_state)
+                   THEN json_set(export_state,
+                           '$.state', ?,
+                           '$.partialReason', ?,
+                           '$.error', NULL,
+                           '$.id', ?,
+                           '$.notebook', ?,
+                           -- \`json(...)\` rather than the bare parameter: a bound
+                           -- parameter is a SQL text value, so without it the counts
+                           -- are stored as the *string* "{\"pages\":12}" and every
+                           -- read of .pages is undefined. Same reason, same spelling
+                           -- as \`updateExportProgress\` above.
+                           '$.progress', json(?),
+                           '$.finishedAt', ?,
+                           '$.failed', json(?))
+                  ELSE ?
+                END
           WHERE guid = ?`,
         input.artifactId,
         input.partial ? 1 : 0,
         input.finishedAt,
+        input.partial ? "partial" : "done",
+        input.partialReason,
+        input.artifactId,
+        input.notebook,
+        JSON.stringify(input.progress),
+        input.finishedAt,
+        JSON.stringify({
+          pages: input.failedPages,
+          sections: input.failedSections,
+          groups: input.failedGroups,
+        }),
         JSON.stringify({
           state: input.partial ? "partial" : "done",
           partialReason: input.partialReason,
@@ -829,7 +901,7 @@ export class Db {
           id: input.artifactId,
           notebook: input.notebook,
           progress: input.progress,
-          startedAt: input.startedAt,
+          startedAt: input.startedAt ?? input.finishedAt,
           finishedAt: input.finishedAt,
           failed: {
             pages: input.failedPages,
@@ -859,6 +931,19 @@ export class Db {
    * `state` is reset for the same reason `completeExport` resets it — the sweeper
    * skips `exporting`, so leaving it would pin this session's slot for the rest of
    * the day on a pool of two.
+   *
+   * ## Why it patches instead of overwriting
+   *
+   * Same defect, one line over: this method wrote `startedAt: null` over a start
+   * the row already held, and **this is the worse of the two cases**. The walk
+   * here *succeeded* — it is the archiving that failed — so the elapsed time is a
+   * real, known number the user might reasonably ask about, and erasing it is not
+   * an omission so much as a false statement about how long the export took.
+   *
+   * So the write is the same `json_set` patch `completeExport` uses, preserving
+   * `$.startedAt` and touching only the fields this method actually owns. There is
+   * no `startedAt` input to fall back on and none is added: an argument the caller
+   * would have to invent is exactly what produced the original bug.
    */
   markExportUnpublishable(input: {
     readonly guid: string;
@@ -873,8 +958,26 @@ export class Db {
         `UPDATE sessions
             SET state = 'authenticated',
                 last_activity_at = ?,
-                export_state = ?
+                export_state = CASE
+                  WHEN json_valid(export_state)
+                   THEN json_set(export_state,
+                           '$.state', ?,
+                           '$.partialReason', ?,
+                           '$.error', ?,
+                           '$.id', ?,
+                           '$.notebook', ?,
+                           '$.progress', json(?),
+                           '$.finishedAt', ?)
+                  ELSE ?
+                END
           WHERE guid = ?`,
+        input.finishedAt,
+        "failed",
+        input.partialReason,
+        input.error,
+        input.artifactId,
+        input.notebook,
+        JSON.stringify(null),
         input.finishedAt,
         JSON.stringify({
           state: "failed",

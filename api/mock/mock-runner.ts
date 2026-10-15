@@ -282,7 +282,12 @@ export class MockRunner implements RunnerAdapter, RunnerEraseControl {
       partialReason: null,
       notebook,
       progress: { pages, sections, assets },
-      startedAt: Date.now(),
+      // No `startedAt`. `completeExport` takes one only as the fallback for a row
+      // whose `export_state` is not valid JSON; on every ordinary path it preserves
+      // the start already in the row (written by `routes.ts` at queue and at run
+      // start). Dropping it here mirrors `export-completion.ts`, which stopped
+      // passing a value that never drove the row — this mock's only job is to
+      // stand in for that call.
       finishedAt: Date.now(),
       // The mock always produces a successful export, so all three are zero —
       // and passed rather than omitted because this call stands in for

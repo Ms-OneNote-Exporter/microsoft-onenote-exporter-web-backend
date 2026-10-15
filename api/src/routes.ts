@@ -1570,6 +1570,13 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
         id,
         notebook: session.notebook,
         progress: null,
+        // NOTE: unlike `Db.completeExport` and `Db.markExportUnpublishable`, this
+        // path still writes the whole object and still nulls `startedAt` — while
+        // `progress` is nulled *because* the walk was aborted, not because it was
+        // unmeasured. So an aborted export that had already written pages reports
+        // no counts at all, and no duration either. That is a real gap and a
+        // separate fix; left untouched here deliberately (issue #91), so this line
+        // is a known divergence from the two db methods, not an oversight.
         startedAt: null,
         finishedAt: now(),
       }),

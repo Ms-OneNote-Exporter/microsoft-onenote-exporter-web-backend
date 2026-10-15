@@ -525,6 +525,32 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
       deps.sse.detach(session.guid, attached.subscriberId);
     });
 
+    /*
+     * The other half of the teardown, and the one `close` does not cover.
+     *
+     * A stream that dies without a close — a laptop asleep past the NAT's UDP
+     * timeout, a network handover to a different interface — leaves the socket in
+     * a state where `res.write()` does not throw. It returns `false`, queues
+     * into a buffer nobody will ever drain, and the subscriber stays registered
+     * in the hub forever: the api keeps writing to a corpse and never learns the
+     * client is gone. Node surfaces that condition as an async `error` on the
+     * *response*, not on the request, so the `close` handler above never fires
+     * and `emit()`'s synchronous try/catch never catches it.
+     *
+     * So the subscriber is detached here as well. Idempotent — `detach` is a
+     * `Map.delete`, and a `close` that follows costs nothing.
+     *
+     * The log line is payload-free: the session guid and nothing else. No frame
+     * content, no credential, nothing a notebook name could ride in on.
+     */
+    stream.on("error", () => {
+      request.log.warn(
+        { event: "sse_subscriber_error", session: session.guid },
+        "SSE subscriber dropped after a stream error",
+      );
+      deps.sse.detach(session.guid, attached.subscriberId);
+    });
+
     // The response never ends on its own; the socket stays open until the client
     // closes it or the process does.
     return reply;

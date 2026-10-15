@@ -16,7 +16,11 @@
  *      gap is worse than a resync: the alternative is a UI that shows a stale
  *      export forever.
  *   3. Keepalive on a timer, because proxies and mobile radios drop idle
- *      connections.
+ *      connections — and in *two* forms, because only one of them can be
+ *      observed: a comment keeps the intermediaries alive, and a named
+ *      `keepalive` event is the only thing a browser can notice a dead stream
+ *      with, since a stream that dies without a close never fires `close` and
+ *      never throws from `write()`.
  *   4. One hub per session with multiple subscribers, so two tabs see identical
  *      events and one tab's export appears in the other (PLAN-v2 §7.4).
  */
@@ -218,15 +222,48 @@ class SessionHub {
   /**
    * comment writes a keepalive comment to one subscriber.
    *
-   * A comment rather than a `keepalive` event: §7.1 lists `keepalive` as an event
-   * type, but a comment line is invisible to `EventSource` and so does not force
-   * the client to parse a payload it would discard. Both are emitted, so the
-   * contract's named event type is real and the wire cost is not paid.
+   * A comment rather than an event frame: invisible to `EventSource`, so it does
+   * not force the client to parse a payload it would discard, and it is what
+   * every hop between the socket and the browser — Caddy, a NAT table, a proxy
+   * with an idle timeout — actually needs to stay open.
+   *
+   * It cannot be *detected* with, which is what emitKeepalive() below is for.
    */
   comment(subscriberId: string): void {
     const subscriber = this.#subscribers.get(subscriberId);
     if (subscriber === undefined) return;
     this.#write(subscriber, ": keepalive\n\n", null);
+  }
+
+  /**
+   * emitKeepalive writes a keepalive event to every subscriber without buffering.
+   *
+   * The comment above is the right thing to send and the wrong thing to *detect*
+   * with: a browser discards it without dispatching anything, so a client whose
+   * connection has silently died — sleep, NAT timeout, a network change that
+   * keeps the TCP connection up but stops delivering — sees nothing, reports
+   * nothing, and its `EventSource` sits in `OPEN` forever while the api keeps
+   * writing into a socket nobody is reading. A named frame with a non-empty
+   * `data:` line is dispatched, which is what lets the client notice and
+   * reconnect.
+   *
+   * The data line is `{}` and is deliberately non-empty: per the SSE spec a frame
+   * with no `data:` line is not dispatched at all, so an "empty" keepalive would
+   * be indistinguishable from the comment it was meant to replace.
+   *
+   * It deliberately does NOT go through emit(). Keepalive is not a meaningful
+   * event for replay, so it must not increment nextId (that would push every
+   * real event's id up by one per 15 s, for nothing), must not consume buffer
+   * space, and must not be replayed to every reconnecting client — a client that
+   * had been away for an hour would be handed an hour of `{}` frames instead of
+   * the snapshot the buffer's eviction is supposed to trigger. Hence the direct
+   * `#write`, with `id: null` so a subscriber's resume point is left alone.
+   */
+  emitKeepalive(): void {
+    const frame = "event: keepalive\ndata: {}\n\n";
+    for (const subscriber of this.#subscribers.values()) {
+      this.#write(subscriber, frame, null);
+    }
   }
 
   /** snapshot writes a snapshot frame to one subscriber. */
@@ -327,6 +364,11 @@ export class SseHub {
     this.#hubs.get(sessionId)?.comment(subscriberId);
   }
 
+  /** emitKeepAlive emits a keepalive event to all subscribers of a session. */
+  emitKeepAlive(sessionId: string): void {
+    this.#hubs.get(sessionId)?.emitKeepalive();
+  }
+
   /** sendSnapshot writes a snapshot frame to one subscriber. */
   sendSnapshot(sessionId: string, subscriberId: string, snapshot: unknown, id: number): void {
     this.#hubs.get(sessionId)?.snapshot(subscriberId, snapshot, id, this.#now());
@@ -357,11 +399,21 @@ export class SseHub {
    * One timer for the whole hub rather than one per session: a per-session timer
    * would mean a timer per open tab, which is the kind of scaling surprise a
    * keepalive is supposed to avoid.
+   *
+   * Two frames per tick per subscriber, deliberately. The comment is for
+   * everything between the socket and the browser — Caddy, a NAT table, a proxy
+   * with an idle timeout — and costs nothing to parse. The named `keepalive`
+   * event is for the browser, and is the only one of the two a client can
+   * actually *detect* liveness from; see emitKeepalive() for why that matters
+   * when a stream dies without closing.
    */
   startKeepalive(): void {
     if (this.#keepaliveTimer !== null) return;
     this.#keepaliveTimer = setInterval(() => {
-      for (const [sessionId, hub] of this.#hubs) {
+      for (const hub of this.#hubs.values()) {
+        // Visible keepalive event for EventSource clients (liveness detection).
+        hub.emitKeepalive();
+        // Comment for non-EventSource clients (proxies, NATs) — invisible to EventSource.
         for (const subscriberId of hub.subscriberIds()) {
           hub.comment(subscriberId);
         }

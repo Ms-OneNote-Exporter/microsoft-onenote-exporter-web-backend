@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
+import type { FastifyInstance } from "fastify";
 import type { ServerResponse } from "node:http";
 
 import {
@@ -7,6 +8,13 @@ import {
   SseHub,
   parseLastEventId,
 } from "../src/sse.js";
+import { buildServer } from "../src/server.js";
+import { ApiConfig, validateOrigins } from "../src/config.js";
+import { Db } from "../src/db.js";
+import { RateLimiter } from "../src/rate-limit.js";
+import { FakeOrchestrator } from "../mock/fake-orchestrator.js";
+import { SESSION_COOKIE } from "../src/csrf.js";
+import { generateCsrfKey, hashSecret } from "../src/session.js";
 
 /**
  * PLAN-v2 §7, §7.2, §7.3, §7.4, §7.5; PLAN-v3 §6. The behaviours with real design
@@ -303,9 +311,15 @@ describe("parseLastEventId", () => {
   });
 });
 
+/** The keepalive frame, byte for byte, as `emitKeepalive()` writes it. */
+const KEEPALIVE_FRAME = "event: keepalive\ndata: {}\n\n";
+
 describe("keepalive", () => {
-  it("writes a comment line rather than an event frame", () => {
-    // A comment is invisible to EventSource, so the client discards nothing.
+  it("sendComment writes a comment line and nothing else", () => {
+    // Still true, and still the right thing for the intermediaries between the
+    // socket and the browser: a comment costs a proxy nothing to parse and is
+    // invisible to `EventSource`. It is the *detection* that needs the named
+    // event below.
     const hub = newHub();
     const res = fakeResponse();
     const attached = hub.attach(SESSION, res, null);
@@ -316,7 +330,79 @@ describe("keepalive", () => {
     expect(frames(res.written)).toHaveLength(0);
   });
 
-  it("writes a comment to every subscriber on the timer", () => {
+  it("emitKeepAlive writes a named keepalive event with a non-empty data line", () => {
+    // The whole point. A frame with no `data:` line is never dispatched by a
+    // browser, so "data is empty" would have reproduced the comment exactly.
+    const hub = newHub();
+    const res = fakeResponse();
+    hub.attach(SESSION, res, null);
+
+    hub.emitKeepAlive(SESSION);
+
+    const [frame] = frames(res.written);
+    expect(frame.event).toBe("keepalive");
+    expect(frame.data).toBe("{}");
+    expect(frame.data).not.toBe("");
+  });
+
+  it("emitKeepAlive writes to every subscriber", () => {
+    const hub = newHub();
+    const a = fakeResponse();
+    const b = fakeResponse();
+    const c = fakeResponse();
+    hub.attach(SESSION, a, null);
+    hub.attach(SESSION, b, null);
+    hub.attach(SESSION, c, null);
+
+    hub.emitKeepAlive(SESSION);
+
+    // Every tab has to get it, or a tab that alone went deaf stays deaf: this is
+    // the client's only evidence the stream is alive.
+    expect(a.written.join("")).toBe(KEEPALIVE_FRAME);
+    expect(b.written.join("")).toBe(KEEPALIVE_FRAME);
+    expect(c.written.join("")).toBe(KEEPALIVE_FRAME);
+  });
+
+  it("emitKeepAlive consumes no id and enters no buffer", () => {
+    // Through emit(), a keepalive every 15 s would push every real event's
+    // `Last-Event-ID` up by one for no reason, eat a slot in the 500-event
+    // ring, and replay an hour of `{}` to a client that had been away.
+    const hub = newHub();
+    const attached = hub.attach(SESSION, fakeResponse(), null);
+
+    hub.emitKeepAlive(SESSION);
+
+    // Nothing entered the buffer: a client resuming from 0 still gets a
+    // snapshot, rather than a replay of keepalives it was never shown.
+    expect(hub.attach(SESSION, fakeResponse(), 0).replayed).toBeNull();
+    // And no id was consumed, so the next real event is still id 1 and every
+    // `Last-Event-ID` a client holds keeps matching a real event.
+    expect(attached.hub.nextId).toBe(1);
+    expect(hub.emit(SESSION, "export-done", {}).id).toBe(1);
+  });
+
+  it("emitKeepAlive drops a subscriber whose write throws", () => {
+    // The same rule as emit(): one dead connection must not stop the keepalive
+    // reaching the others, which is the other half of staying alive.
+    const hub = newHub();
+    const broken = fakeResponse();
+    broken.write = (() => {
+      throw new Error("EPIPE");
+    }) as ServerResponse["write"];
+    const healthy = fakeResponse();
+    hub.attach(SESSION, broken, null);
+    hub.attach(SESSION, healthy, null);
+
+    expect(() => hub.emitKeepAlive(SESSION)).not.toThrow();
+    expect(frames(healthy.written)).toHaveLength(1);
+    expect(hub.stats()[SESSION]).toBe(1);
+  });
+
+  it("ignores an unknown session", () => {
+    expect(() => newHub().emitKeepAlive("nope")).not.toThrow();
+  });
+
+  it("writes both a comment and a named event to every subscriber on the timer", () => {
     vi.useFakeTimers();
     try {
       const hub = newHub({ keepaliveMs: 1000 });
@@ -328,8 +414,12 @@ describe("keepalive", () => {
 
       vi.advanceTimersByTime(3000);
 
-      expect(a.written.filter((w) => w.includes("keepalive"))).toHaveLength(3);
-      expect(b.written.filter((w) => w.includes("keepalive"))).toHaveLength(3);
+      for (const res of [a, b]) {
+        // Two writes per tick: the comment for the proxies, the named event for
+        // the browser. A client can only detect liveness from the second one.
+        expect(res.written.filter((w) => w === ": keepalive\n\n")).toHaveLength(3);
+        expect(res.written.filter((w) => w === KEEPALIVE_FRAME)).toHaveLength(3);
+      }
       hub.stopKeepalive();
     } finally {
       vi.useRealTimers();
@@ -345,7 +435,8 @@ describe("keepalive", () => {
       hub.startKeepalive();
       hub.startKeepalive();
       vi.advanceTimersByTime(1000);
-      expect(res.written.filter((w) => w.includes("keepalive"))).toHaveLength(1);
+      expect(res.written.filter((w) => w === ": keepalive\n\n")).toHaveLength(1);
+      expect(res.written.filter((w) => w === KEEPALIVE_FRAME)).toHaveLength(1);
       hub.stopKeepalive();
     } finally {
       vi.useRealTimers();
@@ -467,5 +558,134 @@ describe("stats", () => {
     const a = fakeResponse();
     hub.attach(SESSION, a, null);
     expect(hub.stats()).toEqual({ [SESSION]: 1 });
+  });
+});
+
+/*
+ * The subscriber teardown on the route itself, which is not hub code and so is
+ * not reachable from a `fakeResponse` above.
+ *
+ * It lives in this file rather than in sse-cors.test.ts for one reason: this is
+ * the file that owns the behaviour. Everything above exercises the hub in
+ * isolation, and the half of the fix that decides *when* to detach — the `error`
+ * handler on the response, next to the existing `close` handler on the request —
+ * has no other home. It is a wire test either way; the header assertions in
+ * sse-cors.test.ts are about a browser accepting the 200, these are about what
+ * happens to the subscriber afterwards.
+ */
+describe("a subscriber whose stream dies without closing", () => {
+  const ORIGIN = "https://microsoft-onenote-exporter.phttp.com";
+  const SECRET = "A".repeat(43);
+
+  const config: ApiConfig = {
+    allowedOrigins: validateOrigins(ORIGIN),
+    csrfKey: "C".repeat(43),
+    sessionTtlHours: 12,
+    minFreeDiskMb: 2048,
+    publicOrigin: "https://one-backend.phttp.com",
+    orchestratorUrl: "http://mock:9100",
+    orchestratorSecret: "B".repeat(43),
+    orchestratorReplayWindowSeconds: 60,
+    // Silent, so the payload-free warn the handler emits is not test output.
+    logLevel: "silent",
+    listen: "127.0.0.1:0",
+    databasePath: ":memory:",
+    sseBufferEvents: 500,
+    sseKeepaliveMs: 15_000,
+  };
+
+  /**
+   * Open the stream over a real socket and hand back the hub plus the
+   * ServerResponse the route attached it to.
+   *
+   * `inject` cannot be used: it waits for the response to complete, and an SSE
+   * response never completes until it is closed. A real `fetch` gets the
+   * headers as soon as they land, which is also what a browser does.
+   *
+   * The `ServerResponse` itself is captured by spying on `attach` rather than by
+   * reaching into the server, because the alternative — provoking a genuine
+   * ECONNRESET from a socket — is a timing-dependent test for a behaviour that
+   * is just an event dispatch.
+   */
+  async function openStream(): Promise<{
+    hub: SseHub;
+    stream: ServerResponse;
+    release: () => Promise<void>;
+  }> {
+    const db = new Db(":memory:");
+    db.createSession({
+      guid: SESSION,
+      secretHash: hashSecret(SECRET),
+      csrfKey: generateCsrfKey(),
+      now: Date.now(),
+      expiresAt: Date.now() + 43_200_000,
+    });
+    const hub = new SseHub({ now: () => Date.now() });
+    const attach = vi.spyOn(hub, "attach");
+    const app = buildServer(config, {
+      db,
+      sse: hub,
+      limiter: new RateLimiter({ logSalt: "t" }),
+      orchestrator: new FakeOrchestrator({ size: 1 }),
+    });
+    await app.ready();
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+
+    const controller = new AbortController();
+    // The body never completes, so this promise never settles on its own; it
+    // rejects on abort, which is below this point in the test, not here.
+    void fetch(`${address}/api/session/events`, {
+      headers: { cookie: `${SESSION_COOKIE}=${SESSION}:${SECRET}` },
+      signal: controller.signal,
+    }).catch(() => undefined);
+
+    // Headers are flushed before the subscriber is attached, so reaching for the
+    // response is not enough — wait for the attach itself.
+    await vi.waitFor(() => expect(attach).toHaveBeenCalled());
+
+    return {
+      hub,
+      stream: attach.mock.calls[0]?.[1] as ServerResponse,
+      release: async () => {
+        controller.abort();
+        await app.close();
+        db.close();
+      },
+    };
+  }
+
+  it("detaches the subscriber when the response emits an error", async () => {
+    const open = await openStream();
+    try {
+      expect(open.hub.stats()[SESSION]).toBe(1);
+
+      // What Node does when the socket dies under it: an `error` on the
+      // *response*, with no `close` on the request and nothing thrown from any
+      // write. `close` alone leaves this subscriber registered forever, and the
+      // api then writes into a socket nobody is reading.
+      open.stream.emit("error", new Error("ECONNRESET"));
+
+      expect(open.hub.stats()).toEqual({});
+    } finally {
+      await open.release();
+    }
+  });
+
+  it("keeps serving the other tabs", async () => {
+    // One dead socket must not cost the live ones their stream, which is the
+    // property `emit()`'s per-subscriber try/catch has always had.
+    const open = await openStream();
+    try {
+      const other = fakeResponse();
+      open.hub.attach(SESSION, other, null);
+
+      open.stream.emit("error", new Error("ECONNRESET"));
+
+      open.hub.emit(SESSION, "export-done", {});
+      expect(frames(other.written)).toHaveLength(1);
+      expect(open.hub.stats()[SESSION]).toBe(1);
+    } finally {
+      await open.release();
+    }
   });
 });

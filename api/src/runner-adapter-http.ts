@@ -1486,8 +1486,14 @@ function publish(
         // and nothing to race: this event says the walk stopped, and the browser's
         // refresh reads a row that is already correct.
         sse.emit(sessionId, "export-aborted", { id });
-      } else {
+      } else if (type === "export-started") {
         sse.emit(sessionId, "export-started", { id });
+      } else {
+        // Unreachable through the public adapter: the outer switch at line 1261
+        // admits only the six export types, so `default:` already drops anything
+        // else. Kept so that adding a seventh case label above makes the omission
+        // a drop rather than an emit under a borrowed name.
+        return "dropped";
       }
       return "published";
     }

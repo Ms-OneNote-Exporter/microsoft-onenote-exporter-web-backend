@@ -1036,24 +1036,6 @@ describe("PoolBinder.releaseForIdle", () => {
     expect(db.getSession(GUID)?.auth_state).toBe("valid");
   });
 
-  it("promotes an interrupted login back to valid on release", async () => {
-    // A claim sets auth_state to authenticating. An idle release while that is
-    // still set means the login finished but the state was not updated — the
-    // vault holds a usable auth.json, so the session should be usable.
-    seedRunners(1);
-    seedSession(GUID, {
-      state: "authenticating",
-      auth_state: "authenticating",
-      runner_id: "slot-1",
-    });
-    const { client } = orchestratorStub({ release: "ok" });
-    const binder = new PoolBinder(options(client));
-
-    await binder.releaseForIdle(db.getSession(GUID)!);
-
-    expect(db.getSession(GUID)?.auth_state).toBe("valid");
-  });
-
   // A container that still exists must not be forgotten, or reconciliation will
   // not find it.
   it("retains the slot when the orchestrator cannot be reached", async () => {

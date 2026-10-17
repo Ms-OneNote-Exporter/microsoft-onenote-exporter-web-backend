@@ -146,6 +146,38 @@ func TestReconcileAtColdStartAdoptsABoundRunnerWithItsVault(t *testing.T) {
 	}
 }
 
+// A boot-detected dead bound container must appear in DeadBoundSlots so the api
+// can distinguish "dead and reported" from "never seen."
+func TestReconcileAtColdStartReportsADeadBoundRunnerInDeadSlots(t *testing.T) {
+	guid := "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+	f := newColdStartFixture(t, 1)
+	created := f.now.Add(-time.Minute)
+	expires := f.now.Add(time.Hour)
+	_ = f.d.add("dead-bound", false, runnerLabels("slot-2", true, created, expires))
+
+	if err := f.p.Reconcile(t.Context(), nothingExpired); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	slots := f.p.Slots()
+	if len(slots) != 1 {
+		t.Fatalf("slots = %d, want 1", len(slots))
+	}
+	if slots[0].State != StateDead {
+		t.Fatalf("state = %q, want dead", slots[0].State)
+	}
+	if slots[0].SessionGUID != guid {
+		t.Fatalf("session = %q, want %q", slots[0].SessionGUID, guid)
+	}
+	if got := f.p.DeadBoundSlots(); len(got) != 1 || got[0] != "slot-2" {
+		t.Fatalf("DeadBoundSlots = %v, want [slot-2]: a boot-detected dead bound "+
+			"container must be reported in /stats deadSlots", got)
+	}
+	if got := f.p.Stats().DeadSlots; len(got) != 1 || got[0] != "slot-2" {
+		t.Fatalf("Stats().DeadSlots = %v, want [slot-2]", got)
+	}
+}
+
 // Adoption and pool filling happen back to back on every boot, so they must not fight.
 // `nextSlotSeq` is a process-global starting at 1: without skipping ids already in use,
 // filling a pool that adopted `slot-1` overwrote the entry for a container that was
@@ -570,6 +602,12 @@ func TestReconcileAdoptsAnOverAgeBoundRunnerThatHasExitedAsDead(t *testing.T) {
 	}
 	if slots[0].SessionGUID != guid {
 		t.Errorf("adopted session = %q, want %q", slots[0].SessionGUID, guid)
+	}
+	// A boot-adopted dead bound container must appear in DeadBoundSlots so the
+	// api can distinguish "dead and reported" from "never seen".
+	if got := f.p.DeadBoundSlots(); len(got) != 1 || got[0] != "slot-1" {
+		t.Errorf("DeadBoundSlots = %v, want [slot-1]: a boot-adopted dead bound "+
+			"container must be reported in /stats deadSlots", got)
 	}
 }
 

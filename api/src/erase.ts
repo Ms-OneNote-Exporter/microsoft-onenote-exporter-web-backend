@@ -99,7 +99,7 @@ export interface EraserOrchestrator {
    */
   deleteArtifact(artifactId: string): Promise<void>;
   /** Reports pool occupancy, used to reclaim the slot. */
-  stats(): Promise<{ ok: boolean; value: { size: number } }>;
+  stats(): Promise<{ ok: boolean; value: { size: number; deadSlots?: readonly string[] } }>;
 }
 
 /** The result of the runner-facing part of an erase. */
@@ -182,6 +182,52 @@ export async function runErase(deps: EraseDeps, sessionId: string): Promise<Eras
 
   const session = deps.db.getSession(sessionId);
   const slotId = session?.runner_id ?? null;
+  // Check if the runner's slot is dead before proceeding with erase steps
+  let runnerDead = false;
+  if (slotId !== null) {
+    try {
+      const statsResult = await deps.orchestrator.stats();
+      if (statsResult.ok && statsResult.value.deadSlots?.includes(slotId)) {
+        runnerDead = true;
+      }
+    } catch {
+      // stats failed — assume not dead, proceed normally
+    }
+  }
+
+
+  // Short-circuit: if the runner's slot is dead, skip all runner-facing steps.
+  // The runner is gone — abort/freeze/shred/remove would all fail on transport,
+  // and the user has already erased. Just delete the row and reclaim the slot.
+  if (runnerDead) {
+    log.warn("erase: runner slot is dead, skipping runner-facing steps", {
+      session: sessionId,
+      slot: slotId,
+    });
+    // Step 7: Delete the row
+    try {
+      deps.db.deleteSession(sessionId);
+      note("row-deleted");
+    } catch (error) {
+      note("row-deleted", error);
+    }
+    // Step 8: Reclaim the slot (container is dead, so remove the row)
+    if (slotId !== null) {
+      try {
+        deps.db.removeRunner(slotId);
+      } catch (error) {
+        log.warn("erase: runner row could not be removed", {
+          session: sessionId,
+          slot: slotId,
+          error: String(error),
+        });
+      }
+    }
+    if (failedAt !== null) {
+      return { ok: false, steps, failedAt, error: firstError };
+    }
+    return { ok: true, steps };
+  }
 
   // 2. Abort any active login or export. §8.2: aborting preserves what is on
   // disk, which is then deleted by step 4 — this step exists so the abort does
@@ -191,6 +237,15 @@ export async function runErase(deps: EraseDeps, sessionId: string): Promise<Eras
     note("aborted");
   } catch (error) {
     note("aborted", error);
+    // Re-check: the runner may have died during this step.
+    if (!runnerDead && slotId !== null) {
+      try {
+        const recheck = await deps.orchestrator.stats();
+        if (recheck.ok && recheck.value.deadSlots?.includes(slotId)) {
+          runnerDead = true;
+        }
+      } catch { /* assume not dead */ }
+    }
   }
 
   // 3. Freeze the runner, so it cannot write into the directory being deleted.
@@ -199,6 +254,14 @@ export async function runErase(deps: EraseDeps, sessionId: string): Promise<Eras
     note("frozen");
   } catch (error) {
     note("frozen", error);
+    if (!runnerDead && slotId !== null) {
+      try {
+        const recheck = await deps.orchestrator.stats();
+        if (recheck.ok && recheck.value.deadSlots?.includes(slotId)) {
+          runnerDead = true;
+        }
+      } catch { /* assume not dead */ }
+    }
   }
 
   // 4 and 5. Secure delete then remove the directory. Both happen in the runner:
@@ -214,6 +277,14 @@ export async function runErase(deps: EraseDeps, sessionId: string): Promise<Eras
   } catch (error) {
     note("files-removed", error);
     note("directory-removed", error);
+    if (!runnerDead && slotId !== null) {
+      try {
+        const recheck = await deps.orchestrator.stats();
+        if (recheck.ok && recheck.value.deadSlots?.includes(slotId)) {
+          runnerDead = true;
+        }
+      } catch { /* assume not dead */ }
+    }
   }
 
   // 6. Remove or recycle the container. §11: "force remove; if still failing, mark
@@ -235,6 +306,14 @@ export async function runErase(deps: EraseDeps, sessionId: string): Promise<Eras
       // `removal` stays null and step 8 reads it as "retain", which is the direction
       // that cannot destroy a record of a live container.
       note("container-removed", error);
+      if (!runnerDead) {
+        try {
+          const recheck = await deps.orchestrator.stats();
+          if (recheck.ok && recheck.value.deadSlots?.includes(slotId)) {
+            runnerDead = true;
+          }
+        } catch { /* assume not dead */ }
+      }
     }
   } else {
     // Nothing bound, so nothing to remove. Recorded so the step list is complete
@@ -289,6 +368,14 @@ export async function runErase(deps: EraseDeps, sessionId: string): Promise<Eras
       note("artifact-deleted");
     } catch (error) {
       note("artifact-deleted", error);
+      if (!runnerDead && slotId !== null) {
+        try {
+          const recheck = await deps.orchestrator.stats();
+          if (recheck.ok && recheck.value.deadSlots?.includes(slotId)) {
+            runnerDead = true;
+          }
+        } catch { /* assume not dead */ }
+      }
     }
   }
 
@@ -358,7 +445,12 @@ export async function runErase(deps: EraseDeps, sessionId: string): Promise<Eras
   // The caller is responsible for the eighth thing erase must do, which has no
   // server-side action at all: expiring the cookies. See `expireCookieHeaders`.
 
+  // If the runner died during the erase, the failures are expected — the user has
+  // erased. Return ok: true instead of ok: false.
   if (failedAt !== null) {
+    if (runnerDead) {
+      return { ok: true, steps };
+    }
     return { ok: false, steps, failedAt, error: firstError };
   }
   return { ok: true, steps };

@@ -52,6 +52,7 @@ import {
   TTL,
 } from "./sweep.js";
 import { buildServer } from "./server.js";
+import { pendingErase } from "./erase.js";
 
 /**
  * How often the sweepers run.
@@ -606,6 +607,19 @@ async function main(): Promise<void> {
 
   const { app, config, db, sse, binder, orchestrator } = booted;
 
+  // Check for pending erases at boot.
+  try {
+    const pending = pendingErase(db);
+    if (pending.length > 0) {
+      booted.log.warn("pending erases found at boot", {
+        count: pending.length,
+        guids: pending.map((s) => s.guid),
+      });
+    }
+  } catch (error) {
+    booted.log.warn("pendingErase check at boot failed", { error: String(error) });
+  }
+
   // Sweepers. Independent intervals on purpose: an idle sweep that never runs
   // holds containers, and a session sweep that never runs grows the database.
   const sweeper = setInterval(() => {
@@ -632,6 +646,9 @@ async function main(): Promise<void> {
             rowsCleaned: report.phantomRowsCleaned,
             exportsRunnerDied: report.exportsRunnerDied,
           });
+        }
+        if (report.pendingErases > 0) {
+          booted.log.warn("pending erases found", { count: report.pendingErases });
         }
       })
       .catch((error: unknown) => {

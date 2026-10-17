@@ -22,6 +22,7 @@
  */
 
 import type { Db, SessionRow } from "./db.js";
+import { pendingErase } from "./erase.js";
 import type { OrchestratorApi, OrchestratorResult, OrchestratorStats } from "./orchestrator-client.js";
 import type { SseHub } from "./sse.js";
 
@@ -144,6 +145,8 @@ export interface SweepReport {
   loginExpired: number;
   /** Sessions left for the erase machine because they were mid-erase. */
   skippedErasing: number;
+  /** Sessions stuck mid-erase, found by pendingErase. */
+  pendingErases: number;
   /**
    * Exports whose runner was **kept** despite the session's idle deadline having passed.
    *
@@ -1130,6 +1133,7 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
     unclaimedExpired: 0,
     loginExpired: 0,
     skippedErasing: 0,
+    pendingErases: 0,
     exportsHeld: 0,
     exportsStranded: 0,
     exportsRunnerDied: 0,
@@ -1469,6 +1473,20 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
       }
       continue;
     }
+  }
+
+  // Pending erases: sessions stuck mid-machine. Alert so operators know.
+  try {
+    const pending = pendingErase(db);
+    report.pendingErases = pending.length;
+    if (pending.length > 0) {
+      log.warn("pending erases found", {
+        count: pending.length,
+        guids: pending.map((s) => s.guid),
+      });
+    }
+  } catch (error) {
+    log.warn("pendingErase check failed", { error: String(error) });
   }
 
   // After the loop, never inside it. A session row deleted *by this very tick* — the

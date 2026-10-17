@@ -1400,6 +1400,7 @@ describe("sweep", () => {
     seedSession(GUID, { state: "erasing", expires_at: now - 1 });
     const report = await run();
     expect(report.skippedErasing).toBe(1);
+    expect(report.pendingErases).toBe(1);
     expect(db.getSession(GUID)).toBeDefined();
   });
 

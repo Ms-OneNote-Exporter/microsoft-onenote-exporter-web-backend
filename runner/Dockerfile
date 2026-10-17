@@ -202,7 +202,7 @@ COPY --from=build /app/dist ./dist
 # `unknown instruction: const`. Exactly the mistake the api's Dockerfile already
 # documents and works around; recorded here because it is the same trap and this
 # file is new.
-RUN test "$(node -p "Object.keys(require('./package.json').dependencies).sort().join(',')")" = "@msout/microsoft-onenote-export-notebook,@msout/microsoft-onenote-list-notebooks,@msout/microsoft-webauth,archiver,fastify" \
+RUN test "$(node -p "Object.entries(require('./package.json').dependencies).map(([k,v])=>k+'@'+v).sort().join(',')")" = "@msout/microsoft-onenote-export-notebook@0.5.0,@msout/microsoft-onenote-list-notebooks@0.0.8,@msout/microsoft-webauth@0.1.12,archiver@7.0.1,fastify@5.12.5" \
  && echo "runtime dependency set is as expected"
 
 EXPOSE 3100

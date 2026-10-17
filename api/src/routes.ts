@@ -1045,7 +1045,15 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
           // the machine reports "pool stats unavailable", not a TS error.
           stats: async () => {
             const result = await deps.orchestrator.stats();
-            return { ok: result.ok, value: { size: result.ok ? result.value.size : 0 } };
+            return {
+              ok: result.ok,
+              value: {
+                size: result.ok ? result.value.size : 0,
+                ...(result.ok && result.value.deadSlots !== undefined
+                  ? { deadSlots: result.value.deadSlots }
+                  : {}),
+              },
+            };
           },
         },
         runner: deps.eraseRunner,

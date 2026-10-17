@@ -37,6 +37,7 @@ function makeDeps(
     failAt?: string;
     boundSlot?: string | null;
     removeAnswers?: "ok" | "conflict" | "unreachable" | "unexpected";
+    deadSlots?: string[];
   } = {},
 ) {
   const calls: string[] = [];
@@ -78,7 +79,7 @@ function makeDeps(
       if (e) throw e;
     },
     async stats() {
-      return { ok: true as const, value: { size: 0 } };
+      return { ok: true as const, value: { size: 0, deadSlots: options.deadSlots ?? [] } };
     },
   };
 
@@ -143,6 +144,42 @@ describe("runErase", () => {
       ]);
     }
     expect(calls).toEqual(["abort", "freeze", "shredDirectory", "remove:slot-1"]);
+  });
+
+  it("short-circuits to ok when the runner is dead", async () => {
+    seedSession(GUID, "authenticated", "slot-1");
+    const { deps, calls } = makeDeps({ deadSlots: ["slot-1"] });
+
+    const outcome = await runErase(deps, GUID);
+
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) {
+      // Runner-facing steps are NOT recorded (skipped)
+      expect(outcome.steps).not.toContain("aborted");
+      expect(outcome.steps).not.toContain("frozen");
+      expect(outcome.steps).not.toContain("files-removed");
+      expect(outcome.steps).not.toContain("directory-removed");
+      expect(outcome.steps).not.toContain("container-removed");
+      expect(outcome.steps).not.toContain("artifact-deleted");
+      // Row is deleted
+      expect(outcome.steps).toContain("row-deleted");
+    }
+    // No runner-facing calls made
+    expect(calls).not.toContain("abort");
+    expect(calls).not.toContain("freeze");
+    expect(calls).not.toContain("shredDirectory");
+    // Row is deleted
+    expect(db.getSession(GUID)).toBeUndefined();
+  });
+
+  it("reclaims the slot when the runner is dead", async () => {
+    seedSession(GUID, "authenticated", "slot-1");
+    seedBoundRunner("slot-1", GUID);
+    const { deps } = makeDeps({ deadSlots: ["slot-1"] });
+
+    await runErase(deps, GUID);
+
+    expect(runnerRow("slot-1")).toBeUndefined();
   });
 
   it("removes the row", async () => {

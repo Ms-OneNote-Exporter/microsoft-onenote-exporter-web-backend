@@ -517,11 +517,30 @@ func (p *Pool) Stats() Stats {
 func (p *Pool) DeadBoundSlots() []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(p.deadBound) == 0 {
+	seen := make(map[string]struct{}, len(p.deadBound))
+	for id := range p.deadBound {
+		seen[id] = struct{}{}
+	}
+	// Include bound slots adopted at boot as StateDead. Reconcile marks these
+	// dead at boot (the container was not running) but never adds them to
+	// deadBound, because deadBound is populated by observeBoundRunner during
+	// Sweep, which only runs for StateBound slots. Without this, a boot-detected
+	// dead bound slot is invisible in /stats deadSlots until the next Sweep
+	// observes it — but Sweep skips StateDead slots, so it never would be.
+	//
+	// ContainerID != "" guards against slots where the container was already
+	// removed (e.g. expired-session path in Reconcile clears both ContainerID
+	// and SessionGUID). A slot with no container has nothing to observe.
+	for _, s := range p.slots {
+		if s.State == StateDead && s.SessionGUID != "" && s.ContainerID != "" {
+			seen[s.ID] = struct{}{}
+		}
+	}
+	if len(seen) == 0 {
 		return nil
 	}
-	out := make([]string, 0, len(p.deadBound))
-	for id := range p.deadBound {
+	out := make([]string, 0, len(seen))
+	for id := range seen {
 		out = append(out, id)
 	}
 	sort.Strings(out)

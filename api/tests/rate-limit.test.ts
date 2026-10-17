@@ -1,4 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, afterEach } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Db } from "../src/db.js";
 import { DEFAULT_LIMITS, RateLimiter } from "../src/rate-limit.js";
 
 /**
@@ -259,5 +263,102 @@ describe("bucket hygiene", () => {
     expect(stats.requestBuckets).toBe(1);
     expect(stats.sessionBuckets).toBe(1);
     expect(stats.activeExports).toBe(1);
+  });
+});
+
+describe("persistence across restarts", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs) {
+      try { rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
+    dirs.length = 0;
+  });
+
+  it("retains request counters across a new RateLimiter on the same Db file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rl-persist-"));
+    dirs.push(dir);
+    const dbPath = join(dir, "api.db");
+    const ADDRESS = "198.51.100.7";
+
+    // First process: exhaust the request budget.
+    const db1 = new Db(dbPath);
+    const l1 = new RateLimiter({ db: db1, now: () => 1_700_000_000_000, logSalt: "test-salt" });
+    for (let i = 0; i < DEFAULT_LIMITS.requestsPerMinute.max; i++) {
+      expect(l1.checkRequest(ADDRESS).allowed).toBe(true);
+    }
+    expect(l1.checkRequest(ADDRESS).allowed).toBe(false);
+
+    // Second process: same Db file, fresh RateLimiter.
+    const db2 = new Db(dbPath);
+    const l2 = new RateLimiter({ db: db2, now: () => 1_700_000_000_000, logSalt: "test-salt" });
+    expect(l2.checkRequest(ADDRESS).allowed).toBe(false);
+  });
+
+  it("retains session counters across a new RateLimiter on the same Db file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rl-persist-"));
+    dirs.push(dir);
+    const dbPath = join(dir, "api.db");
+    const ADDRESS = "198.51.100.7";
+
+    const db1 = new Db(dbPath);
+    const l1 = new RateLimiter({ db: db1, now: () => 1_700_000_000_000, logSalt: "test-salt" });
+    for (let i = 0; i < DEFAULT_LIMITS.sessionsPerWindow.max; i++) {
+      expect(l1.checkNewSession(ADDRESS).allowed).toBe(true);
+    }
+    expect(l1.checkNewSession(ADDRESS).allowed).toBe(false);
+
+    const db2 = new Db(dbPath);
+    const l2 = new RateLimiter({ db: db2, now: () => 1_700_000_000_000, logSalt: "test-salt" });
+    expect(l2.checkNewSession(ADDRESS).allowed).toBe(false);
+  });
+
+  it("prunes expired hits across the process boundary", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rl-persist-"));
+    dirs.push(dir);
+    const dbPath = join(dir, "api.db");
+    const ADDRESS = "198.51.100.7";
+    const T0 = 1_700_000_000_000;
+
+    const db1 = new Db(dbPath);
+    const l1 = new RateLimiter({ db: db1, now: () => T0, logSalt: "test-salt" });
+    for (let i = 0; i < DEFAULT_LIMITS.requestsPerMinute.max; i++) {
+      l1.checkRequest(ADDRESS);
+    }
+
+    // Second process, time advanced past the window.
+    const db2 = new Db(dbPath);
+    const l2 = new RateLimiter({ db: db2, now: () => T0 + 60_001, logSalt: "test-salt" });
+    expect(l2.checkRequest(ADDRESS).allowed).toBe(true);
+  });
+});
+
+describe("forgetAddress across event types", () => {
+  it("clears both request and session counters", () => {
+    const l = new RateLimiter({ now: () => 1_700_000_000_000, logSalt: "test-salt" });
+    const ADDRESS = "198.51.100.7";
+
+    l.checkRequest(ADDRESS);
+    l.checkNewSession(ADDRESS);
+
+    l.forgetAddress(ADDRESS);
+
+    // Both should be allowed again (fresh).
+    expect(l.checkRequest(ADDRESS).allowed).toBe(true);
+    expect(l.checkNewSession(ADDRESS).allowed).toBe(true);
+  });
+});
+
+describe("rate_limit_events CHECK constraint", () => {
+  it("rejects an unknown event_type", () => {
+    const db = new Db(":memory:");
+    expect(() =>
+      db.run(
+        "INSERT INTO rate_limit_events (address_hash, event_type, created_at) VALUES (?, ?, ?)",
+        "abc",
+        "foo",
+        123,
+      ),
+    ).toThrow();
   });
 });

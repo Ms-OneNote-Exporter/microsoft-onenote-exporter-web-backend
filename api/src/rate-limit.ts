@@ -8,19 +8,23 @@
  *   per-session  one active export, and a session's own request budget
  *   global       the backstop, when the per-IP layers are distributed
  *
- * Counters are in memory. That is a deliberate limitation and it is honest about
- * one: a restart resets the buckets, so an attacker who can crash the api can
- * clear its own limits. The global caps and the orchestrator's pool size are what
- * bound the damage — a limiter that can be reset by a crash is not the control
- * that keeps the host up, it is the control that keeps one address from
- * monopolising it. PLAN-v2 §10's global cap is enforced against the pool, not
- * against this process's memory.
+ * Counters are persisted to SQLite (issue #86) so a restart does not clear them.
+ * The global `activeExports` backstop stays in memory — it tracks currently
+ * running exports, which are dead after a restart anyway, so resetting to 0 is
+ * correct.
+ *
+ * A limiter that can be reset by a crash is not the control that keeps the host
+ * up, it is the control that keeps one address from monopolising it. PLAN-v2
+ * §10's global cap is enforced against the pool, not against this process's
+ * memory.
  *
  * Nothing here persists a raw address. Counters key on the address §3.5 resolved,
- * which is already an IPv6 /48, and the log line uses a hash.
+ * which is already an IPv6 /48, and the log line uses a hash. Only the 16-char
+ * hash is stored in SQLite (T-P5).
  */
 
 import { hashForLog } from "./client-ip.js";
+import { Db } from "./db.js";
 // Type-only, so the import is erased and this is not a runtime cycle with
 // config.ts — which imports DEFAULT_LIMITS from this module.
 import type { ApiConfig } from "./config.js";
@@ -53,13 +57,8 @@ export type Decision =
       readonly retryAfterSeconds: number;
     };
 
-/** One counter bucket. */
-interface Bucket {
-  /** Hit timestamps within the window, oldest first. */
-  readonly hits: number[];
-}
-
 export interface RateLimiterOptions {
+  readonly db?: Db;
   readonly limits?: typeof DEFAULT_LIMITS;
   /** Salt for log hashes. Not secret; per-deployment so buckets are not portable. */
   readonly logSalt?: string;
@@ -88,9 +87,11 @@ export interface RateLimiterOptions {
  */
 export function buildRateLimiter(
   config: Pick<ApiConfig, "sessionsPerHour">,
+  db?: Db,
   logSalt = "api",
 ): RateLimiter {
   return new RateLimiter({
+    ...(db !== undefined ? { db } : {}),
     logSalt,
     limits: {
       ...DEFAULT_LIMITS,
@@ -103,8 +104,7 @@ export function buildRateLimiter(
 }
 
 export class RateLimiter {
-  readonly #requests = new Map<string, Bucket>();
-  readonly #sessions = new Map<string, Bucket>();
+  readonly #db: Db;
   readonly #limits: typeof DEFAULT_LIMITS;
   readonly #logSalt: string;
   readonly #now: () => number;
@@ -112,6 +112,7 @@ export class RateLimiter {
   #activeExports = 0;
 
   constructor(options: RateLimiterOptions = {}) {
+    this.#db = options.db ?? new Db(":memory:");
     this.#limits = options.limits ?? DEFAULT_LIMITS;
     this.#logSalt = options.logSalt ?? "msout";
     this.#now = options.now ?? (() => Date.now());
@@ -123,23 +124,46 @@ export class RateLimiter {
    * A refused request is *not* recorded. Recording it would let a caller who is
    * being throttled extend its own penalty indefinitely, which turns a rate limit
    * into a lockout the attacker controls.
+   *
+   * Safety: `DatabaseSync` is synchronous and single-process. No two Fastify
+   * handlers can interleave inside a statement, so the DELETE → SELECT → INSERT
+   * sequence below is safe without an explicit transaction.
    */
   checkRequest(address: string): Decision {
     const now = this.#now();
-    const bucket = this.#prune(this.#requests, address, this.#limits.requestsPerMinute, now);
+    const hash = this.hashOf(address);
+    const limit = this.#limits.requestsPerMinute;
+    const cutoff = now - limit.windowMs;
 
-    if (bucket.hits.length >= this.#limits.requestsPerMinute.max) {
+    // Prune expired hits for this address.
+    this.#db.run(
+      "DELETE FROM rate_limit_events WHERE address_hash = ? AND event_type = 'request' AND created_at <= ?",
+      hash,
+      cutoff,
+    );
+
+    // Count remaining hits and find the oldest in one query.
+    const row = this.#db.get<{ oldest: number | null; count: number }>(
+      "SELECT MIN(created_at) AS oldest, COUNT(*) AS count FROM rate_limit_events WHERE address_hash = ? AND event_type = 'request'",
+      hash,
+    );
+    const count = row?.count ?? 0;
+
+    if (count >= limit.max) {
+      const oldest = row?.oldest ?? now;
       return {
         allowed: false,
         reason: "rate-limited",
-        retryAfterSeconds: this.#retryAfter(
-          bucket.hits,
-          now,
-          this.#limits.requestsPerMinute.windowMs,
-        ),
+        retryAfterSeconds: this.#retryAfter(oldest, now, limit.windowMs),
       };
     }
-    bucket.hits.push(now);
+
+    // Record the hit.
+    this.#db.run(
+      "INSERT INTO rate_limit_events (address_hash, event_type, created_at) VALUES (?, 'request', ?)",
+      hash,
+      now,
+    );
     return { allowed: true };
   }
 
@@ -153,20 +177,39 @@ export class RateLimiter {
    */
   checkNewSession(address: string): Decision {
     const now = this.#now();
-    const bucket = this.#prune(this.#sessions, address, this.#limits.sessionsPerWindow, now);
+    const hash = this.hashOf(address);
+    const limit = this.#limits.sessionsPerWindow;
+    const cutoff = now - limit.windowMs;
 
-    if (bucket.hits.length >= this.#limits.sessionsPerWindow.max) {
+    // Prune expired hits for this address.
+    this.#db.run(
+      "DELETE FROM rate_limit_events WHERE address_hash = ? AND event_type = 'session' AND created_at <= ?",
+      hash,
+      cutoff,
+    );
+
+    // Count remaining hits and find the oldest in one query.
+    const row = this.#db.get<{ oldest: number | null; count: number }>(
+      "SELECT MIN(created_at) AS oldest, COUNT(*) AS count FROM rate_limit_events WHERE address_hash = ? AND event_type = 'session'",
+      hash,
+    );
+    const count = row?.count ?? 0;
+
+    if (count >= limit.max) {
+      const oldest = row?.oldest ?? now;
       return {
         allowed: false,
         reason: "too-many-sessions",
-        retryAfterSeconds: this.#retryAfter(
-          bucket.hits,
-          now,
-          this.#limits.sessionsPerWindow.windowMs,
-        ),
+        retryAfterSeconds: this.#retryAfter(oldest, now, limit.windowMs),
       };
     }
-    bucket.hits.push(now);
+
+    // Record the hit.
+    this.#db.run(
+      "INSERT INTO rate_limit_events (address_hash, event_type, created_at) VALUES (?, 'session', ?)",
+      hash,
+      now,
+    );
     return { allowed: true };
   }
 
@@ -213,8 +256,8 @@ export class RateLimiter {
    * unusable for the people who need it.
    */
   forgetAddress(address: string): void {
-    this.#requests.delete(address);
-    this.#sessions.delete(address);
+    const hash = this.hashOf(address);
+    this.#db.run("DELETE FROM rate_limit_events WHERE address_hash = ?", hash);
   }
 
   /**
@@ -228,43 +271,27 @@ export class RateLimiter {
   }
 
   /**
-   * prune returns the bucket for a key, dropping hits that have aged out.
-   *
-   * The bucket is created and returned even when it is empty, so the caller can
-   * push a hit onto it. Emptiness is cleaned up by `#pruneIfEmpty` on the next
-   * visit rather than here, because the caller always needs a live reference.
-   */
-  #prune(store: Map<string, Bucket>, key: string, limit: Limit, now: number): Bucket {
-    let bucket = store.get(key);
-    if (bucket === undefined) {
-      bucket = { hits: [] };
-      store.set(key, bucket);
-    }
-    const cutoff = now - limit.windowMs;
-    // Hits are pushed in ascending order, so the expired ones are a prefix.
-    while (bucket.hits.length > 0 && (bucket.hits[0] ?? 0) <= cutoff) {
-      bucket.hits.shift();
-    }
-    return bucket;
-  }
-
-  /**
    * retryAfter returns whole seconds until the oldest hit ages out.
    *
    * The window is passed in rather than assumed: the session limit is an hour and
    * the request limit is a minute, and returning the wrong one would tell a caller
    * to retry when the bucket had already cleared.
    */
-  #retryAfter(hits: number[], now: number, windowMs: number): number {
-    const oldest = hits[0] ?? now;
+  #retryAfter(oldest: number, now: number, windowMs: number): number {
     return Math.max(1, Math.ceil((oldest + windowMs - now) / 1000));
   }
 
   /** stats reports bucket sizes, for health. */
   stats(): { requestBuckets: number; sessionBuckets: number; activeExports: number } {
+    const reqRow = this.#db.get<{ count: number }>(
+      "SELECT COUNT(DISTINCT address_hash) AS count FROM rate_limit_events WHERE event_type = 'request'",
+    );
+    const sessRow = this.#db.get<{ count: number }>(
+      "SELECT COUNT(DISTINCT address_hash) AS count FROM rate_limit_events WHERE event_type = 'session'",
+    );
     return {
-      requestBuckets: this.#requests.size,
-      sessionBuckets: this.#sessions.size,
+      requestBuckets: reqRow?.count ?? 0,
+      sessionBuckets: sessRow?.count ?? 0,
       activeExports: this.#activeExports,
     };
   }

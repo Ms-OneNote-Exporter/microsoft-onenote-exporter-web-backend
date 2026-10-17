@@ -129,6 +129,15 @@ CREATE INDEX IF NOT EXISTS sessions_expires_at ON sessions (expires_at);
 CREATE INDEX IF NOT EXISTS sessions_state ON sessions (state);
 CREATE INDEX IF NOT EXISTS runners_status ON runners (status);
 CREATE INDEX IF NOT EXISTS runners_session ON runners (session_guid);
+
+CREATE TABLE IF NOT EXISTS rate_limit_events (
+  address_hash  TEXT NOT NULL,
+  event_type    TEXT NOT NULL CHECK (event_type IN ('request', 'session')),
+  created_at    INTEGER NOT NULL
+);
+-- Table must exist before this index (SQLite rejects index-before-table).
+CREATE INDEX IF NOT EXISTS rate_limit_events_lookup
+  ON rate_limit_events (address_hash, event_type, created_at);
 `;
 
 /**

@@ -523,7 +523,7 @@ runner = new HttpRunnerAdapter({
       db,
       orchestrator,
       sse,
-      limiter: buildRateLimiter(config),
+      limiter: buildRateLimiter(config, db),
       // The four runner-facing routes. Previously 501.
       runner,
       poolBinder: binder,

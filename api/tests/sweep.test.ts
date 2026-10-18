@@ -2496,3 +2496,313 @@ describe("sweep exportsRunnerDied", () => {
     expect(db.getSession(GUID)?.artifact_id).toBe("artifact123");
   });
 });
+/**
+ * A session left `exporting` on a slot the orchestrator reclaimed to **idle**.
+ *
+ * ## The gap
+ *
+ * A boot TTL-replace (or any orchestrator restart) drops a bound slot's
+ * orchestrator-side `SessionGUID`, so the slot reports `idle`. The api's own records
+ * are then all consistent and all wrong: `state='exporting'`, `runner_id` set,
+ * `runners` row `active` — naming a slot nobody is bound to. The sweeper skips
+ * `exporting` sessions to protect live ones, so the idle deadline never applies and
+ * `POST /api/export` answers `409 an export is already running` for every future
+ * notebook, until the 12-hour absolute cap erases the row.
+ *
+ * Neither existing branch reaches it: `exportsStranded` needs `runner_id IS NULL`,
+ * and `exportsRunnerDied` needs the slot in `deadSlots` — which is bound-only, and an
+ * idle slot is not dead.
+ *
+ * ## The signal, and its one production shape
+ *
+ * `/stats.boundSessions` names **every slot the orchestrator currently binds**, so a
+ * session's slot being *absent as a key* is positive evidence it is unbound: idle,
+ * vacant, being recreated, or gone. The production shape is `boundSessions` **present**
+ * with this slot absent — the pool's one idle slot of two, the other slot bound to a
+ * live session — which is what test (a) builds. An **absent field** is a different
+ * thing entirely: an orchestrator predating it, or an all-idle pool, where `omitempty`
+ * drops the key. That is test (c) and it must never strand.
+ */
+describe("sweep exportsDispossessed", () => {
+  /** Read off a real host row rather than invented, so the shape is the real one. */
+  const REAL_EXPORT_STATE =
+    '{"state":"running","partialReason":null,"id":"zLshdOnjRmN6jkYPcu7SnXzsZvKg9YifTAbRM7aZy5E",' +
+    '"notebook":"MS is great","progress":{"pages":0,"sections":0,"assets":0},' +
+    '"startedAt":1791536187840,"finishedAt":null}';
+
+  /** A third session, for the two-slot pool's other slot. */
+  const THIRD = "22222222-2222-4222-8222-222222222222";
+
+  /**
+   * The exported session, plus a `runners` row that says its slot is bound.
+   *
+   * `slots` creates the pool this test's `slotIds` names — asking for two and seeding
+   * one would leave `syncPool` to invent the second row, so the binding under test
+   * would be partly the thing under test.
+   */
+  function seedExportingOnSlot(guid = GUID, slotId = "slot-1", slots = 1): void {
+    seedRunners(slots);
+    db.run(`UPDATE runners SET status = 'active', session_guid = ? WHERE id = ?`, guid, slotId);
+    seedSession(guid, {
+      state: "exporting",
+      runner_id: slotId,
+      export_state: REAL_EXPORT_STATE,
+    });
+  }
+
+  /**
+   * The pool's second slot, held by a **live** session.
+   *
+   * A real `sessions` row, because the post-loop orphan reconciler asks
+   * `sessionOwnsSlot(guid)` and releases anything bound to a session it cannot find.
+   * Seeding only the `runners` row would make every "nothing else is released"
+   * assertion here pass or fail on the *reconciler*, not on this branch — the test
+   * would measure the wrong writer.
+   */
+  function seedSecondSlotBound(sessionGuid = OTHER, slotId = "slot-2"): void {
+    seedSession(sessionGuid, { state: "authenticated", runner_id: slotId });
+    db.run(`UPDATE runners SET status = 'active', session_guid = ? WHERE id = ?`, sessionGuid, slotId);
+  }
+
+  const rowFor = (slotId: string) =>
+    db.get<{ status: string; session_guid: string | null }>(
+      `SELECT status, session_guid FROM runners WHERE id = ?`,
+      slotId,
+    );
+
+  // (a) whole repair on the PRODUCTION signal — one idle slot of two.
+  it("releases the slot and ends the export in one tick (one idle slot of two)", async () => {
+    seedExportingOnSlot(GUID, "slot-1", 2);
+    seedSecondSlotBound();
+
+    const frames = watch(sse, GUID);
+
+    const { client, released } = orchestratorStub({
+      stats: "filled",
+      slotIds: ["slot-1", "slot-2"],
+      boundSessions: { "slot-2": OTHER },
+      deadSlots: [],
+      release: "ok",
+    });
+    const report = await sweep(options(client), new PoolBinder(options(client)));
+
+    // **Nothing goes through `/release`.** Branch C repairs the api's row only: the
+    // orchestrator side is already idle, so a `/release` would destroy a healthy
+    // container to fix nothing. And the orphan reconciler is quiet because slot-2's
+    // holder is a real session — so this array is branch C's assertion, not the
+    // reconciler's.
+    expect(released).toEqual([]);
+    expect(report.exportsDispossessed).toBe(1);
+
+    const session = db.getSession(GUID)!;
+    expect(session.runner_id).toBeNull();
+    expect(session.state).toBe("authenticated");
+    expect(session.idle_expires_at).toBe(now + TTL.authenticatedIdle);
+
+    const parsed = JSON.parse(session.export_state!);
+    expect(parsed.state).toBe("failed");
+    expect(parsed.error).toBe("the runner's slot was reclaimed before this export finished");
+    expect(parsed.id).toBe("zLshdOnjRmN6jkYPcu7SnXzsZvKg9YifTAbRM7aZy5E");
+    expect(parsed.notebook).toBe("MS is great");
+
+    expect(rowFor("slot-1")).toEqual({
+      status: "idle",
+      session_guid: null,
+    });
+
+    const events = frames();
+    expect(events.length).toBe(1);
+    expect(events[0].type).toBe("session-status");
+    expect(events[0].data).toEqual({ state: "authenticated" });
+  });
+
+  // (b) false-positive guard — a live export is held, untouched.
+  it("does not reset when the slot is bound to a live session", async () => {
+    seedExportingOnSlot(GUID, "slot-1", 2);
+    seedSecondSlotBound(THIRD);
+
+    const { client, released } = orchestratorStub({
+      stats: "filled",
+      slotIds: ["slot-1", "slot-2"],
+      boundSessions: { "slot-1": GUID, "slot-2": THIRD },
+      deadSlots: [],
+      release: "ok",
+    });
+    const report = await sweep(options(client), new PoolBinder(options(client)));
+
+    expect(released).toEqual([]);
+    expect(report.exportsDispossessed).toBe(0);
+    // Held by the export-hold below, which is the correct answer for a live export.
+    expect(report.exportsHeld).toBe(1);
+
+    const session = db.getSession(GUID)!;
+    expect(session.runner_id).toBe("slot-1");
+    expect(session.state).toBe("exporting");
+  });
+
+  // (c) an absent `boundSessions` field reads as "cannot ask" — never "unbound".
+  //
+  // This is the rolling-deploy case **and** the all-idle-pool case at once: `Stats()`
+  // leaves the map nil when nothing is bound and `omitempty` drops the key. Both must
+  // fall back to the cap, which is today's behaviour — no regression, but also no fix.
+  // That is D6, and it is why a positive orchestrator signal was deferred.
+  it("does nothing when boundSessions is absent (rolling deploy / all-idle pool)", async () => {
+    seedExportingOnSlot();
+
+    const { client, released } = orchestratorStub({
+      stats: "filled",
+      slotIds: ["slot-1"],
+      deadSlots: [],
+      release: "ok",
+    });
+    const report = await sweep(options(client), new PoolBinder(options(client)));
+
+    expect(released).toEqual([]);
+    expect(report.exportsDispossessed).toBe(0);
+    expect(report.exportsHeld).toBe(1);
+
+    const session = db.getSession(GUID)!;
+    expect(session.runner_id).toBe("slot-1");
+    expect(session.state).toBe("exporting");
+  });
+
+  // (d) data-loss guard — a terminal `partial` export keeps its bytes.
+  it("preserves a partial export_state and its artifact_id through this repair", async () => {
+    seedExportingOnSlot(GUID, "slot-1", 2);
+    seedSecondSlotBound();
+
+    const partialState = JSON.stringify({
+      state: "partial",
+      partialReason: "quota",
+      id: "artifact123",
+      notebook: "MS is great",
+      progress: { pages: 1, sections: 1, assets: 1 },
+      startedAt: 1791536187840,
+      finishedAt: 1791536200000,
+    });
+    db.run(
+      `UPDATE sessions SET export_state = ?, artifact_id = 'artifact123' WHERE guid = ?`,
+      partialState,
+      GUID,
+    );
+
+    const { client } = orchestratorStub({
+      stats: "filled",
+      slotIds: ["slot-1", "slot-2"],
+      boundSessions: { "slot-2": OTHER },
+      deadSlots: [],
+      release: "ok",
+    });
+    const report = await sweep(options(client), new PoolBinder(options(client)));
+
+    // The repair runs — the session is freed either way...
+    expect(report.exportsDispossessed).toBe(1);
+    expect(db.getSession(GUID)?.state).toBe("authenticated");
+    // ...but `markExportStranded`'s `ELSE export_state` arm is the data-loss guard: a
+    // terminal export is not `queued`/`running`, so it is left byte-for-byte alone and
+    // the artifact it names is still downloadable.
+    expect(db.getSession(GUID)?.export_state).toBe(partialState);
+    expect(db.getSession(GUID)?.artifact_id).toBe("artifact123");
+  });
+
+  // (e) malformed `export_state` — the row is still repaired.
+  it("resets to authenticated even with malformed export_state", async () => {
+    seedExportingOnSlot(GUID, "slot-1", 2);
+    seedSecondSlotBound();
+    db.run(`UPDATE sessions SET export_state = 'not-json' WHERE guid = ?`, GUID);
+
+    const { client } = orchestratorStub({
+      stats: "filled",
+      slotIds: ["slot-1", "slot-2"],
+      boundSessions: { "slot-2": OTHER },
+      deadSlots: [],
+      release: "ok",
+    });
+    const report = await sweep(options(client), new PoolBinder(options(client)));
+
+    expect(report.exportsDispossessed).toBe(1);
+    expect(db.getSession(GUID)?.state).toBe("authenticated");
+    expect(db.getSession(GUID)?.runner_id).toBeNull();
+    // `json_valid` fails, so the export blob is left as found rather than half-written.
+    expect(db.getSession(GUID)?.export_state).toBe("not-json");
+  });
+
+  // (f) bound to a *different* session is pool drift, not dispossession.
+  //
+  // This is the guard that pins D5's direction. `slot-1` **is** a key in
+  // `boundSessions`, so `!(runner_id in boundSessions)` is false and branch C stands
+  // down — the post-loop orphan reconciler owns that shape. A `!== guid` test would
+  // have fired here and dispossessed a live session.
+  it("does not reset when the slot is bound to a different session", async () => {
+    seedExportingOnSlot(GUID, "slot-1", 2);
+    seedSecondSlotBound(OTHER, "slot-1");
+    seedSession(THIRD, { state: "authenticated", runner_id: "slot-2" });
+
+    const { client, released } = orchestratorStub({
+      stats: "filled",
+      slotIds: ["slot-1", "slot-2"],
+      boundSessions: { "slot-1": OTHER, "slot-2": THIRD },
+      deadSlots: [],
+      release: "ok",
+    });
+    const report = await sweep(options(client), new PoolBinder(options(client)));
+
+    expect(released).toEqual([]);
+    expect(report.exportsDispossessed).toBe(0);
+    expect(report.exportsHeld).toBe(1);
+
+    const session = db.getSession(GUID)!;
+    expect(session.runner_id).toBe("slot-1");
+    expect(session.state).toBe("exporting");
+  });
+
+  // (g) an unreachable orchestrator is "cannot ask", not "nothing is bound".
+  it("does nothing when the orchestrator is unreachable", async () => {
+    seedExportingOnSlot();
+
+    const { client, released } = orchestratorStub({ stats: "unreachable", release: "ok" });
+    const report = await sweep(options(client), new PoolBinder(options(client)));
+
+    expect(released).toEqual([]);
+    expect(report.exportsDispossessed).toBe(0);
+    expect(report.exportsHeld).toBe(1);
+
+    const session = db.getSession(GUID)!;
+    expect(session.runner_id).toBe("slot-1");
+    expect(session.state).toBe("exporting");
+  });
+
+  // (h) a slot that is **both** dead and unbound belongs to branch B, exactly once.
+  //
+  // This is the overlap the two predicates could both match, and the reason it matters
+  // is not the double-count but the *message and the teardown*: branch C would end the
+  // export with "the slot was reclaimed" and skip the `/release`, when in fact the
+  // container died and needs tearing down. So B must win, and only B.
+  it("gives a dead-and-unbound slot to branch B, counted once", async () => {
+    seedExportingOnSlot();
+    seedSession(OTHER, { state: "authenticated" });
+
+    const { client, released } = orchestratorStub({
+      stats: "filled",
+      slotIds: ["slot-1"],
+      // `boundSessions` is present and empty: the orchestrator binds nothing, which is
+      // true of a slot whose container died and was never rebound.
+      boundSessions: {},
+      deadSlots: ["slot-1"],
+      release: "ok",
+    });
+    const report = await sweep(options(client), new PoolBinder(options(client)));
+
+    // B acted — with its release, which C would not have made.
+    expect(released).toEqual(["slot-1"]);
+    expect(report.exportsRunnerDied).toBe(1);
+    // And C did not also act on the same slot.
+    expect(report.exportsDispossessed).toBe(0);
+
+    const session = db.getSession(GUID)!;
+    expect(session.state).toBe("authenticated");
+    expect(JSON.parse(session.export_state!).error).toBe(
+      "the runner disappeared before this export finished",
+    );
+  });
+});

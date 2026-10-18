@@ -108,6 +108,23 @@ type Config struct {
 	// runner/tests/contract.test.ts.
 	RunnerTokenFile string
 
+	// RunnerLoginTimeout and RunnerExportTimeout bound **a single child process
+	// inside the runner**: Chromium during the login walk, and during an export.
+	// They are the runner's `MSOUT_LOGIN_TIMEOUT_MS` / `MSOUT_EXPORT_TIMEOUT_MS`
+	// (runner/src/config.ts), which the create request below sets only when these
+	// are non-zero.
+	//
+	// **Zero means "not configured", and that is a real state rather than a
+	// placeholder.** The runner carries its own defaults for both (300000 and
+	// 3600000), and they are the ones that apply when this is unset. A default
+	// here would be a second copy of the same two numbers in a second repository,
+	// free to drift — and the runner's would become dead code, which is the
+	// "capability declared but never executed" shape this exists to fix. So unset
+	// means the orchestrator adds *nothing* to the create request and the runner's
+	// own constant is the single source of truth. See pool/runner.go.
+	RunnerLoginTimeout  time.Duration
+	RunnerExportTimeout time.Duration
+
 	// PoolSize is how many runners exist when idle.
 	PoolSize int
 
@@ -168,6 +185,36 @@ func ValidGUID(s string) bool { return guidPattern.MatchString(s) }
 
 // ValidArtifactID reports whether s is a well-formed artifact id.
 func ValidArtifactID(s string) bool { return ArtifactIDPattern.MatchString(s) }
+
+// The api's own TTLs, **in milliseconds** — the two numbers the runner's
+// child-process timeouts are bounded by, and the reason those bounds are strict.
+//
+// They are `api/src/sweep.ts`'s `TTL` object, quoted here rather than imported
+// (this is a Go binary and that is a TypeScript module), because the bound is
+// only meaningful if a reader can see which constant produced it:
+//
+//   - apiLoginInProgressTTLMs = TTL.loginInProgress = 15 minutes (sweep.ts:33)
+//   - apiAbsoluteTTLMs         = TTL.absolute         = 12 hours  (sweep.ts:38)
+//
+// The sweeper's comparison is
+//
+//	session.last_activity_at + TTL.loginInProgress <= now          (sweep.ts:1383)
+//
+// and it is a **`<=`, not a `<`**. So at *exactly* the TTL the sweeper fires in
+// the same instant the runner's timeout fires, and which lands first is a race —
+// which is the entire argument for refusing equality, and an argument about that
+// line rather than a general preference for strictness.
+//
+// Larger than the TTL is worse than a race. The sweeper expires the row **while
+// Chromium is still working**, and the eventual `login-success` then arrives for a
+// session that no longer exists. On the export side a value at or above
+// TTL.absolute means a wedged walk is never ended by the runner at all, leaving
+// the 12-hour cap as the only reaper — strictly worse than the 60 minutes the
+// runner applies today.
+const (
+	apiLoginInProgressTTLMs int64 = 900_000    // TTL.loginInProgress — sweep.ts:33
+	apiAbsoluteTTLMs        int64 = 43_200_000 // TTL.absolute         — sweep.ts:38
+)
 
 // Load reads configuration from the environment and returns it, or an error
 // describing the first fatal problem.
@@ -260,6 +307,50 @@ func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (*C
 				n)
 		}
 		cfg.RunnerNanoCpus = n
+	}
+
+	// The two child-process timeouts. Bounded, unlike `envOr`, because these are
+	// not cosmetic: a value at or above the api's own TTL decides which component
+	// ends a session, and the check that would notice is 15 minutes (or 12 hours)
+	// away from the operator who typed the number. Refusing at load is the only
+	// point at which the operator is still reading the message.
+	//
+	// The shape is ORCH_RUNNER_NANO_CPUS's: parse, range-check, error. A
+	// malformed value is fatal rather than ignored because an ignored value here
+	// is indistinguishable from an unset one, and "I raised the timeout and
+	// nothing happened" is the failure this issue exists to close.
+	//
+	// Unset leaves the field zero, which pool/runner.go reads as "do not add this
+	// to the create request at all".
+	if v := strings.TrimSpace(getenv("ORCH_RUNNER_LOGIN_TIMEOUT_MS")); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("orchestrator: ORCH_RUNNER_LOGIN_TIMEOUT_MS %q is not an integer", v)
+		}
+		if n < 1 || n >= apiLoginInProgressTTLMs {
+			return nil, fmt.Errorf(
+				"orchestrator: ORCH_RUNNER_LOGIN_TIMEOUT_MS %d must be positive and strictly below the "+
+					"api's TTL.loginInProgress (%d ms, api/src/sweep.ts), which expires a login at "+
+					"`last_activity_at + TTL <= now`; at or above it the sweeper ends the session while "+
+					"Chromium is still working, and the login-success arrives for a row that is gone",
+				n, apiLoginInProgressTTLMs)
+		}
+		cfg.RunnerLoginTimeout = time.Duration(n) * time.Millisecond
+	}
+	if v := strings.TrimSpace(getenv("ORCH_RUNNER_EXPORT_TIMEOUT_MS")); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("orchestrator: ORCH_RUNNER_EXPORT_TIMEOUT_MS %q is not an integer", v)
+		}
+		if n < 1 || n >= apiAbsoluteTTLMs {
+			return nil, fmt.Errorf(
+				"orchestrator: ORCH_RUNNER_EXPORT_TIMEOUT_MS %d must be positive and strictly below the "+
+					"api's TTL.absolute (%d ms, api/src/sweep.ts), which expires a session at "+
+					"`last_activity_at + TTL <= now`; at or above it the sweeper's 12-hour cap is the only "+
+					"thing that ends a wedged export, which is strictly worse than the runner's own 60 minutes",
+				n, apiAbsoluteTTLMs)
+		}
+		cfg.RunnerExportTimeout = time.Duration(n) * time.Millisecond
 	}
 
 	if v := strings.TrimSpace(getenv("ORCH_POOL_SIZE")); v != "" {

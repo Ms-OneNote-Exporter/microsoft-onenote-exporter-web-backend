@@ -17,9 +17,16 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 const SCRIPT = ".github/assert-compose.mjs";
 
@@ -50,56 +57,6 @@ function runScript(scriptPath, cfg) {
   } catch (error) {
     return error.status ?? 1;
   }
-}
-
-/**
- * stages a mutated copy of the orchestrator Dockerfile beside a copy of the script,
- * and returns the path to that copy of the script.
- *
- * A temp tree rather than an in-place edit-and-restore: restoring in a `finally`
- * means an interrupt leaves the repository broken, and a broken repository is a
- * worse outcome than a failed harness.
- */
-/**
- * Copies **every** Dockerfile the script reads, applying the replacement to whichever
- * one contains `find`.
- *
- * All of them, not only the mutated one. The uid check reads `orchestrator/Dockerfile`
- * *and* `runner/Dockerfile`, so a staged tree carrying just the mutated file makes the
- * script crash on a missing path — which exits non-zero, which the harness counts as
- * "caught", which is how two uid cases passed while asserting nothing.
- *
- * That is worth more than the cases it hid: a harness case must fail because the
- * *check* failed, not because the harness broke. So a mutation that matches nothing
- * throws rather than quietly staging an identical tree.
- */
-function stageDockerfile(find, replace, only) {
-  const root = mkdtempSync(join(tmpdir(), "assert-compose-"));
-  mkdirSync(join(root, ".github"));
-  writeFileSync(join(root, ".github", "assert-compose.mjs"), readFileSync(SCRIPT));
-
-  // `only` matters: `USER 1000:1000` is in *both* Dockerfiles, so an unscoped
-  // replacement made them both 65532 — still equal, and the check correctly passed.
-  // The case then reported "not caught" for a mutation that had quietly become a
-  // no-op on the property under test.
-  let matched = false;
-  for (const dir of ["orchestrator", "runner"]) {
-    mkdirSync(join(root, dir));
-    const original = readFileSync(join(dir, "Dockerfile"), "utf8");
-    if (original.includes(find) && (only === undefined || dir === only)) {
-      matched = true;
-      writeFileSync(join(root, dir, "Dockerfile"), original.split(find).join(replace));
-    } else {
-      writeFileSync(join(root, dir, "Dockerfile"), original);
-    }
-  }
-  if (!matched) {
-    throw new Error(
-      `no Dockerfile contains ${JSON.stringify(find)}; the mutation would stage an ` +
-        `identical tree and the case would pass without asserting anything`,
-    );
-  }
-  return join(root, ".github", "assert-compose.mjs");
 }
 
 /** A deep clone, so each case starts from the real config untouched. */
@@ -150,6 +107,68 @@ if (run(clone(base)) !== 0) {
   process.exit(1);
 }
 console.log("ok    the real compose config passes every assertion");
+
+/**
+ * stages the assertion script beside a scratch copy of everything it reads, applying
+ * zero or more mutations, and returns the path to that copy of the script.
+ *
+ * The script reads four things: the resolved config on stdin, and — resolved relative
+ * to itself — the two Dockerfiles the uid check compares, `.env.example`,
+ * `docker-compose.yml`, and the component source trees the documented-key check
+ * scans. A staged tree missing any of them makes the script fail on a **missing file**
+ * rather than on the violation, and the harness counts any non-zero exit as "caught":
+ * every case would pass while asserting nothing.
+ *
+ * That is not hypothetical. The documented-key check added a third read, and the
+ * first version of this harness kept staging only the Dockerfiles — so the allowlist
+ * cases below failed on "no component source could be read" and reported it as a
+ * broken allowlist.
+ *
+ * A temp tree rather than an in-place edit-and-restore, for the reason
+ * `stageDockerfile` gives: restoring in a `finally` means an interrupt leaves the
+ * repository broken, and a broken repository is a worse outcome than a failed harness.
+ *
+ * `mutations` is `{relativePath: [find, replace] | null}`, where `null` means "omit
+ * this file" — a deleted `.env.example` is not the same violation as an edited one.
+ * A `find` that matches nothing **throws**, so a case cannot stage an identical tree
+ * and pass without asserting anything.
+ */
+function stageScript(mutations) {
+  const root = mkdtempSync(join(tmpdir(), "assert-compose-"));
+  mkdirSync(join(root, ".github"));
+  writeFileSync(join(root, ".github", "assert-compose.mjs"), readFileSync(SCRIPT));
+
+  // Everything the script reads, copied verbatim. Enumerated rather than walked,
+  // because an omitted entry is silent: the script fails on the missing path and the
+  // harness counts that as a caught violation.
+  const COPIED_TREES = ["api/src", "runner/src", "orchestrator"];
+  const COPIED_FILES = ["orchestrator/Dockerfile", "runner/Dockerfile", "docker-compose.yml", ".env.example"];
+
+  for (const path of [...COPIED_TREES, ...COPIED_FILES]) {
+    const destination = join(root, path);
+    mkdirSync(dirname(destination), { recursive: true });
+    cpSync(path, destination, { recursive: true });
+  }
+
+  for (const [path, mutation] of Object.entries(mutations)) {
+    if (mutation === null) {
+      rmSync(join(root, path), { force: true, recursive: true });
+      continue;
+    }
+    const [find, replace] = mutation;
+    const target = join(root, path);
+    const original = readFileSync(target, "utf8");
+    if (!original.includes(find)) {
+      throw new Error(
+        `${path} does not contain ${JSON.stringify(find)}; the mutation would stage an ` +
+          `identical tree and the case would pass without asserting anything`,
+      );
+    }
+    writeFileSync(target, original.split(find).join(replace));
+  }
+
+  return join(root, ".github", "assert-compose.mjs");
+}
 
 /** @type {{name: string, mutate: (cfg: any) => void, expectMessage: RegExp}[]} */
 const cases = [
@@ -661,7 +680,167 @@ const cases = [
     // being weakened.
     expectMessage: /must resolve on the host/,
   },
+
+  // ---- `.env.example` reachability ------------------------------------------
+  //
+  // Three keys shipped documented and dead: `LOGIN_TIMEOUT_MS` /
+  // `EXPORT_TIMEOUT_MS`, which nothing read under either name, and
+  // `CHROMIUM_NO_SANDBOX`, which advertised disabling a security control. All three
+  // deployed cleanly and did nothing.
+  //
+  // These are the mutations of that class, and they need `mutateRepoFile` rather than
+  // `mutateFile` because the thing being broken is a **file in the repository** rather
+  // than the resolved config. The script reads `.env.example` and `docker-compose.yml`
+  // from the repo root relative to itself, so staging those two beside a copy of the
+  // script is the only way a violation can be expressed at all.
+  {
+    // The original defect, form 1: a documented key nothing reads. An operator sets
+    // it, restarts, and every runner is on the runner's own default — with no error
+    // anywhere, because the orchestrator is not misconfigured; it is simply never
+    // told.
+    name: "documents a key nothing consumes",
+    mutateRepoFile: { file: ".env.example", find: "LOG_LEVEL=info", replace: "LOG_LEVEL=info\nTOTALLY_MADE_UP_KNOB=1" },
+    expectMessage: /documents TOTALLY_MADE_UP_KNOB and nothing consumes it/,
+  },
+  {
+    // **The defect that actually shipped**, and the sharpest case in this section.
+    //
+    // The sharpest form of this check: a documented key whose name **contains** a
+    // consumed name as a substring. `X_EXPORT_TIMEOUT_MS` contains `EXPORT_TIMEOUT_MS`,
+    // which is itself a real key here. A check that asked "does this string appear
+    // anywhere?" would call it consumed. This one compares the whole name, so it must
+    // report it dead.
+    //
+    // This case is why the check is not a `grep`, and the nesting is real in this
+    // repository: the operator's host-side `EXPORT_TIMEOUT_MS`, the orchestrator's
+    // `ORCH_RUNNER_EXPORT_TIMEOUT_MS`, and the runner's `MSOUT_EXPORT_TIMEOUT_MS` — each
+    // name contains the previous one.
+    name: "documents a key whose name merely contains a consumed one",
+    mutateRepoFile: {
+      file: ".env.example",
+      find: "EXPORT_TIMEOUT_MS=3600000",
+      replace: "X_EXPORT_TIMEOUT_MS=3600000",
+    },
+    expectMessage: /documents X_EXPORT_TIMEOUT_MS and nothing consumes it/,
+  },
+  {
+    // The original defect, form 3: `CHROMIUM_NO_SANDBOX`. Nothing reads it in any
+    // name, so an operator who set it would see no error and conclude the renderer
+    // sandbox was off. It was deleted rather than wired, because wiring it would have
+    // turned a control into a default.
+    name: "documents the Chromium sandbox flag again",
+    mutateRepoFile: { file: ".env.example", find: "MSOUT_FAKE=0", replace: "MSOUT_FAKE=0\nCHROMIUM_NO_SANDBOX=0" },
+    expectMessage: /documents CHROMIUM_NO_SANDBOX and nothing consumes it/,
+  },
+  {
+    // The other direction: stop interpolating a documented key in compose while
+    // leaving `.env.example` alone. The operator's value stops reaching compose, the
+    // orchestrator falls back to a default, and nothing reports it.
+    //
+    // `RUNNER_MEMORY_LIMIT` specifically because it is **only** consumed through
+    // compose — no component source reads that string, which is the same fact this
+    // check asserts on its own. `LOG_LEVEL` would not work here: the api reads it
+    // directly, so the key survives losing its interpolation and the case would pass
+    // vacuously.
+    name: "stops interpolating a documented key in compose",
+    mutateRepoFile: {
+      file: "docker-compose.yml",
+      find: "${RUNNER_MEMORY_LIMIT:-2g}",
+      replace: "2g",
+    },
+    expectMessage: /documents RUNNER_MEMORY_LIMIT and nothing consumes it/,
+  },
+  {
+    // A `.env.example` that cannot be read at all. The check must say so rather than
+    // reporting zero unconsumed keys and passing: "found nothing" and "found nothing
+    // wrong" are indistinguishable from the outside, and this is the shape of a check
+    // that has been defeated by a path change.
+    name: "cannot read .env.example from the repo root",
+    mutateRepoFile: { file: ".env.example", find: null },
+    expectMessage: /could not read \.env\.example/,
+  },
+  {
+    // **The value `.env.example` shipped with.** `LOGIN_TIMEOUT_MS=900000` was exactly
+    // `TTL.loginInProgress`, so a reader who copied the template unchanged would have
+    // got an orchestrator that refused to start — once the knob was wired at all.
+    //
+    // A reachability check cannot see this: the key *is* consumed. The value is a
+    // separate question, and it is the one that decides whether the file describes a
+    // configuration the stack can actually run.
+    name: "documents a value the orchestrator refuses at boot",
+    mutateRepoFile: {
+      file: ".env.example",
+      find: "LOGIN_TIMEOUT_MS=300000",
+      replace: "LOGIN_TIMEOUT_MS=900000",
+    },
+    expectMessage: /documents LOGIN_TIMEOUT_MS=900000, which compose maps to/,
+  },
+  {
+    // The other TTL, on the export side: `TTL.absolute` at 12 hours. A value above it
+    // is not merely unbounded — the sweeper's 12-hour cap becomes the only thing that
+    // ends a wedged export, which is strictly worse than the runner's own 60 minutes.
+    name: "documents an export timeout above the api's absolute TTL",
+    mutateRepoFile: {
+      file: ".env.example",
+      find: "EXPORT_TIMEOUT_MS=3600000",
+      replace: "EXPORT_TIMEOUT_MS=43200000",
+    },
+    expectMessage: /documents EXPORT_TIMEOUT_MS=43200000, which compose maps to/,
+  },
 ];
+
+// ---- the allowlist cannot swallow everything --------------------------------
+//
+// The two OUT_OF_BAND_CONSUMERS entries are the check's escape hatch, and an escape
+// hatch that cannot be opened is a claim. Each one is removed in turn and the real
+// `.env.example` is required still to pass — so a key that is *only* alive because an
+// allowlist entry names it fails as soon as that entry is gone.
+//
+// The two are removed by **repointing the named consumer at a file that does not
+// exist**, rather than by deleting the entry. Deleting a line changes the file's shape
+// and a harness that matched on exact indentation would break the first time somebody
+// reformatted it; repointing names the property under test — that the entry is *carrying*
+// this key — and a file that no longer consumes it is precisely how such an entry rots.
+//
+// Both are checked, and starting from a passing state is the whole assertion: a key
+// with a second consumer would pass with its entry repointed and would prove nothing.
+// That is the failure mode being guarded against — an allowlist that keeps entries long
+// after the thing they excused is fixed.
+for (const [key, consumer] of [
+  ["ORCHESTRATOR_HMAC_SECRET_FILE", ".github/workflows/ci.yml"],
+  ["MSOUT_FAKE", "runner/package.json"],
+]) {
+  if (run(clone(base)) !== 0) {
+    console.error(`allowlist: the real config does not pass, so ${key} proves nothing`);
+    process.exit(1);
+  }
+  const staged = stageScript({
+    ".github/assert-compose.mjs": [
+      `"${consumer}"`,
+      `".github/workflows/nothing-consumes-this.mjs"`,
+    ],
+  });
+  const code = runScript(staged, clone(base));
+  if (code !== 0) {
+    let output = "";
+    try {
+      execFileSync("node", [staged], { input: JSON.stringify(clone(base)), stdio: ["pipe", "pipe", "pipe"] });
+    } catch (error) {
+      output = String(error.stderr ?? "");
+    }
+    console.error(
+      `FAIL  repointing the ${key} allowlist entry at a file that consumes nothing made ` +
+        `the real .env.example fail`,
+    );
+    console.error(
+      `      so ${key} has another consumer and the allowlist entry is not carrying it: ` +
+        `update the check's comment to name the consumer that is. Got: ` +
+        `${output.trim().split("\n").filter((l) => l.includes("FAIL")).join(" | ") || "(no FAIL line)"}`,
+    );
+    process.exit(1);
+  }
+  console.log(`ok    ${key} is carried by its allowlist entry, not by something else`);
+}
 
 // ---- each violation must be caught ----------------------------------------
 
@@ -674,13 +853,18 @@ for (const testCase of cases) {
   // them having to invent one. A required `mutate` would push every file-level case
   // towards a filler function that looks like it is asserting something.
   testCase.mutate?.(cfg);
-  const script = testCase.mutateFile
-    ? stageDockerfile(
-        testCase.mutateFile.find,
-        testCase.mutateFile.replace,
-        testCase.mutateFile.file,
-      )
-    : SCRIPT;
+  const script = stageScript(
+    testCase.mutateFile
+      ? { [`${testCase.mutateFile.file}/Dockerfile`]: [testCase.mutateFile.find, testCase.mutateFile.replace] }
+      : testCase.mutateRepoFile
+        ? {
+            [testCase.mutateRepoFile.file]:
+              testCase.mutateRepoFile.find === null
+                ? null
+                : [testCase.mutateRepoFile.find, testCase.mutateRepoFile.replace],
+          }
+        : {},
+  );
 
   if (runScript(script, cfg) === 0) {
     console.error(`FAIL  not caught: ${testCase.name}`);

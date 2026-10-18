@@ -805,6 +805,291 @@ func TestRecycleOnDrainingSlotIsErrNotBound(t *testing.T) {
 	}
 }
 
+// ---- Recycle on a slot with no session ----------------------------------------
+//
+// #120, and the one thing to know about this whole block: `Recycle` accepted every
+// state except `draining` and `dead`, and ended by writing `slot.State = StateBound`
+// unconditionally. A signed `POST /recycle` on an **idle** slot therefore produced a
+// slot bound to nobody — and a slot bound to nobody is not an idle slot that is
+// slightly mislabelled, it is capacity the pool can no longer use:
+//
+//   - `Claim` requires `IsIdle()` in both arms, so the named form answers
+//     `ErrAlreadyBound` and the random form is not a candidate at all;
+//   - `refillable()` excludes `StateBound`, so `EnsurePool` never replaces it either.
+//
+// Nothing rescues it. `Sweep`'s `StateBound` arm has no idle-TTL branch, and a
+// restart does not either: the container carries no session label, so `Reconcile`
+// adopts it as `idle` and the slot returns — but only after the orchestrator is
+// bounced by hand.
+//
+// Observed on the deployed host during #119's verification: one signed `/recycle` on
+// one idle slot of a pool of two turned `byState` from `{"idle":2}` into
+// `{"bound":1,"idle":1}`, with both containers' session labels empty. Two such slots
+// is a total lockout. `Recycle`'s trailing state is now derived from the session GUID
+// (`stateForSession`), so a recycled slot with no session is `idle` — which is also
+// what makes "give me a fresh idle container" a thing an operator can ask for, the
+// need #119's own verification hit and had no verb for.
+
+// Recycle on a slot that never had a session leaves it idle, not bound.
+//
+// The single case from the issue, asserted directly. `IsIdle()` is asserted as well
+// as the state because it is the predicate `Claim` actually asks — a fix that
+// introduced a seventh state called something else would slip past a state-string
+// comparison alone.
+func TestRecycleOnASessionlessSlotLeavesItIdle(t *testing.T) {
+	cfg := testConfig(t, 1)
+	d := newFakeDaemon()
+	p := New(cfg, d, discardLog())
+
+	if err := p.EnsurePool(t.Context()); err != nil {
+		t.Fatalf("EnsurePool: %v", err)
+	}
+	// Asserted rather than assumed: this test is about a slot with *no* session, and
+	// a pool that came up bound would make every assertion below vacuous.
+	slots := p.Slots()
+	if len(slots) != 1 || slots[0].State != StateIdle || slots[0].SessionGUID != "" {
+		t.Fatalf("fixture is %+v, want one idle slot with no session", slots)
+	}
+
+	if err := p.Recycle(t.Context(), slots[0].ID, "operator asked for a fresh runner"); err != nil {
+		t.Fatalf("recycle: %v", err)
+	}
+
+	s := p.Slots()[0]
+	if s.State != StateIdle {
+		t.Errorf("recycled sessionless slot state = %q, want idle: it records no session, "+
+			"so there is nothing to be bound to", s.State)
+	}
+	if !s.IsIdle() {
+		t.Error("IsIdle() is false on a recycled sessionless slot, so Claim will never " +
+			"consider it — the container is running and unreachable")
+	}
+	// Recycle replaces the container; it must not invent a session for it.
+	if s.SessionGUID != "" {
+		t.Errorf("recycle gave a sessionless slot the session %q", s.SessionGUID)
+	}
+	// And the verb did its actual job — a fresh runner, not a dead slot.
+	if s.ContainerID == "" {
+		t.Error("recycled slot holds no container")
+	}
+	if s.ContainerID == slots[0].ContainerID {
+		t.Error("recycle did not replace the container")
+	}
+	if got := d.count(); got != 1 {
+		t.Errorf("after recycling a sessionless slot there are %d containers, want 1: %v",
+			got, d.names())
+	}
+}
+
+// The no-regression half. A recycled slot that *does* serve a session still ends
+// `bound` — the verb's whole contract, and `TestRecycleKeepsTheSessionAndTheSlot`'s
+// reason to exist.
+//
+// Separate from that test on purpose: this one starts from a slot built by hand, so it
+// does not depend on `Claim` and `provision` to produce the precondition. A future
+// change to those would otherwise be able to make the bound-slot case untestable.
+func TestRecycleOnABoundSlotStillEndsBound(t *testing.T) {
+	cfg := testConfig(t, 1)
+	guid := boundGUIDOne
+
+	d := newFakeDaemon()
+	p := New(cfg, d, discardLog())
+	now := time.Now()
+	p.now = func() time.Time { return now }
+
+	old := d.add("old", true, map[string]string{
+		"msout.role":         "runner",
+		"msout.slot.id":      "slot-1",
+		"msout.session.guid": guid,
+	})
+	expires := now.Add(time.Hour)
+	p.slots["slot-1"] = &Slot{
+		ID: "slot-1", State: StateBound, ContainerID: old.id,
+		CreatedAt: now, SessionGUID: guid, SessionExpiresAt: expires,
+	}
+
+	if err := p.Recycle(t.Context(), "slot-1", "runner ttl"); err != nil {
+		t.Fatalf("recycle: %v", err)
+	}
+
+	s := p.Slots()[0]
+	if s.State != StateBound {
+		t.Errorf("state after recycling a bound slot = %q, want bound", s.State)
+	}
+	if s.SessionGUID != guid {
+		t.Errorf("session after recycle = %q, want %q", s.SessionGUID, guid)
+	}
+	if !s.SessionExpiresAt.Equal(expires) {
+		t.Errorf("session expiry after recycle = %v, want %v carried over", s.SessionExpiresAt, expires)
+	}
+	if s.ContainerID == old.id {
+		t.Error("recycle did not replace the container")
+	}
+	if got := d.count(); got != 1 {
+		t.Errorf("after recycling a bound slot there are %d containers, want 1: %v", got, d.names())
+	}
+}
+
+// **The invariant, across every state `Recycle` accepts.** One signed `/recycle` on a
+// sessionless slot was the observed defect, but the rule it broke is general: no slot
+// is ever `StateBound` with an empty GUID. A test of the `idle` row alone would have
+// passed while `starting`, `vacant` and a `bound` slot whose session went missing all
+// still ended bound to nobody — so the table covers every state the verb lets through
+// except the two it refuses.
+//
+// The rows are the ones the derivation has to be right for, each with the state the
+// slot holds a session in. `bound`+GUID is the regression case and must not change;
+// the other four are what the hardcoded literal got wrong, and for all four the harm
+// is identical: recycle leaves behind a filled, running container that no session can
+// claim and the pool will never replace, labelled `bound` for a session that does not
+// exist.
+func TestRecycleNeverLeavesABlankGuidBoundSlot(t *testing.T) {
+	cases := []struct {
+		name  string
+		state State
+		guid  string
+		want  State
+	}{
+		{name: "bound with a session", state: StateBound, guid: boundGUIDOne, want: StateBound},
+		{name: "bound whose session went missing", state: StateBound, guid: "", want: StateIdle},
+		{name: "idle", state: StateIdle, guid: "", want: StateIdle},
+		// A `starting` slot has no container yet, and the create `Recycle` runs gives
+		// it one — so restoring the prior state would leave a filled slot claiming to
+		// be mid-create, which `refillable()` and `EnsurePool` both read as "a
+		// container is on its way, do not touch it".
+		{name: "starting", state: StateStarting, guid: "", want: StateIdle},
+		// `vacant` is the state `Release` leaves: a slot that holds no container and
+		// is owed one. `destroy("")` is a no-op, so recycling one is mechanically
+		// fine; ending it `vacant` would mean holding a container the pool believes it
+		// does not have.
+		{name: "vacant", state: StateVacant, guid: "", want: StateIdle},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig(t, 1)
+			guid := tc.guid
+			state := tc.state
+
+			d := newFakeDaemon()
+			p := New(cfg, d, discardLog())
+			now := time.Now()
+			p.now = func() time.Time { return now }
+
+			// The container is a real one in the fake daemon, because the destroy leg
+			// has to find something to destroy — a nil daemon would answer every
+			// assertion below with a nil-pointer panic rather than a verdict.
+			slotID := "slot-1"
+			ctrLabels := map[string]string{
+				"msout.role":    "runner",
+				"msout.slot.id": slotID,
+			}
+			if guid != "" {
+				ctrLabels["msout.session.guid"] = guid
+			}
+			ctr := d.add("runner", true, ctrLabels)
+			p.slots[slotID] = &Slot{
+				ID: slotID, State: state, ContainerID: ctr.id,
+				CreatedAt: now, SessionGUID: guid,
+			}
+
+			if err := p.Recycle(t.Context(), slotID, "test"); err != nil {
+				t.Fatalf("recycle: %v", err)
+			}
+
+			s := p.Slots()[0]
+			// Stated as a property, not as the value this fix happens to produce: the
+			// property is what has to hold for every future writer of a bound state.
+			if s.State == StateBound && s.SessionGUID == "" {
+				t.Fatalf("a %q slot with no session ended StateBound: bound to nobody, "+
+					"so Claim skips it and refillable() never replaces it. State is %q",
+					state, s.State)
+			}
+			if s.State != tc.want {
+				t.Errorf("state after recycling a %q slot = %q, want %q", state, s.State, tc.want)
+			}
+			if s.SessionGUID != guid {
+				t.Errorf("recycle changed the session: %q, want %q", s.SessionGUID, guid)
+			}
+			if s.ContainerID == "" {
+				t.Error("recycled slot holds no container")
+			}
+			if s.ContainerID == ctr.id {
+				t.Error("recycle did not replace the container")
+			}
+			if got := d.count(); got != 1 {
+				t.Errorf("after recycling a %q slot there are %d containers, want 1: %v",
+					state, got, d.names())
+			}
+		})
+	}
+}
+
+// **The severity, as one test.** Recycle both idle slots of a pool of two — the state
+// a two-slot pool is in for most of its life, and the state the api's D6 repair is
+// about — and then claim. Before the fix this was the total lockout: a named claim
+// answered `ErrAlreadyBound` for both slots, and the random arm found no candidate at
+// all and answered `ErrNoSlot`, forever, with every other signal reporting a healthy
+// pool of two running runners.
+//
+// It asserts the consequence rather than the implementation, and that is the whole
+// reason it is here rather than one more assertion inside the state tests. Those pin
+// what `Recycle` returns — a verb's contract. This one pins what the *pool* can do
+// afterwards: two running runners a session can take. The gap between the two is real
+// and silent: adding a post-create cooldown to `Claim` — a plausible thing to want, so
+// a fresh runner gets a moment before it takes a login — leaves every state assertion
+// in this block green and turns this one red, because the recycled slot is correct and
+// unreachable.
+//
+// The claim **names** the recycled slot rather than asking for any idle one: claiming
+// *some* slot would pass even if the recycled one were still stuck, which is the
+// assertion the deployment harness got wrong first.
+func TestRecycledSessionlessSlotsAreStillClaimable(t *testing.T) {
+	cfg := testConfig(t, 2)
+	d := newFakeDaemon()
+	p := New(cfg, d, discardLog())
+
+	if err := p.EnsurePool(t.Context()); err != nil {
+		t.Fatalf("EnsurePool: %v", err)
+	}
+	ids := slotIDsOf(p)
+	if len(ids) != 2 {
+		t.Fatalf("slot count = %d, want 2", len(ids))
+	}
+
+	for _, id := range ids {
+		if err := p.Recycle(t.Context(), id, "operator asked for fresh runners"); err != nil {
+			t.Fatalf("recycle %s: %v", id, err)
+		}
+	}
+
+	// Reported through /stats because that is how the operator saw it: a pool that
+	// says it is full of idle runners and hands out nothing.
+	if byState := p.Stats().ByState; len(byState) != 1 || byState["idle"] != 2 {
+		t.Errorf("byState after recycling both idle slots = %v, want exactly {idle: 2}", byState)
+	}
+
+	for i, id := range ids {
+		slot, err := p.Claim(t.Context(), fmt.Sprintf("cccccccc-3333-4333-8333-%012d", i),
+			time.Now().Add(time.Hour), id)
+		if err != nil {
+			t.Fatalf("claim of recycled slot %s: %v", id, err)
+		}
+		if slot.ID != id {
+			t.Fatalf("asked for %s, got %s", id, slot.ID)
+		}
+	}
+
+	// And the pool is whole again: one container per slot, both bound to somebody.
+	if got := d.count(); got != 2 {
+		t.Errorf("container count = %d, want 2", got)
+	}
+	bound := p.Stats().BoundSessions
+	if len(bound) != 2 {
+		t.Errorf("BoundSessions = %v, want both recycled slots held", bound)
+	}
+}
+
 // Stats reports the shape `api` and /healthz read.
 func TestStatsShape(t *testing.T) {
 	cfg := testConfig(t, 3)

@@ -655,13 +655,39 @@ func (p *Pool) Claim(ctx context.Context, sessionGUID string, sessionExpiresAt t
 	return p.provision(ctx, slot, sessionGUID, sessionExpiresAt, slotID, idleContainerID)
 }
 
+// stateForSession reports the state a slot holds after (re)binding it to
+// sessionGUID. A slot with no session is idle, whatever it was doing before.
+//
+// **The empty-GUID case is the whole point.** A slot that records no session and is
+// nevertheless `StateBound` is lost capacity: `Claim` requires `IsIdle()` in both
+// arms, so nothing can ever take it, and because it still holds a container
+// `refillable()`'s first clause is already false, so nothing can replace it either.
+// (The `StateBound` exclusion in `refillable()` is about a claim in flight, not
+// about this case.) It also makes `/stats` contradict itself — counted in
+// `byState.bound`, omitted from `boundSessions` — which is what stands down the api's
+// all-idle export repair (#117).
+func stateForSession(sessionGUID string) State {
+	if sessionGUID == "" {
+		return StateIdle
+	}
+	return StateBound
+}
+
 // bindLocked marks a slot bound. Callers must hold p.mu.
 //
 // Split out so the two arms of `Claim` — named slot and random slot — cannot drift
 // on what "bound" means. The state is provisional: if the container work in
 // `provision` fails, `fail` puts the slot back to idle.
+//
+// **The state is derived from the GUID rather than written as a literal, and that
+// changes nothing here** — both arms of `Claim` are reached only with a non-empty
+// sessionGUID, so the derivation cannot return `StateIdle` from this path. It is
+// here so that *no* writer of a bound state hardcodes the literal: `Recycle` did,
+// and a signed `/recycle` on a slot with no session left it bound to nobody —
+// unclaimable capacity on a pool that `/stats` reported as healthy. The rule is
+// uniform or it is not a rule.
 func (p *Pool) bindLocked(slot *Slot, sessionGUID string, sessionExpiresAt time.Time) {
-	slot.State = StateBound
+	slot.State = stateForSession(sessionGUID)
 	slot.SessionGUID = sessionGUID
 	slot.BoundAt = p.now()
 	slot.SessionExpiresAt = sessionExpiresAt
@@ -865,7 +891,20 @@ func (p *Pool) Recycle(ctx context.Context, slotID, reason string) error {
 	}
 
 	p.mu.Lock()
-	slot.State = StateBound
+	// **The state follows the session, not the verb.** A signed `/recycle` reaches
+	// this line on a slot that never had one — the verb accepts every state except
+	// `draining` and `dead`, so `POST /recycle` on an idle slot arrived here with an
+	// empty GUID. Writing `StateBound` unconditionally then produced a slot bound to
+	// nobody: `Claim` requires `IsIdle()` in both arms and `refillable()` excludes
+	// `StateBound`, so nothing could ever claim or replace it, while `/stats` counted
+	// it in `byState.bound` and omitted it from `boundSessions`. A healthy container
+	// no session could reach, and a `/stats` that disagreed with itself about it.
+	//
+	// So the state is derived from the GUID that was already captured above: a
+	// recycled slot serving a session stays `bound`, and one serving nothing is
+	// `idle` — which is what it was, and what the operator who signed the verb was
+	// asking for. See `stateForSession`.
+	slot.State = stateForSession(sessionGUID)
 	p.mu.Unlock()
 
 	p.log.Info("recycled slot", "slot", slot.ID, "oldContainer", containerID,

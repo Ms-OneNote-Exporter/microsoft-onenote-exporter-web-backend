@@ -272,6 +272,73 @@ export function idleExpiresAt(session: SessionRow, now: number): number | null {
 }
 
 /**
+ * The pool state names `Stats.byState` is keyed by.
+ *
+ * A transcription of the Go constants in `orchestrator/internal/pool/pool.go`
+ * (`StateVacant`, `StateStarting`, `StateIdle`, `StateBound`, `StateDraining`,
+ * `StateDead`) and not a vocabulary of our own: the orchestrator owns that naming,
+ * and the api reads it. `pool_test.go`'s `TestStatsByStateKeysAreKnownStateNames`
+ * is the far end of this contract — a seventh state there turns that test red, and
+ * the fix is to add the name here in the same PR. Crossed already: `/stats` has
+ * always carried `byState`, and nothing is added to the wire by reading it.
+ */
+export const POOL_STATE_NAMES: ReadonlySet<string> = new Set([
+  "vacant",
+  "starting",
+  "idle",
+  "bound",
+  "draining",
+  "dead",
+]);
+
+/**
+ * poolBindsNobody asks whether `/stats` says no slot in the pool is bound.
+ *
+ * **`true` = positive evidence nothing is bound by anyone. `undefined` = cannot
+ * ask.** Three-valued on purpose: "nobody is bound" is a repair the sweeper is
+ * allowed to act on, "I do not know" is not, and a two-valued signature would have
+ * to pick one of them — which is precisely how a stranded export waits out the
+ * 12-hour cap.
+ *
+ * **Why the absence of the `bound` key is an answer.** `Stats` builds `byState` with
+ * `byState[string(s.State)]++` over *every* slot (`pool.go:430`), so a state with zero
+ * slots contributes **no key at all** — not a `0`. That is a property of that counting
+ * loop, not of Go's JSON encoding: the map carries no `omitempty`, so an empty map
+ * would still marshal as `"byState": {}`, and what is absent is the *key inside* it.
+ * So:
+ *
+ *     no `bound` key  ⟺  no slot is StateBound  ⟺  no slot is bound to any session
+ *
+ * which is the same fact branch C derives from `boundSessions` — from a count rather
+ * than a key set, and available in exactly the case the key set goes missing, because
+ * `boundSessions` is `omitempty` and an all-idle pool marshals without it. That is
+ * the whole of this change: D6 (a session `exporting` while every slot is idle, never
+ * repaired, 409ing every future export) was the absence of `boundSessions` being read
+ * as *cannot ask* when it in fact had a positive answer sitting in the same response.
+ *
+ * **Why the vocabulary check, and why it refuses rather than defaults.** A bare
+ * `byState.bound ?? 0` is safe *only* because the key is absent exactly when the
+ * count is zero. The day the orchestrator renames `bound` — to `attached`, to
+ * `in-use` — that `?? 0` reads "I do not use that word" as "nothing is bound", and
+ * the sweeper dispossesses every live export on the pool. So an unrecognised name is
+ * `undefined`, not a default: a refusal, which is the one answer that cannot strand
+ * work. The cost is a named state is needed to trust a pool; the price of guessing
+ * wrong is a user's export cancelled mid-walk.
+ */
+export function poolBindsNobody(
+  byState: Record<string, number> | undefined,
+): boolean | undefined {
+  if (byState === undefined) return undefined;
+  // One unknown name disqualifies the whole reading, because the unknown word may be
+  // the one that used to mean `bound` — and "the thing I am looking for is not in
+  // this response" has to mean *cannot ask* rather than *nothing is bound*.
+  for (const name of Object.keys(byState)) {
+    if (!POOL_STATE_NAMES.has(name)) return undefined;
+  }
+  return (byState.bound ?? 0) === 0;
+}
+
+/**
  * PoolBinder owns the binding between a session and a runner slot.
  *
  * The atomic claim is in SQLite, not here: `db.claimRunner` takes the write lock
@@ -1207,6 +1274,19 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
   // refuse to ask rather than guess `{}` — see the branch C comment.
   const boundSessions =
     stats.ok && stats.value.boundSessions !== undefined ? stats.value.boundSessions : undefined;
+  // **The same question asked of the same snapshot, one clause lower.** `boundSessions`
+  // is an *absence* as evidence: this session's slot is missing as a key, which only
+  // works while some other slot happens to be bound — `Stats` leaves the map nil
+  // otherwise and `omitempty` drops the key, so an all-idle pool (the ordinary state of
+  // a pool nobody is using, and the body the deployed host actually sends) answers
+  // nothing. `byState` answers the same question from a *count*, on the same response,
+  // with a tri-state answer instead of a bare presence — see `poolBindsNobody`.
+  //
+  // `stats.ok` first, same reason as the two above: an unreachable orchestrator is "we
+  // do not know", never "nothing is bound". And the vocabulary refusal lives inside the
+  // helper, so an orchestrator that renamed a state yields `undefined` rather than a
+  // fabricated zero.
+  const nothingBound = stats.ok ? poolBindsNobody(stats.value.byState) : undefined;
   if (stats.ok && stats.value.slotIds !== undefined) {
     const pool = syncPool(db, stats.value.slotIds);
     if (pool.added > 0) {
@@ -1463,10 +1543,10 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
     // — idle, vacant, being recreated, or gone. Reading an absent *field* that way
     // would be the opposite of true, hence:
     //
-    //   - `boundSessions !== undefined` — an absent field means we cannot *ask*. It is
-    //     a rolling deploy (this api ahead of the orchestrator) or an all-idle pool
-    //     (`omitempty` drops the key, and `Stats()` leaves the map nil), not "nothing
-    //     is bound". Fails open to "cannot ask", exactly as `deadSlots` does above.
+    //   - `boundSessions !== undefined` — an absent field means we cannot *ask* **of
+    //     that field**. It is a rolling deploy (this api ahead of the orchestrator) or an
+    //     all-idle pool (`omitempty` drops the key, and `Stats()` leaves the map nil).
+    //     Fails open to "cannot ask", exactly as `deadSlots` does above.
     //     This is the guard that matters: without it an absent field reads as "no slot
     //     is bound" and strands every live export on the pool.
     //   - `!(runner_id in boundSessions)` — **absent**, not "bound to another guid". A
@@ -1482,18 +1562,37 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
     //     the branches without this clause would let C act on a dead slot with the wrong
     //     message and no `/release`; with it, C stands down and B repairs.
     //
-    // **KNOWN LIMITATION (D6):** a session `exporting` while *every* slot is idle is
-    // not caught — that pool marshals no `boundSessions` key at all, so the guard above
-    // fails open and the session waits on the cap. This is not a regression: waiting on
-    // the cap is today's behaviour, so C is a strict improvement for the observed
-    // "one usable slot of two" shape and no worse anywhere else. Closing it needs a
-    // *positive* orchestrator signal, which is a new contract and a separate decision.
+    // **D6 is closed, and the `else` arm below is how.** When `boundSessions` is absent
+    // the old predicate stood down unconditionally, which left a session `exporting`
+    // while *every* slot was idle unrepaired for the whole 12-hour cap — 409ing every
+    // future `POST /api/export` — because that is precisely the pool shape in which
+    // `Stats` leaves the map nil. So the fallback asks the same question of the same
+    // response in a form that survives an empty pool:
+    //
+    //   boundSessions !== undefined  ?  !(runner_id in boundSessions)
+    //                                 :  nothingBound === true
+    //
+    // The arms are ordered, not interchangeable. **`boundSessions` still wins whenever
+    // it is present**, byte for byte: it names *which* slot is unbound rather than how
+    // many are bound, so it is strictly the better evidence and the only one that can
+    // stand C down for a slot bound to a different session. Every pre-existing branch-C
+    // test therefore still runs through the untouched arm, and there is no rolling-
+    // deploy window in which behaviour differs for a pool that is not all-idle.
+    //
+    // `nothingBound` is a fallback for *cannot ask*, not a replacement for *no answer*.
+    // It is `undefined` — and so the whole condition false — when `/stats` failed, when
+    // `byState` itself is missing, and when the response names a state this api does not
+    // know (`poolBindsNobody`). Those three are the same failure: reading a shape we
+    // cannot interpret as "nothing is bound", which would dispose of live exports
+    // mid-walk. The safe direction is deliberate in both halves — no false positive on a
+    // live export, at the cost of a strand surviving one more tick when we cannot ask.
     if (
       session.state === "exporting" &&
       session.runner_id !== null &&
-      boundSessions !== undefined &&
       !deadSlots.includes(session.runner_id) &&
-      !(session.runner_id in boundSessions)
+      (boundSessions !== undefined
+        ? !(session.runner_id in boundSessions)
+        : nothingBound === true)
     ) {
       // **Order is the whole repair**, for the same reason it is in branch B:
       // `releaseRunner` frees the `runners` row and does *not* touch

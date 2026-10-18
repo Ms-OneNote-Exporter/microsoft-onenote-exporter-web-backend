@@ -6,6 +6,11 @@ import {
   signingString,
   type OrchestratorResult,
 } from "../src/orchestrator-client.js";
+// The reader this file's `byState` bodies are pinned *for*. Imported here rather than
+// re-derived as a local `!== undefined` so the literal below is checked against the
+// answer the sweeper will actually read — two copies of "what an absent key means" in one
+// repository is how the two drift.
+import { poolBindsNobody } from "../src/sweep.js";
 
 /**
  * These tests pin the signing scheme against literal vectors produced by the Go
@@ -427,6 +432,84 @@ describe("OrchestratorClient", () => {
     // would refuse a slot that has not been created.
     expect(result.value.slotRemainingSec).toEqual({ "slot-1": 0 });
     expect("slot-2" in (result.value.slotRemainingSec ?? {})).toBe(false);
+  });
+
+  // The both-ends pin for `byState`, the other half of which is
+  // `orchestrator/internal/pool`'s `TestStatsByStateKeysAreKnownStateNames`.
+  //
+  // Same argument as `boundSessions` above — two components, no shared code, a name that
+  // is only a contract — but load-bearing in a way the others are not. `byState` is how
+  // the sweeper reaches a strand on an **all-idle pool**, which is the ordinary state of
+  // a pool nobody is using and the one shape `boundSessions` cannot report at all
+  // (`omitempty` over a nil map). A silent drift here would not degrade: it would restore
+  // D6 exactly, and every other test would still pass.
+  //
+  // **The literal below is the body captured from the deployed host** on 2026-10-18, not
+  // a hand-written approximation — that is the whole point of pinning this one, since the
+  // property under test is an *absence* and an approximation would carry whatever keys
+  // the author happened to type. Read off it: no `bound` key, and no `boundSessions`.
+  it("reads byState off a body with no bound key, and calls that nothing being bound", async () => {
+    const c = client(
+      stubFetch(
+        200,
+        '{"size":2,"byState":{"idle":2},"runnerTtlSeconds":300,"slotIds":["slot-20","slot-21"],"slotAgeSec":{"slot-20":1428,"slot-21":408},"slotRemainingSec":{"slot-20":0,"slot-21":0}}',
+      ),
+    );
+
+    const result = await c.stats();
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // **The key is absent, not `0`** — asserted as a key set rather than as a value,
+    // because `expect(result.value.byState).toEqual({idle: 2})` would also pass for a
+    // client that filled the gap in, and filling it in is the bug this guards.
+    expect(result.value.byState).toEqual({ idle: 2 });
+    expect("bound" in result.value.byState).toBe(false);
+    // And the absence is what the sweeper reads. `byState` is only a repair if "no
+    // `bound` key" is answerable as "nothing is bound by anyone".
+    expect(poolBindsNobody(result.value.byState)).toBe(true);
+  });
+
+  // The other half of the same reading, and the case that keeps the absence from being
+  // over-read: one bound slot is enough to stand the branch down, whatever the field
+  // above says about it.
+  it("calls a pool with a bound slot nothing-bound-is-not", async () => {
+    const c = client(
+      stubFetch(
+        200,
+        JSON.stringify({
+          size: 2,
+          byState: { idle: 1, bound: 1 },
+          runnerTtlSeconds: 300,
+          slotIds: ["slot-1", "slot-2"],
+        }),
+      ),
+    );
+
+    const result = await c.stats();
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(poolBindsNobody(result.value.byState)).toBe(false);
+  });
+
+  // A body with **no** `byState` at all. Unlike the three fields above, `ByState` has
+  // never carried `omitempty`, so this is not a rolling deploy — it is a malformed
+  // response — and the only safe reading of it is "cannot ask". A `?? 0` default here
+  // would say "nothing is bound" and dispose of every live export on the pool.
+  it("reads a body with no byState as cannot-ask, not as nothing being bound", async () => {
+    const c = client(
+      stubFetch(
+        200,
+        JSON.stringify({ size: 2, runnerTtlSeconds: 300, slotIds: ["slot-1", "slot-2"] }),
+      ),
+    );
+
+    const result = await c.stats();
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(poolBindsNobody(result.value.byState)).toBeUndefined();
   });
 });
 

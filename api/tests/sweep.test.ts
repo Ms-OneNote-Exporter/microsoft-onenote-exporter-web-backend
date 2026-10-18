@@ -40,7 +40,11 @@ function orchestratorStub(opts: {
    *
    * Left out of the response when undefined, which is how this stub also stands in
    * for an orchestrator predating the field — the rolling-deploy case the sweeper's
-   * `stats.ok` / `slotIds` guards exist for, and the one test (c) pins.
+   * `stats.ok` / `slotIds` guards exist for — **and** for the real one, the all-idle
+   * pool, where `Stats()` leaves the map nil and `omitempty` drops the key. Tests
+   * (c')–(c'''') are that single absent field with different `byState` bodies under
+   * it: what the sweeper does with an absence is not one answer but a fallback, and
+   * the fallback's input is the field below.
    */
   boundSessions?: Record<string, string>;
   /**
@@ -52,6 +56,22 @@ function orchestratorStub(opts: {
    * exists for and the one test (d) pins.
    */
   deadSlots?: string[];
+  /**
+   * What `/stats` reports as `byState`: pool-state name → slot count.
+   *
+   * Spread over the stub's derived `{ idle: slotIds.length }`, so a test can send the
+   * real all-idle body (`{ idle: 2 }`), a pool with something bound elsewhere
+   * (`{ idle: 1, bound: 1 }`), the shape a `/release` leaves behind (`{ idle: 1,
+   * vacant: 1 }`) or a vocabulary this api has never heard of (`{ idle: 1, warming: 1 }`)
+   * — the last of which is what makes `poolBindsNobody`'s refusal non-theatrical.
+   *
+   * The **default carries no `bound` key**, which is what the real `Stats()` sends: it
+   * counts with `byState[string(s.State)]++`, so a state with zero slots contributes no
+   * key at all. That default is the D6 body — an all-idle pool with `boundSessions`
+   * dropped by `omitempty` — and it is why the stub, not the test, is where the strand
+   * is reproduced.
+   */
+  byState?: Record<string, number>;
   /**
    * What `/stats` reports as `slotRemainingSec`: slot id → seconds of budget left.
    *
@@ -161,7 +181,11 @@ function orchestratorStub(opts: {
           return new Response(
             JSON.stringify({
               size: slotIds.length,
-              byState: { idle: slotIds.length },
+              // The real shape, and it is a *shaped* default rather than `{}`: `Stats`
+              // counts with `byState[string(s.State)]++`, so a state holding no slot
+              // contributes no key. A stub that sent `bound: 0` would make "nobody is
+              // bound anywhere" unreachable, which is the D6 input.
+              byState: { idle: slotIds.length, ...opts.byState },
               runnerTtlSeconds: 300,
               slotIds,
               // Conditional spread, matching `omitempty` on the Go side: an
@@ -2089,6 +2113,11 @@ describe("sweep exportsStranded", () => {
     expect(parsed.finishedAt).toBe(now);
   });
 
+  // A live runner is a **bound** slot, and the orchestrator has to say so. This used to
+  // answer `stats: "ok"` — a pool of *zero* slots — and stand down only because the old
+  // code had no way to read the answer. It can now, and a pool of zero slots says
+  // plainly that nothing is bound to anybody: the fixture was contradicting its own name,
+  // and the unread field was the only thing hiding it.
   it("leaves a session with a live runner untouched", async () => {
     seedRunners(1);
     seedSession(GUID, {
@@ -2097,7 +2126,11 @@ describe("sweep exportsStranded", () => {
       export_state: '{"state":"running","id":"art1","notebook":"NB","progress":null,"startedAt":1,"finishedAt":null}',
     });
 
-    const { client } = orchestratorStub({ stats: "ok" });
+    const { client } = orchestratorStub({
+      stats: "filled",
+      slotIds: ["slot-1"],
+      byState: { bound: 1 },
+    });
     const binder = new PoolBinder(options(client));
     const report = await sweep(options(client), binder);
 
@@ -2335,6 +2368,13 @@ describe("sweep exportsRunnerDied", () => {
 
   // (b) The false-positive guard, and the reason the list is narrow evidence rather
   // than "the slot looks busy". Everything is the same except that the runner is alive.
+  //
+  // **And "alive" has to be said on the wire.** `bound: 1` is the whole difference
+  // between this and (a) once `byState` is read: the stub's derived default is
+  // `{ idle: 1 }` with no `bound` key — the D6 body — so the identical fixture without
+  // this line would now measure the *repair* rather than the hold. A pool reporting that
+  // nothing is bound anywhere is precisely what branch C exists for, and it would be
+  // right to act on it.
   it("holds a live runner, and releases nothing", async () => {
     seedExportingOnDeadSlot();
 
@@ -2342,6 +2382,7 @@ describe("sweep exportsRunnerDied", () => {
       stats: "filled",
       slotIds: ["slot-1"],
       deadSlots: [],
+      byState: { bound: 1 },
       release: "ok",
     });
     const report = await sweep(options(client), new PoolBinder(options(client)));
@@ -2426,6 +2467,10 @@ describe("sweep exportsRunnerDied", () => {
       stats: "filled",
       slotIds: ["slot-1"],
       deadSlots: ["slot-1"],
+      // Live runner, on both fixtures: the slot is `bound`, so branch C stands down and
+      // the half-pinned question stays the only one this test asks. See (b) above for why
+      // it cannot be left to the stub's default.
+      byState: { bound: 1 },
       release: "ok",
     });
     // Same pool, same dead runner, one field missing. A fresh session, because the
@@ -2434,6 +2479,7 @@ describe("sweep exportsRunnerDied", () => {
     const withoutField = await runWith({
       stats: "filled",
       slotIds: ["slot-1"],
+      byState: { bound: 1 },
       release: "ok",
     });
 
@@ -2513,15 +2559,27 @@ describe("sweep exportsRunnerDied", () => {
  * and `exportsRunnerDied` needs the slot in `deadSlots` — which is bound-only, and an
  * idle slot is not dead.
  *
- * ## The signal, and its one production shape
+ * ## The signal, and its two production shapes
  *
  * `/stats.boundSessions` names **every slot the orchestrator currently binds**, so a
  * session's slot being *absent as a key* is positive evidence it is unbound: idle,
- * vacant, being recreated, or gone. The production shape is `boundSessions` **present**
+ * vacant, being recreated, or gone. The primary shape is `boundSessions` **present**
  * with this slot absent — the pool's one idle slot of two, the other slot bound to a
- * live session — which is what test (a) builds. An **absent field** is a different
- * thing entirely: an orchestrator predating it, or an all-idle pool, where `omitempty`
- * drops the key. That is test (c) and it must never strand.
+ * live session — which is what test (a) builds.
+ *
+ * The other shape is an **absent field**, and it has two causes that are not the same
+ * thing. A rolling deploy pairs this api with an orchestrator predating `boundSessions`.
+ * An all-idle pool does not send it either: `Stats()` leaves the map nil and `omitempty`
+ * drops the key — which is what makes it the *ordinary* state of a pool nobody is using,
+ * and what D6 was: that pool could not be repaired at all, and a session stuck
+ * `exporting` on it was 409ing every future export until the 12-hour cap.
+ *
+ * So the absent field is now a **fallback, not a dead end**: `byState` answers the same
+ * question from the same response by counting instead of naming, and no `bound` key in it
+ * means no slot in the pool is bound to anybody. Tests (c')–(c'''') are that one absent
+ * field with four `byState` bodies under it — repaired, repaired, refused, and stood
+ * down — because a fallback whose only pin is the happy path is not a fallback, it is a
+ * guess.
  */
 describe("sweep exportsDispossessed", () => {
   /** Read off a real host row rather than invented, so the shape is the real one. */
@@ -2561,6 +2619,25 @@ describe("sweep exportsDispossessed", () => {
    */
   function seedSecondSlotBound(sessionGuid = OTHER, slotId = "slot-2"): void {
     seedSession(sessionGuid, { state: "authenticated", runner_id: slotId });
+    db.run(`UPDATE runners SET status = 'active', session_guid = ? WHERE id = ?`, sessionGuid, slotId);
+  }
+
+  /**
+   * The pool's second slot, held by a second session that is **also** exporting.
+   *
+   * A real `sessions` row for the same reason `seedSecondSlotBound` above gives one, and
+   * the same trap this whole block keeps re-learning: with a two-slot pool and only one
+   * seeded session, the post-loop orphan reconciler is a second candidate to have done
+   * the repair, and it does it by calling `/release`. So "both slots are unbound now"
+   * would be true whichever writer ran, and `released === []` would be the assertion that
+   * distinguishes them — which only means something if branch C is the one that ran.
+   */
+  function seedSecondSlotExporting(sessionGuid = THIRD, slotId = "slot-2"): void {
+    seedSession(sessionGuid, {
+      state: "exporting",
+      runner_id: slotId,
+      export_state: REAL_EXPORT_STATE,
+    });
     db.run(`UPDATE runners SET status = 'active', session_guid = ? WHERE id = ?`, sessionGuid, slotId);
   }
 
@@ -2640,18 +2717,184 @@ describe("sweep exportsDispossessed", () => {
     expect(session.state).toBe("exporting");
   });
 
-  // (c) an absent `boundSessions` field reads as "cannot ask" — never "unbound".
+  // (c') **D6, closed.** An absent `boundSessions` is no longer a dead end: the same
+  // response's `byState` answers the same question by counting.
   //
-  // This is the rolling-deploy case **and** the all-idle-pool case at once: `Stats()`
-  // leaves the map nil when nothing is bound and `omitempty` drops the key. Both must
-  // fall back to the cap, which is today's behaviour — no regression, but also no fix.
-  // That is D6, and it is why a positive orchestrator signal was deferred.
-  it("does nothing when boundSessions is absent (rolling deploy / all-idle pool)", async () => {
+  // This test used to pin the *limitation* — `exportsDispossessed === 0`, and its
+  // comment recorded why a positive orchestrator signal was deferred. It is the same
+  // fixture with the assertions inverted, which is the shape this repo asks for: the
+  // body it runs against is the one the deployed host actually sends on a pool nobody is
+  // using (`{"size":1,"byState":{"idle":1},…}` — no `boundSessions`, no `bound` key), and
+  // the thing it used to demonstrate was that the strand survived.
+  //
+  // **Before this fix the row below stayed `exporting` for the whole 12-hour cap**, and
+  // `POST /api/export` answered `409 an export is already running` for every notebook the
+  // user had not tried yet. The stub's derived `byState` — `{ idle: 1 }` with no `bound`
+  // key — is that body, and it is the *default* every other test in this file has been
+  // running against all along, which is why the fixture needed no new option to
+  // reproduce D6.
+  it("repairs the strand on an all-idle pool, which marshals no boundSessions", async () => {
+    seedExportingOnSlot();
+
+    const frames = watch(sse, GUID);
+
+    const { client, released } = orchestratorStub({
+      stats: "filled",
+      slotIds: ["slot-1"],
+      deadSlots: [],
+      release: "ok",
+    });
+    const report = await sweep(options(client), new PoolBinder(options(client)));
+
+    // **Still no `/release`** — the point branch C shares with test (a), and why this is
+    // asserted first. The orchestrator side is already unbound, so a release would
+    // destroy a healthy idle container to fix a row only this process can see. And
+    // because `/stats` carries no `boundSessions` at all, the post-loop orphan
+    // reconciler has nothing to iterate: `[]` here is branch C's assertion, not the
+    // reconciler's.
+    expect(released).toEqual([]);
+    expect(report.exportsDispossessed).toBe(1);
+
+    const session = db.getSession(GUID)!;
+    expect(session.state).toBe("authenticated");
+    expect(session.runner_id).toBeNull();
+    expect(rowFor("slot-1")).toEqual({ status: "idle", session_guid: null });
+
+    // The user's own cause — branch C's message, not branch B's "the runner disappeared".
+    const parsed = JSON.parse(session.export_state!);
+    expect(parsed.error).toBe("the runner's slot was reclaimed before this export finished");
+    expect(parsed.id).toBe("zLshdOnjRmN6jkYPcu7SnXzsZvKg9YifTAbRM7aZy5E");
+
+    // One frame, because the frontend is SSE-only: the walk is gone, and nothing else
+    // will ever end this progress card.
+    const events = frames();
+    expect(events.length).toBe(1);
+    expect(events[0].type).toBe("session-status");
+    expect(events[0].data).toEqual({ state: "authenticated" });
+  });
+
+  // (c'') the body the deployed host actually sends, on the pool size it actually has.
+  //
+  // Two slots, `{"byState":{"idle":2}}`, and **two sessions stranded on them** — the
+  // shape a whole pool going quiet leaves behind. Both halves are load-bearing:
+  //
+  //   - **Two real `sessions` rows.** With only one, the post-loop orphan reconciler is
+  //     also a candidate to "fix" a row, and it fixes it by calling `/release` for real.
+  //     A test that asserted only "both slots ended up unbound" would pass whichever
+  //     writer ran — the trap the PR that added branch C fell into. `released === []`
+  //     beside the counter is what tells the two apart.
+  //   - **No `bound` key.** Asserted by the stub's own default rather than by a comment,
+  //     because a `bound: 0` would make this the (a) shape and the test would measure
+  //     nothing new.
+  it("repairs both strands on the real two-slot all-idle body", async () => {
+    seedExportingOnSlot(GUID, "slot-1", 2);
+    seedSecondSlotExporting();
+
+    const runWith = async (opts: Parameters<typeof orchestratorStub>[0]) => {
+      const { client, released } = orchestratorStub(opts);
+      const report = await sweep(options(client), new PoolBinder(options(client)));
+      return { report, released };
+    };
+
+    // The capture from the deployed host, byte for byte in the part under test: two
+    // slots, both idle, nothing bound, and no `boundSessions` key to ask about.
+    const idle = await runWith({
+      stats: "filled",
+      slotIds: ["slot-1", "slot-2"],
+      byState: { idle: 2 },
+      release: "ok",
+    });
+    expect(idle.released).toEqual([]);
+    expect(idle.report.exportsDispossessed).toBe(2);
+
+    for (const guid of [GUID, THIRD]) {
+      expect(db.getSession(guid)?.state).toBe("authenticated");
+      expect(db.getSession(guid)?.runner_id).toBeNull();
+      expect(JSON.parse(db.getSession(guid)!.export_state!).error).toBe(
+        "the runner's slot was reclaimed before this export finished",
+      );
+    }
+  });
+
+  // (c''-b) **The companion body: what a `/release` actually leaves behind.**
+  //
+  // One idle slot and one `vacant` — no container, one wanted — which is the state
+  // `Pool.Release` puts a slot in. The same repair has to happen, and it has to happen
+  // *because `vacant` reads as not-bound* rather than in spite of the vocabulary check:
+  // `POOL_STATE_NAMES` covers both words, so the answer is the same one (c'') got from
+  // `idle`. Without this half, the refusal in (c''') would read as being about unknown
+  // names rather than about names, and a future state added to the pool could break the
+  // repair with a green suite.
+  it("still repairs when the released slot reports vacant rather than idle", async () => {
+    seedExportingOnSlot(GUID, "slot-1", 2);
+    seedSecondSlotExporting();
+
+    const { client, released } = orchestratorStub({
+      stats: "filled",
+      slotIds: ["slot-1", "slot-2"],
+      byState: { idle: 1, vacant: 1 },
+      release: "ok",
+    });
+    const report = await sweep(options(client), new PoolBinder(options(client)));
+
+    // Still branch C's: no `/release`, even though this body is the aftermath of one.
+    expect(released).toEqual([]);
+    expect(report.exportsDispossessed).toBe(2);
+  });
+
+  // (c''') the refusal, which is what makes the `?? 0` this does *not* write safe.
+  //
+  // `byState: { idle: 1, warming: 1 }` is a pool from an orchestrator whose vocabulary
+  // this api has never heard of. `bound` is absent from it — for a reason that means "I do
+  // not use that word", not "nothing is bound" — and a `byState.bound ?? 0` would read it
+  // as the second thing and dispossess a live export mid-walk. So the helper answers
+  // "cannot ask" and the strand survives this tick.
+  //
+  // **That is the safe direction and it is deliberate**: one more tick of a 409 beats
+  // cancelling somebody's running export. Deleting the `POOL_STATE_NAMES` loop turns this
+  // red, which is the entire reason the loop exists.
+  it("refuses to answer when byState names a state this api does not know", async () => {
     seedExportingOnSlot();
 
     const { client, released } = orchestratorStub({
       stats: "filled",
       slotIds: ["slot-1"],
+      byState: { idle: 1, warming: 1 },
+      deadSlots: [],
+      release: "ok",
+    });
+    const report = await sweep(options(client), new PoolBinder(options(client)));
+
+    expect(released).toEqual([]);
+    expect(report.exportsDispossessed).toBe(0);
+    // Held, not stranded by us: the export-hold below is the right answer for a session
+    // we cannot prove is unbound.
+    expect(report.exportsHeld).toBe(1);
+
+    const session = db.getSession(GUID)!;
+    expect(session.state).toBe("exporting");
+    expect(session.runner_id).toBe("slot-1");
+  });
+
+  // (c'''') the fallback's other no-answer: `boundSessions` missing for a reason that is
+  // NOT an all-idle pool.
+  //
+  // `boundSessions` is `omitempty` over a nil map, and a bound slot whose GUID is blank
+  // contributes nothing to it by design: `Stats` requires `StateBound` **and** a non-empty
+  // `SessionGUID`. So an orchestrator can bind a slot and still publish no
+  // `boundSessions` at all, and then `byState` is the only evidence there is. It says a
+  // slot *is* bound, which means something is holding one, so this branch stands down
+  // rather than assuming it is this session's.
+  //
+  // This is what forbids hard-coding the fallback to `true`: the strand in (c') is
+  // detected because the pool is quiet, not because anybody released anything.
+  it("stands down when boundSessions is absent but some slot is bound", async () => {
+    seedExportingOnSlot();
+
+    const { client, released } = orchestratorStub({
+      stats: "filled",
+      slotIds: ["slot-1"],
+      byState: { idle: 1, bound: 1 },
       deadSlots: [],
       release: "ok",
     });
@@ -2662,8 +2905,8 @@ describe("sweep exportsDispossessed", () => {
     expect(report.exportsHeld).toBe(1);
 
     const session = db.getSession(GUID)!;
-    expect(session.runner_id).toBe("slot-1");
     expect(session.state).toBe("exporting");
+    expect(session.runner_id).toBe("slot-1");
   });
 
   // (d) data-loss guard — a terminal `partial` export keeps its bytes.
@@ -2789,6 +3032,14 @@ describe("sweep exportsDispossessed", () => {
       // true of a slot whose container died and was never rebound.
       boundSessions: {},
       deadSlots: ["slot-1"],
+      // **`byState` is consistent, and deliberately so**: nothing is bound anything, so
+      // the fallback arm would also say `true`. The test therefore cannot tell the two
+      // arms apart — `boundSessions` is present and empty, so the untouched arm decides
+      // — and what it pins is the property that must hold either way: a slot that is
+      // both dead and unbound belongs to B, once, with its `/release` and its own
+      // message. If branch order ever let the fallback act first, the message and the
+      // missing teardown below would say so.
+      byState: { idle: 1, dead: 1 },
       release: "ok",
     });
     const report = await sweep(options(client), new PoolBinder(options(client)));

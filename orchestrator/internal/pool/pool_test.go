@@ -1405,6 +1405,99 @@ func TestStatsMarshalsBoundSessionsUnderItsJSONKey(t *testing.T) {
 	}
 }
 
+// ---- byState ------------------------------------------------------------------
+//
+// The one field here that is load-bearing *by its absences*, and the only cross-component
+// reading in the system that treats "no key" as an answer rather than as missing data.
+//
+// `api`'s sweeper repairs a session stuck `exporting` whose slot nobody holds. Its
+// primary evidence is `boundSessions`, which is `omitempty` over a nil map — so on an
+// all-idle pool, the ordinary state of a pool nobody is using, it reports nothing at all.
+// The fallback reads `ByState` instead: no `bound` key there is positive evidence that no
+// slot in the pool is bound to any session.
+//
+// **Two facts make that inference sound, and this test is where they are asserted.** Both
+// are properties of this side, which is why both live here rather than in the api:
+//
+//  1. The keys are the `State` constants and nothing else — so "the key I want is not in
+//     this map" cannot mean "the orchestrator calls it something else".
+//  2. A state with **no** slots contributes **no key** — not a zero. `Stats` counts with
+//     `byState[string(s.State)]++` over the slots it has, so a zero is never counted and
+//     never written. That is a property of that loop, not of Go's JSON encoding: the map
+//     carries no `omitempty`, so an empty map still marshals as `"byState": {}`.
+//
+// Add a seventh state and this goes red, and `POOL_STATE_NAMES` in `api/src/sweep.ts` is
+// updated in the same PR. Make `Stats` emit zero-count keys and it goes red the other way,
+// because the absence would stop meaning "none" — which is the failure the api's
+// vocabulary refusal is there to survive.
+func TestStatsByStateKeysAreKnownStateNames(t *testing.T) {
+	// Spelled out as the strings that cross the boundary rather than derived from the
+	// constants above. Deriving them would still catch a new state — the fixture would
+	// still be six states long — but it would not catch a *rename*, which is the other
+	// way this contract breaks and the one that strands live exports.
+	known := map[string]bool{
+		"vacant":   true,
+		"starting": true,
+		"idle":     true,
+		"bound":    true,
+		"draining": true,
+		"dead":     true,
+	}
+
+	p := New(testConfig(t, len(known)), nil, discardLog())
+	states := []State{StateVacant, StateStarting, StateIdle, StateBound, StateDraining, StateDead}
+	for i, state := range states {
+		id := fmt.Sprintf("slot-%d", i+1)
+		p.slots[id] = &Slot{ID: id, State: state, ContainerID: "container-" + id}
+	}
+	// The bound slot records a session, so the fixture is a pool one could really be in
+	// rather than one only `Stats` could produce.
+	p.slots["slot-4"].SessionGUID = boundGUIDOne
+
+	body, err := json.Marshal(p.Stats())
+	if err != nil {
+		t.Fatalf("marshal stats: %v", err)
+	}
+	var decoded struct {
+		ByState map[string]int `json:"byState"`
+	}
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("unmarshal stats: %v", err)
+	}
+
+	// Six states in, six keys out. Asserted first, because a loop over an empty map
+	// proves nothing at all — and an empty map is exactly what a pool whose slots had
+	// all been dropped would produce.
+	if len(decoded.ByState) != len(known) {
+		t.Fatalf("byState = %v, want one key per state: %s", decoded.ByState, body)
+	}
+	for name, count := range decoded.ByState {
+		if !known[name] {
+			t.Errorf("byState carries %q, which is not a pool state name; api's "+
+				"POOL_STATE_NAMES would refuse to read this pool", name)
+		}
+		if count != 1 {
+			t.Errorf("byState[%q] = %d, want 1", name, count)
+		}
+	}
+
+	// **The other half: a state with no slots contributes no key.** The body captured
+	// from the deployed host on a pool of two, both idle, is `{"byState":{"idle":2}}` —
+	// no `bound` key, and that absence is the api's evidence that nothing is bound
+	// anywhere. A `bound: 0` here would be a *different* response, and the `?? 0` the
+	// api deliberately does not write would stop being safe against a future rename.
+	idle := slotIDsPool(t, 2)
+	byState := idle.Stats().ByState
+	if _, present := byState["bound"]; present {
+		t.Errorf("an all-idle pool carries a bound key: %v", byState)
+	}
+	// Asserted after the absence, so a map that dropped everything passes neither check
+	// by accident.
+	if byState["idle"] != 2 || len(byState) != 1 {
+		t.Errorf("byState = %v on an all-idle pool, want exactly {idle: 2}", byState)
+	}
+}
+
 // ---- per-slot age and remaining budget ---------------------------------------
 //
 // The api can already ask how many slots are idle; it could not ask how long the

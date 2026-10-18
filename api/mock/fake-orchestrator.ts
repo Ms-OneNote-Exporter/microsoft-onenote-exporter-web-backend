@@ -322,10 +322,35 @@ export class FakeOrchestrator {
   }
 
   async stats(): Promise<OrchestratorResult<OrchestratorStats>> {
-    const byState: Record<string, number> = { idle: 0, bound: 0 };
+    // **Counted the way `Stats()` counts.** Only a state that holds at least one slot
+    // gets a key, so an all-idle pool answers `{"idle": n}` and carries **no `bound`
+    // key** — which is what the real orchestrator sends, read off the deployed host:
+    // `{"size":2,"byState":{"idle":2},…}`. This used to seed `{ idle: 0, bound: 0 }`
+    // and always emit `bound: 0`, a response no `Stats()` has ever produced. That is
+    // worse than a missing field: the api's strand repair reads `byState` when
+    // `boundSessions` is absent, and a fake that always sent `bound` made the new
+    // path's *input* unreachable in the one place it is supposed to be exercised —
+    // while teaching the api a shape the wire does not carry. A mock that disagrees
+    // with production is a mock that keeps passing when production is wrong.
+    //
+    // **Still an approximation, and knowingly so.** This file's slot model has no state
+    // machine, so there is no `starting`, `draining` or `dead` here at all; modelling
+    // those is a mock-fidelity project, not this fix. Nor is this mock covered by CI —
+    // it is a dev harness (`npm run mock`) — which is why the both-ends pins live in
+    // `api/tests/orchestrator-client.test.ts` and in `orchestrator/internal/pool`'s
+    // `TestStatsByStateKeysAreKnownStateNames` instead of here.
+    const byState: Record<string, number> = {};
     for (const slot of this.#slots.values()) {
-      byState[slot.sessionGuid === null ? "idle" : "bound"] =
-        (byState[slot.sessionGuid === null ? "idle" : "bound"] ?? 0) + 1;
+      // The real `Release` leaves its slot **vacant** — no container, one wanted — and
+      // so does a slot `EnsurePool` has registered and not created into yet.
+      // `createdAtMs === null` is exactly the container-less case this file models, so
+      // it is what tells the two apart from an `idle` container nobody is bound to. The
+      // mock has no `fail`, so it cannot produce that one — see the note above. Neither
+      // word is `bound`, so this changes no answer the api derives; it is fidelity, and
+      // it is what makes a `/stats` body from the dev harness readable as a real one.
+      const state =
+        slot.createdAtMs === null ? "vacant" : slot.sessionGuid === null ? "idle" : "bound";
+      byState[state] = (byState[state] ?? 0) + 1;
     }
     // The same shape the real one sends, derived from this file's own slot model
     // rather than computed on demand from the caller's interest in it.

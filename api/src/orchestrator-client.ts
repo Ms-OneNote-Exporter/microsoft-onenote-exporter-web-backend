@@ -185,6 +185,29 @@ export interface FinalizeInput {
 /** Pool occupancy, from GET /stats. */
 export interface OrchestratorStats {
   size: number;
+  /**
+   * How many slots are in each pool state: `{"idle": 2}`, `{"idle": 1, "bound": 1}`.
+   *
+   * **Keys are present only for states that currently hold at least one slot.** Go's
+   * `Stats` counts with `byState[string(s.State)]++` over every slot, so a state with
+   * zero slots contributes *no key* — not a `0`. Read the live body from the deployed
+   * host (pool of two, nobody using it): `{"size":2,"byState":{"idle":2},…}`. There is
+   * no `bound` key in it, and `bound: 0` would have been a different response.
+   *
+   * That absence is what makes this field load-bearing rather than descriptive. The
+   * sweeper repairs a session stuck `exporting` whose slot nobody holds, and
+   * `boundSessions` — the field that names *which* slots are held — is `omitempty`, so
+   * on an all-idle pool it is absent entirely and the repair could not be reached from
+   * it. This map can: **no `bound` key is positive evidence that no slot is bound to
+   * any session**, because that is the same response that counted zero `StateBound`
+   * slots. `poolBindsNobody` in `sweep.ts` is the reader, and the state names it
+   * accepts are pinned by `POOL_STATE_NAMES` there — a renamed state makes it refuse
+   * to answer rather than read the renamed word as "nothing is bound".
+   *
+   * Required, and not for the reason the optional fields above are optional: `ByState`
+   * has carried no `omitempty` since before this api existed, so a body without it is
+   * malformed rather than old. Nothing here rolls back with a deploy.
+   */
   byState: Record<string, number>;
   runnerTtlSeconds: number;
   /**

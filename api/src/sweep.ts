@@ -183,6 +183,26 @@ export interface SweepReport {
    */
   exportsRunnerDied: number;
   /**
+   * Exports ended because their runner's slot was **reclaimed to idle** while they
+   * were still running, and whose state was reset.
+   *
+   * The third shape, and the one nothing could see. `exportsStranded` is a session
+   * with no runner row; `exportsRunnerDied` is one whose runner's container died —
+   * both have the api's records agreeing with each other and with a slot the
+   * orchestrator can still name. Here the api's records also agree with each other
+   * (`runner_id` set, `runners` row `active`, state `exporting`) and the slot is
+   * *idle*: a boot TTL-replace cleared the orchestrator's `SessionGUID` and dropped
+   * the binding, so the export was never going to finish. Because `exporting`
+   * sessions are skipped to protect live ones, the row sat there refusing every
+   * future export with a 409 until the 12-hour absolute cap.
+   *
+   * Counted separately because each is a different repair for a different failure,
+   * and an operator seeing "one stranded export" must know which of the three to look
+   * for: this one is a *slot the pool still has*, which is why it was invisible —
+   * nothing was missing, one thing was simply no longer true.
+   */
+  exportsDispossessed: number;
+  /**
    * Runners released because the session's login was refused.
    *
    * Counted because 'a session went idle' and 'a login was rejected' look identical from
@@ -1137,6 +1157,7 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
     exportsHeld: 0,
     exportsStranded: 0,
     exportsRunnerDied: 0,
+    exportsDispossessed: 0,
     authFailedReleased: 0,
     orphanSlotsReleased: 0,
     phantomRowsCleaned: 0,
@@ -1174,6 +1195,18 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
   // which is read as `[]`.
   const deadSlots =
     stats.ok && stats.value.deadSlots !== undefined ? stats.value.deadSlots : [];
+  // Same two-part guard as `deadSlots`, and the same reason for both halves: a failed
+  // `/stats` is "we do not know", never "nothing is bound" — treating an orchestrator
+  // outage as a clean bill of health would strand every live export on the pool.
+  //
+  // The difference is the fallback. `deadSlots` falls back to `[]` because "no dead
+  // slots" is the safe default when nothing is reported. `boundSessions` falls back to
+  // `undefined` because its consumer asks a question only an answer can answer: is
+  // this session's slot *absent* from the set? Absent on a healthy pool and absent
+  // because the field was never reported look identical from here, so the guard must
+  // refuse to ask rather than guess `{}` — see the branch C comment.
+  const boundSessions =
+    stats.ok && stats.value.boundSessions !== undefined ? stats.value.boundSessions : undefined;
   if (stats.ok && stats.value.slotIds !== undefined) {
     const pool = syncPool(db, stats.value.slotIds);
     if (pool.added > 0) {
@@ -1407,6 +1440,93 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
         // Same event as the branch above and for the same reason: the frontend is
         // SSE-only, and the one writer that would have ended the progress card is
         // precisely what died. `session-status` tells the client to re-read the
+        // snapshot (App.tsx:293).
+        sse.emit(session.guid, "session-status", { state: "authenticated" });
+      }
+      continue;
+    }
+    // **Branch C — the slot was reclaimed to idle while the session still exports.**
+    //
+    // The third shape, and the only one where the api's records are all consistent
+    // and all wrong. A boot TTL-replace (or any orchestrator restart) drops a bound
+    // slot's orchestrator-side `SessionGUID`, so the slot reports `idle`: `runner_id`
+    // is still set here, the `runners` row is still `active`, and the export was never
+    // going to finish. Branch A cannot reach it (`runner_id` is not null); branch B
+    // cannot reach it (an idle slot is not in `deadSlots`, which is bound-only). So
+    // without this the export-hold below pins the session for the 12-hour cap, and
+    // `POST /api/export` answers `409 an export is already running` for every notebook
+    // the user has not tried yet.
+    //
+    // **The signal is an absence, which is why each guard below is load-bearing.**
+    // `boundSessions` names every slot the orchestrator currently binds, so this
+    // session's slot missing as a *key* is positive evidence it is unbound by everyone
+    // — idle, vacant, being recreated, or gone. Reading an absent *field* that way
+    // would be the opposite of true, hence:
+    //
+    //   - `boundSessions !== undefined` — an absent field means we cannot *ask*. It is
+    //     a rolling deploy (this api ahead of the orchestrator) or an all-idle pool
+    //     (`omitempty` drops the key, and `Stats()` leaves the map nil), not "nothing
+    //     is bound". Fails open to "cannot ask", exactly as `deadSlots` does above.
+    //     This is the guard that matters: without it an absent field reads as "no slot
+    //     is bound" and strands every live export on the pool.
+    //   - `!(runner_id in boundSessions)` — **absent**, not "bound to another guid". A
+    //     slot bound to a *different* session is a key that IS present, so it stands
+    //     down and the post-loop orphan reconciler owns it: that shape is pool drift,
+    //     and stranding it here could dispossess the session actually using the slot.
+    //   - `!deadSlots.includes(...)` — **redundant, and deliberately so.** Branch B
+    //     above matches the same prefix and `continue`s, so a session that reaches here
+    //     cannot be in `deadSlots`; dropping this clause changes no behaviour today
+    //     (verified — the suite stays green without it). It is kept because the two
+    //     branches' contract is that they own *disjoint* shapes, and that is a property
+    //     of this predicate rather than of the order of two `if`s above it. Reordering
+    //     the branches without this clause would let C act on a dead slot with the wrong
+    //     message and no `/release`; with it, C stands down and B repairs.
+    //
+    // **KNOWN LIMITATION (D6):** a session `exporting` while *every* slot is idle is
+    // not caught — that pool marshals no `boundSessions` key at all, so the guard above
+    // fails open and the session waits on the cap. This is not a regression: waiting on
+    // the cap is today's behaviour, so C is a strict improvement for the observed
+    // "one usable slot of two" shape and no worse anywhere else. Closing it needs a
+    // *positive* orchestrator signal, which is a new contract and a separate decision.
+    if (
+      session.state === "exporting" &&
+      session.runner_id !== null &&
+      boundSessions !== undefined &&
+      !deadSlots.includes(session.runner_id) &&
+      !(session.runner_id in boundSessions)
+    ) {
+      // **Order is the whole repair**, for the same reason it is in branch B:
+      // `releaseRunner` frees the `runners` row and does *not* touch
+      // `sessions.runner_id`, and `markExportStranded` tests `runner_id IS NULL`. Skip
+      // the unbind and the third statement is a no-op — the row is untouched and the
+      // cap still wins, while the api goes on claiming a slot the pool has handed back.
+      //
+      // **No `/release`.** The orchestrator side is already unbound (`StateIdle`), so
+      // releasing would destroy a *healthy* idle container and transiently shrink the
+      // pool to fix a row that only this process can see. Branch B needs its release
+      // because the container is gone and something must be torn down; nothing is here.
+      db.releaseRunner(session.runner_id);
+      // Guarded on the id this snapshot named, so a newer live claim that landed in
+      // the window is not dispossessed by a stale one (F8).
+      db.clearSessionRunner(session.guid, session.runner_id);
+      const changed = db.markExportStranded({
+        guid: session.guid,
+        now,
+        idleExpiresAt: now + TTL.authenticatedIdle,
+        // The user's own cause, not branch B's. Nothing died and nothing released it:
+        // the slot was quietly taken back, and the card the browser is showing is
+        // frozen on a walk that can never be resumed.
+        error: "the runner's slot was reclaimed before this export finished",
+      });
+      if (changed) {
+        report.exportsDispossessed++;
+        log.warn("export slot reclaimed while the session still exported; export reset", {
+          session: session.guid,
+          slot: session.runner_id,
+        });
+        // Same event as branches A and B for the same reason: the frontend is
+        // SSE-only, and the one writer that would have ended the progress card is the
+        // thing that went away. `session-status` tells the client to re-read the
         // snapshot (App.tsx:293).
         sse.emit(session.guid, "session-status", { state: "authenticated" });
       }

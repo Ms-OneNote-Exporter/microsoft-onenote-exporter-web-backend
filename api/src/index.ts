@@ -639,12 +639,14 @@ async function main(): Promise<void> {
         if (
           report.orphanSlotsReleased > 0 ||
           report.phantomRowsCleaned > 0 ||
-          report.exportsRunnerDied > 0
+          report.exportsRunnerDied > 0 ||
+          report.exportsDispossessed > 0
         ) {
           booted.log.info("sweep reclaimed orphan bindings", {
             slotsReleased: report.orphanSlotsReleased,
             rowsCleaned: report.phantomRowsCleaned,
             exportsRunnerDied: report.exportsRunnerDied,
+            exportsDispossessed: report.exportsDispossessed,
           });
         }
         if (report.pendingErases > 0) {

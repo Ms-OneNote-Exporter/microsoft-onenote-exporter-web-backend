@@ -245,6 +245,92 @@ func containsEnv(env []string, want string) bool {
 	return envValue(env, strings.SplitN(want, "=", 2)[0]) == strings.SplitN(want, "=", 2)[1]
 }
 
+// The two child-process timeouts, and the shape of the contract around them.
+//
+// `.env.example` documented `LOGIN_TIMEOUT_MS` / `EXPORT_TIMEOUT_MS`, nothing read
+// them, and every runner sat on the runner's own compiled-in 5 and 60 minutes while
+// the operator believed they had configured something. These are the orchestrator's
+// half of the fix; runner/tests/contract.test.ts pins the other end.
+//
+// **Both directions matter, and the second one is the one that keeps the default
+// from drifting.** A conditional that always added the entry would make the operator's
+// value real and leave two copies of each number in two repositories; a conditional
+// that never added it would leave the knob dead again. So: configured ⇒ present with
+// the configured value, unset ⇒ absent.
+func TestCreateRequestCarriesTheConfiguredRunnerTimeouts(t *testing.T) {
+	cfg := testConfig(t, 1)
+	cfg.RunnerLoginTimeout = 120_000 * time.Millisecond
+	cfg.RunnerExportTimeout = 900_000 * time.Millisecond
+	p := noDockerPool(t, cfg)
+
+	req, err := p.buildCreateRequest("slot-1", "c-1", "", time.Time{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for _, want := range []string{
+		"MSOUT_LOGIN_TIMEOUT_MS=120000",
+		"MSOUT_EXPORT_TIMEOUT_MS=900000",
+	} {
+		if !containsEnv(req.Env, want) {
+			t.Errorf("env = %v, want it to contain %q — the runner reads MSOUT_-prefixed "+
+				"names and this is the only way an operator's value reaches one", req.Env, want)
+		}
+	}
+}
+
+// Unset ⇒ the variable is **absent**, not present-and-empty and not present-with-a-
+// default.
+//
+// `envValue` cannot tell those three apart, so this asserts on the name directly. An
+// entry with an empty value would be read by the runner's own `intFromEnv` and become
+// a NaN-shaped zero or a parse failure depending on its implementation — and an
+// entry carrying this component's own default would mean two copies of each number
+// free to drift, with the runner's constant becoming unreachable code.
+func TestCreateRequestOmitsUnconfiguredRunnerTimeouts(t *testing.T) {
+	cfg := testConfig(t, 1)
+	p := noDockerPool(t, cfg)
+
+	req, err := p.buildCreateRequest("slot-1", "c-1", "", time.Time{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for _, name := range []string{"MSOUT_LOGIN_TIMEOUT_MS", "MSOUT_EXPORT_TIMEOUT_MS"} {
+		for _, entry := range req.Env {
+			if strings.HasPrefix(entry, name) {
+				t.Errorf("env carries %q with no configured value; the runner's own default "+
+					"must be the single source of truth", entry)
+			}
+		}
+	}
+}
+
+// The base entries are unconditional. A refactor that moved the whole `Env` slice
+// behind a condition would pass both tests above while breaking this one — the runner
+// refuses to boot without its token file, and every @msout dump would land outside
+// the session directory.
+func TestCreateRequestKeepsItsUnconditionalEnvironment(t *testing.T) {
+	cfg := testConfig(t, 1)
+	cfg.RunnerLoginTimeout = 120_000 * time.Millisecond
+	cfg.RunnerExportTimeout = 900_000 * time.Millisecond
+	p := noDockerPool(t, cfg)
+
+	req, err := p.buildCreateRequest("slot-1", "c-1", "3f2504e0-4f89-11d3-9a0c-0305e82c3301", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for _, want := range []string{
+		"MSOUT_RUNNER_TOKEN_FILE=/run/secrets/runner_token",
+		"ONENOTE_EXPORT_LOG_DIR=/data/logs",
+	} {
+		if !containsEnv(req.Env, want) {
+			t.Errorf("env = %v, want it to still contain %q when the timeouts are configured", req.Env, want)
+		}
+	}
+}
+
 func envValue(env []string, name string) string {
 	for _, entry := range env {
 		if strings.HasPrefix(entry, name+"=") {

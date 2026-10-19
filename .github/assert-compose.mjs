@@ -15,7 +15,7 @@
  * daemon.
  */
 
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 
 const cfg = JSON.parse(readFileSync(0, "utf8"));
 
@@ -829,6 +829,15 @@ const ORCH_VARS_ACTUALLY_READ = new Set([
   // than two cores — found by deploying to a 1-CPU VPS, where the pool stayed empty
   // and the api reported it as "every session is busy".
   "ORCH_RUNNER_NANO_CPUS",
+  // Hard limits on a single child process inside a runner, passed through to each
+  // runner's create request. They were documented in `.env.example` under the bare
+  // names `LOGIN_TIMEOUT_MS` / `EXPORT_TIMEOUT_MS`, which no component reads: the
+  // runner reads `MSOUT_LOGIN_TIMEOUT_MS` / `MSOUT_EXPORT_TIMEOUT_MS` and is created
+  // by this orchestrator rather than by compose, so the value has to arrive here
+  // first. Both may be empty, which means "not configured" — the orchestrator then
+  // omits the variable and the runner's own default applies.
+  "ORCH_RUNNER_EXPORT_TIMEOUT_MS",
+  "ORCH_RUNNER_LOGIN_TIMEOUT_MS",
   // Not read by the orchestrator; Docker's own group_add interpolation.
   "_DOCKER_GID",
 ]);
@@ -891,6 +900,299 @@ for (const svc of ["api", "orchestrator", "caddy"]) {
       added.length === 0,
       `${svc} adds no capabilities`,
       `${svc} adds capabilities it has no use for: ${added.join(",")}`,
+    );
+  }
+}
+
+// 11. Every key `.env.example` documents reaches something.
+//
+// #9 is about a variable in the *wrong namespace*; this is about a variable not in
+// the namespace at all, so #9 cannot see it. Both of those are one shape of mistake
+// and it is the worst kind: the container starts, looks configured, and ignores you.
+//
+// Three keys shipped in exactly that state. `LOGIN_TIMEOUT_MS` and
+// `EXPORT_TIMEOUT_MS` were documented, and nothing read either name — the runner
+// reads `MSOUT_LOGIN_TIMEOUT_MS` / `MSOUT_EXPORT_TIMEOUT_MS` and is created by the
+// orchestrator rather than by compose, so an operator who set them changed nothing
+// and every runner sat on the runner's own compiled-in defaults. The third,
+// `CHROMIUM_NO_SANDBOX`, advertised disabling Chromium's renderer sandbox and had no
+// reader in any name, so an operator who set it would see no error and conclude the
+// sandbox was off. It was deleted rather than wired: a wire would have turned a
+// control into a default, which is the one shape this repository refuses (see
+// ARCHITECTURE.md §4.5 and runner/Dockerfile).
+//
+// So this asks the question in the only way that can be asked about a documentation
+// file: is each key **consumed** — interpolated by compose, or read literally by a
+// component, Dockerfile, workflow or package.json script?
+//
+// **Resolution is not used, and that is deliberate.** `docker compose config` renders
+// `${VAR:-default}` to its value, so the resolved config cannot distinguish a key
+// compose interpolates from one it hardcodes beside it. Reading the interpolation
+// sources means reading docker-compose.yml — which is why this reads two files from
+// the repo root rather than only the stdin config. Both are resolved relative to this
+// script with `import.meta.url`, so it runs from whatever directory it is invoked in
+// and CI's `node .github/assert-compose.mjs` needs no path of its own.
+const REPO_ROOT = new URL("../", import.meta.url);
+const readRepoFile = (relative) => {
+  try {
+    return readFileSync(new URL(relative, REPO_ROOT), "utf8");
+  } catch {
+    return null;
+  }
+};
+
+const envExample = readRepoFile(".env.example");
+const composeSource = readRepoFile("docker-compose.yml");
+
+  check(
+    envExample !== null && composeSource !== null,
+    "`.env.example` and docker-compose.yml are both readable from the repo root",
+    `FAIL: could not read ${envExample === null ? ".env.example" : "docker-compose.yml"} ` +
+      `relative to this script. The documented-key check cannot run, and a check that ` +
+      `quietly skips is the failure mode this file exists to catch`,
+);
+
+if (envExample !== null && composeSource !== null) {
+  // The keys, in file order, first occurrence winning.
+  //
+  // Only uncommented assignments: a `# KEY=value` in the prose is an example of the
+  // syntax, not a setting. Deduplicated because a key may legitimately appear twice
+  // (POOL_SIZE does today, under two headings) and reporting it twice would read as
+  // two findings.
+  const documentedKeys = [
+    ...new Set(
+      envExample
+        .split("\n")
+        .map((line) => /^\s*([A-Za-z_][A-Za-z0-9_]*)=/.exec(line)?.[1])
+        .filter((key) => key !== undefined),
+    ),
+  ];
+
+  // Where a **running** component reads a variable literally.
+  //
+  // Component source only, and that scoping is the check's whole integrity.
+  // `capability.yml` and `ci.yml` between them name almost every variable in this
+  // repository — as `env:` values, as grep patterns, as strings to assert *absent* —
+  // so a scan that included workflows or Dockerfiles would report every key as
+  // consumed and pass on a completely dead one. That is the failure this check
+  // exists to catch, reproduced in the check itself.
+  //
+  // A build-time or CI-time mention is therefore **not** automatic evidence, and a
+  // key that only has one is listed in OUT_OF_BAND_CONSUMERS below with the file
+  // named. `readSecret(env, "CSRF_KEY")` is what consumption looks like.
+  //
+  // `node_modules` is excluded: a `@msout` package reading its own name is not
+  // evidence that this repository's configuration reaches anything.
+  const RUNTIME_CONSUMERS = ["api/src", "orchestrator", "runner/src"];
+
+  // The source of every file under a path, or "" when it is absent.
+  //
+  // Recursive, and deliberately **not** `readFileSync` on the directory: that throws
+  // EISDIR, the catch below turns it into "", and the check then reports a live key
+  // as unconsumed while looking like it had looked. A quiet skip is the one outcome
+  // this file exists to prevent, including in itself.
+  //
+  // **Test files are excluded**, which is not tidiness. A test that pins the contract
+  // for a variable quotes that variable's name, and often quotes the *wrong* one on
+  // purpose: `runner_contract_test.go` says `MSOUT_EXPORT_TIMEOUT_MS=<n>` while the
+  // point of one of its cases is that the entry is absent. Scanning them makes every
+  // historical and misspelled name look live — `LOGIN_TIMEOUT_MS` is quoted in
+  // `config_test.go`'s prose — and a check that reports a dead key as consumed is the
+  // exact failure this file exists to prevent. A test describes a name; only
+  // non-test code reads one.
+  const TEST_FILE = /(_test\.go|\.test\.[cm]?[jt]s|tests?\/.+)$/;
+  const readTree = (relative) => {
+    const walk = (path) => {
+      let entries;
+      try {
+        entries = readdirSync(new URL(`${path}/`, REPO_ROOT), { withFileTypes: true });
+      } catch {
+        return "";
+      }
+      return entries
+        .map((entry) => {
+          const child = `${path}/${entry.name}`;
+          if (entry.isDirectory()) return walk(child);
+          if (TEST_FILE.test(child) || TEST_FILE.test(entry.name)) return "";
+          return readRepoFile(child) ?? "";
+        })
+        .join("\n");
+    };
+    return walk(relative);
+  };
+
+  const runtimeText = RUNTIME_CONSUMERS.map(readTree).join("\n");
+
+  // Whether a component source reads **this exact name**.
+  //
+  // **An exact quoted token, and this is not a detail — it is the check.** The defect
+  // this was written for is precisely a name that is *nearly* a real one. `.env.example`
+  // said `LOGIN_TIMEOUT_MS` while the runner reads `MSOUT_LOGIN_TIMEOUT_MS`; and the
+  // orchestrator reads `ORCH_RUNNER_LOGIN_TIMEOUT_MS`, which *ends* with
+  // `LOGIN_TIMEOUT_MS`. Every looser comparison passes the dead key:
+  //
+  //   plain `includes`   — `MSOUT_LOGIN_TIMEOUT_MS` contains it
+  //   identifier bounds   — `ORCH_RUNNER_LOGIN_TIMEOUT_MS` ends with it
+  //
+  // Both were tried, and the "documents a key under a name no component reads" case
+  // went undetected under each. The same trap on the other side: a documented
+  // `RUNNER_TOKEN` satisfied by a runner that only reads `RUNNER_TOKEN_FILE`.
+  //
+  // So the name must appear **whole and delimited**: as a Go string literal
+  // (`getenv("NAME")`, `fmt.Errorf("NAME %q ...")`), a JSON/env key, or the left-hand
+  // side of an `=` in an env map. Those are the only forms a variable is read by in
+  // this repository — Go has no `process.env`, and every TypeScript read is
+  // `env("NAME")` or `process.env.NAME` — so this is a complete enumeration rather
+  // than a heuristic, and it is why a text scan of mixed Go and TypeScript can be
+  // exact at all.
+  //
+  // The value is not parsed, and does not need to be: this asks whether a name is read
+  // somewhere, not whether a particular value reaches it. The wiring itself is what
+  // check #9 and `runner/tests/contract.test.ts` are for.
+  const readsName = (key) =>
+    new RegExp(`(["'\`])${key}\\1`).test(runtimeText);
+
+  // Keys a component **produces** rather than reads: names the orchestrator puts into
+  // each runner's create request, which are set by this repository and consumed by a
+  // `@msout` package inside the image.
+  //
+  // `ONENOTE_EXPORT_LOG_DIR` is the case. It is honoured by all three @msout packages
+  // (`node_modules`, deliberately unscanned) and it is set once, in
+  // `pool/runner.go`'s create request — so the orchestrator is its *producer* and
+  // nothing in this repository ever reads it. That is a working knob rather than a
+  // dead one, and it fails the read test for a reason that has nothing to do with
+  // whether it works.
+  //
+  // Matched as `NAME=` following a quote, so a documented `ONENOTE_EXPORT_LOG_DIR_X`
+  // cannot satisfy it. The same shape elsewhere in a source tree would also match,
+  // which is the accepted looseness: the alternative is a Go parser, and this is the
+  // check's third source of evidence rather than its main one.
+  const produced = (key) => new RegExp(`["\`]${key}=`).test(runtimeText);
+
+  // Keys compose interpolates from the operator's `.env`.
+  //
+  // Read off the compose *source* because resolution erases the name: `config`
+  // renders `${VAR:-default}` to its value, so the resolved config cannot tell a
+  // key compose interpolates from one it hardcodes beside it. `\${` followed by the
+  // key is the interpolation form, and the same boundary rule applies so a key that
+  // is only a prefix of a longer one is not counted.
+  const interpolated = new Set(
+    [...composeSource.matchAll(/\$\{\s*([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => m[1]),
+  );
+
+  // Keys consumed **out of runtime compose**, each with the file that consumes it.
+  //
+  // **An explicit list of named consumers, never a skip.** A first pass that reported
+  // these two as broken was a first pass that was *wrong*, and the correction belongs
+  // in a place a reader can audit rather than in a `continue`. An entry also rots: if
+  // the named file stops reading the name, the key reappears in the failure list
+  // below and has to be re-justified here.
+  //
+  // Two exist today:
+  //
+  //   ORCHESTRATOR_HMAC_SECRET_FILE — the **api's** name for the secret it signs
+  //     with. At runtime the compose file sets it to `/run/secrets/...` as a literal
+  //     next to the secret's mount, because it is a container path and not something
+  //     an operator's `.env` can usefully say. Consumed outside a running component
+  //     by ci.yml (which boots the api outside compose), by this file, and by
+  //     api/Dockerfile (which sets the env default for an image run directly).
+  //
+  //   MSOUT_FAKE — test-only, and **on purpose**: `npm run fake` in
+  //     runner/package.json sets it to spawn fake CLIs so the whole pipeline runs
+  //     with no Microsoft account and no Chromium download. It has no business in a
+  //     deployment's environment, so it is not in compose and must not be.
+  const OUT_OF_BAND_CONSUMERS = {
+    ORCHESTRATOR_HMAC_SECRET_FILE: [
+      ".github/workflows/ci.yml",
+      ".github/assert-compose.mjs",
+      "api/Dockerfile",
+    ],
+    MSOUT_FAKE: ["runner/package.json"],
+  };
+  check(
+    documentedKeys.length > 0,
+    `read ${documentedKeys.length} documented key(s) from .env.example`,
+    "FAIL: .env.example yielded no `KEY=` lines. Either it is empty or the parse is " +
+      "wrong, and a check that reports nothing found is indistinguishable from one " +
+      "that found nothing wrong",
+  );
+
+  // A component source tree that could not be read at all would report every key it
+  // owns as unconsumed, so this says which one rather than listing 27 failures.
+  check(
+    runtimeText.length > 0,
+    "the component source trees are readable from the repo root",
+    "FAIL: no component source could be read relative to this script, so no key can " +
+      "be shown to be consumed. Every documented key would be reported as dead, which " +
+      "is a false alarm rather than a finding",
+  );
+
+  for (const key of documentedKeys) {
+    const where = [];
+    if (interpolated.has(key)) where.push("interpolated by docker-compose.yml");
+    if (readsName(key)) where.push("read by a component source");
+    if (produced(key)) where.push("set by a component into a runner's environment");
+    if (key in OUT_OF_BAND_CONSUMERS) {
+      where.push(`consumed out of band by ${OUT_OF_BAND_CONSUMERS[key].join(", ")}`);
+    }
+
+    check(
+      where.length > 0,
+      `.env.example: ${key} reaches something (${where.join("; ")})`,
+      `.env.example documents ${key} and nothing consumes it. An operator who sets it ` +
+        `gets no error and no effect: compose does not interpolate it, and no running ` +
+        `component reads it. If it is genuinely consumed out of band, add it to ` +
+        `OUT_OF_BAND_CONSUMERS in this file with the consuming file named; otherwise ` +
+        `delete it`,
+    );
+  }
+
+  // A documented key that reaches something is not yet a documented key that **works**.
+  //
+  // The two timeouts are bounded by the api's TTLs, and the orchestrator refuses a
+  // value at or above the bound. `.env.example` shipped `LOGIN_TIMEOUT_MS=900000`, and
+  // 900000 is *exactly* `TTL.loginInProgress` — so the file documented a value the
+  // stack would reject at boot, and a reader who copied it unchanged got an
+  // orchestrator that would not start. That is the same class of defect as a dead
+  // knob: the file says something false about the configuration.
+  //
+  // So the documented value is checked against the same bound the orchestrator
+  // enforces. The numbers are the api's `TTL` in milliseconds (api/src/sweep.ts:33
+  // and :38), duplicated here because this file cannot import a TypeScript constant —
+  // and `config.go` names them for the same reason. The runner's own defaults are
+  // asserted against them in `runner/tests/contract.test.ts`.
+  //
+  // **Keyed by the orchestrator's name, but the value is read from the host-side key
+  // compose maps it from.** That is the real shape of the thing: the operator types
+  // `EXPORT_TIMEOUT_MS`, compose maps it to `ORCH_RUNNER_EXPORT_TIMEOUT_MS`, and the
+  // orchestrator reads *that*. Looking the documented line up under the `ORCH_` name
+  // finds nothing and `continue`s, skipping the check entirely — which is how this
+  // block went quietly inert once. The second `check` asserts the mapping still
+  // exists, so the two halves cannot drift apart the way the lookup did.
+  const TTL_BOUNDS_MS = {
+    ORCH_RUNNER_LOGIN_TIMEOUT_MS: { mappedFrom: "LOGIN_TIMEOUT_MS", ceiling: 900_000 },
+    ORCH_RUNNER_EXPORT_TIMEOUT_MS: { mappedFrom: "EXPORT_TIMEOUT_MS", ceiling: 43_200_000 },
+  };
+
+  for (const [orchKey, { mappedFrom, ceiling }] of Object.entries(TTL_BOUNDS_MS)) {
+    const line = envExample.split("\n").find((l) => l.startsWith(`${mappedFrom}=`));
+    if (line === undefined) continue; // not documented at all; the loop above reports it
+    const raw = line.slice(mappedFrom.length + 1);
+    const value = Number(raw);
+    check(
+      orchEnv[orchKey] !== undefined,
+      `.env.example: ${mappedFrom} is mapped to ${orchKey} by compose`,
+      `.env.example documents ${mappedFrom}, but compose does not map it to ${orchKey}, so ` +
+        `the value stops there and every runner keeps its own default`,
+    );
+    check(
+      Number.isInteger(value) && value > 0 && value < ceiling,
+      `.env.example: ${mappedFrom} documents ${value}ms, inside the api's ${ceiling}ms bound`,
+      `.env.example documents ${mappedFrom}=${raw}, which compose maps to ${orchKey}, and ` +
+        `the orchestrator refuses that at config load: it must be positive and strictly ` +
+        `below the api's ${ceiling}ms TTL, because the sweeper's comparison is ` +
+        "`last_activity_at + TTL <= now` and equality is a race. A reader who copies " +
+        `this file unchanged would get an orchestrator that refuses to start`,
     );
   }
 }

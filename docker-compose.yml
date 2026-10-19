@@ -412,6 +412,43 @@ services:
       # The tag must be a commit SHA. A mutable tag would let a container start
       # with code nobody reviewed.
       ORCH_RUNNER_IMAGE: ${RUNNER_IMAGE:-ghcr.io/ms-one-note-exporter/runner:0.0.0}
+      # Hard limits on a single child process inside a runner: Chromium during the
+      # login walk, and during an export. A login that hangs on an unanswered MFA
+      # prompt, or an export that wedges, is killed rather than waited on forever.
+      #
+      # These two names exist here and were not here before. `.env.example`
+      # documented `LOGIN_TIMEOUT_MS` / `EXPORT_TIMEOUT_MS` under their bare
+      # names, which nothing in this stack reads — the runner reads
+      # `MSOUT_LOGIN_TIMEOUT_MS` / `MSOUT_EXPORT_TIMEOUT_MS` and is created by the
+      # orchestrator, not by compose — so the documented values reached nothing
+      # and every runner sat on the runner's own 5 and 60 minutes.
+      #
+      # `ORCH_`-prefixed like every other variable in this block, and interpolated
+      # from the **same** name, so the key in `.env` is the key compose reads. The
+      # previous spelling was a name in one file and nothing in the other; a
+      # self-referential interpolation is the fix for that, and the empty default
+      # is the second half of it:
+      #
+      # **Empty means unset means unchanged.** compose renders `""`, the
+      # orchestrator reads that as "not configured", and it then adds *neither*
+      # variable to the create request — so the runner's own defaults apply and a
+      # deployment that says nothing behaves identically. A default here would be a
+      # second copy of each number in a second file, free to drift, with the
+      # runner's constants becoming unreachable code.
+      #
+      # The orchestrator refuses either value at or above the api's own TTLs
+      # (TTL.loginInProgress 900000, TTL.absolute 43200000) at config load, because
+      # the sweeper's own comparison is `last_activity_at + TTL <= now` and equality
+      # is a race with this timeout. `assert-compose.mjs` checks the two names are
+      # in the orchestrator's namespace; the bound is `config.go`'s.
+      #
+      # Mapped from differently-named host variables, like every other `ORCH_` line
+      # above. The host-side names are what `.env.example` documents and what an
+      # operator types; the orchestrator's namespace is this side of the mapping. A
+      # self-referential `${ORCH_…}` would be the only such line in the file, and
+      # would make the operator's name depend on which component reads it.
+      ORCH_RUNNER_EXPORT_TIMEOUT_MS: ${EXPORT_TIMEOUT_MS:-}
+      ORCH_RUNNER_LOGIN_TIMEOUT_MS: ${LOGIN_TIMEOUT_MS:-}
       # The **host** path of the bearer token every runner mounts read-only.
       #
       # A *path*, like every other secret here: the orchestrator never reads the

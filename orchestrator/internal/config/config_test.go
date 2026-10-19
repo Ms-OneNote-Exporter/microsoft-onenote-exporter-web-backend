@@ -4,6 +4,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -203,6 +205,119 @@ func TestLoadRejectsBadNumbers(t *testing.T) {
 			if _, err := Load(env(e), readFileFrom(validSecret)); err == nil {
 				t.Errorf("%s=%q: want an error", key, val)
 			}
+		}
+	}
+}
+
+// The two child-process timeouts exist to make a documented knob real.
+//
+// Before they were read, `.env.example` named `LOGIN_TIMEOUT_MS` /
+// `EXPORT_TIMEOUT_MS` and the orchestrator's create request passed neither, so
+// every runner sat on the runner's own compiled-in 5 and 60 minutes while the
+// operator believed they had configured something. Wiring them is only correct
+// if *unset* stays distinguishable from *configured* — a default here would put a
+// second copy of each number in a second repository and make the runner's own
+// constant dead code.
+func TestLoadLeavesRunnerTimeoutsUnsetByDefault(t *testing.T) {
+	cfg, err := Load(env(baseEnv()), readFileFrom(validSecret))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RunnerLoginTimeout != 0 {
+		t.Errorf("login timeout = %v, want zero (not configured)", cfg.RunnerLoginTimeout)
+	}
+	if cfg.RunnerExportTimeout != 0 {
+		t.Errorf("export timeout = %v, want zero (not configured)", cfg.RunnerExportTimeout)
+	}
+}
+
+func TestLoadAcceptsRunnerTimeouts(t *testing.T) {
+	e := baseEnv()
+	e["ORCH_RUNNER_LOGIN_TIMEOUT_MS"] = "300000"
+	e["ORCH_RUNNER_EXPORT_TIMEOUT_MS"] = "3600000"
+	cfg, err := Load(env(e), readFileFrom(validSecret))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RunnerLoginTimeout.Milliseconds() != 300_000 {
+		t.Errorf("login timeout = %v, want 300000ms", cfg.RunnerLoginTimeout)
+	}
+	if cfg.RunnerExportTimeout.Milliseconds() != 3_600_000 {
+		t.Errorf("export timeout = %v, want 3600000ms", cfg.RunnerExportTimeout)
+	}
+}
+
+// A malformed or non-positive value is fatal rather than ignored.
+//
+// Ignored is the shape this issue exists to close: the orchestrator would come up
+// with its default, the runner would keep its own, and "I raised the timeout and
+// nothing happened" would be indistinguishable from a typo in a file nobody
+// re-reads.
+func TestLoadRejectsMalformedRunnerTimeouts(t *testing.T) {
+	for _, key := range []string{"ORCH_RUNNER_LOGIN_TIMEOUT_MS", "ORCH_RUNNER_EXPORT_TIMEOUT_MS"} {
+		for _, val := range []string{"abc", "0", "-1", "300000ms", "1.5", ""} {
+			if val == "" {
+				continue // an empty value is "unset", tested above
+			}
+			e := baseEnv()
+			e[key] = val
+			if _, err := Load(env(e), readFileFrom(validSecret)); err == nil {
+				t.Errorf("%s=%q: want an error", key, val)
+			}
+		}
+	}
+}
+
+// The bounds are **strict**, and this is the case that says so.
+//
+// The api's sweeper compares `last_activity_at + TTL <= now` — a `<=`, not a
+// `<` (api/src/sweep.ts:1383). At exactly the TTL the sweeper fires in the same
+// instant the runner's timeout does, and which lands first is a race. So
+// equality is refused, and the message names the api constant and its value the
+// way the ORCH_RUNNER_NANO_CPUS message names Docker's floor.
+func TestLoadRejectsRunnerTimeoutAtTheApiTTL(t *testing.T) {
+	for _, tc := range []struct {
+		key      string
+		atTheTTL string
+		apiName  string
+	}{
+		{"ORCH_RUNNER_LOGIN_TIMEOUT_MS", "900000", "TTL.loginInProgress (900000 ms"},
+		{"ORCH_RUNNER_EXPORT_TIMEOUT_MS", "43200000", "TTL.absolute (43200000 ms"},
+	} {
+		e := baseEnv()
+		e[tc.key] = tc.atTheTTL
+		_, err := Load(env(e), readFileFrom(validSecret))
+		if err == nil {
+			t.Errorf("%s=%s: want an error — equality races the sweeper's `<=`", tc.key, tc.atTheTTL)
+			continue
+		}
+		// The message has to name what the number was compared against, or an
+		// operator cannot tell whether to lower it or to file a bug.
+		if !strings.Contains(err.Error(), tc.apiName) {
+			t.Errorf("%s at the TTL: error does not name the api constant: %v", tc.key, err)
+		}
+	}
+}
+
+// One millisecond below the TTL is the largest legal value, and it must load.
+func TestLoadAcceptsRunnerTimeoutJustBelowTheApiTTL(t *testing.T) {
+	for _, tc := range []struct{ key, val string }{
+		{"ORCH_RUNNER_LOGIN_TIMEOUT_MS", "899999"},
+		{"ORCH_RUNNER_EXPORT_TIMEOUT_MS", "43199999"},
+	} {
+		e := baseEnv()
+		e[tc.key] = tc.val
+		cfg, err := Load(env(e), readFileFrom(validSecret))
+		if err != nil {
+			t.Errorf("%s=%s: rejected a legal value: %v", tc.key, tc.val, err)
+			continue
+		}
+		got := cfg.RunnerLoginTimeout.Milliseconds()
+		if tc.key == "ORCH_RUNNER_EXPORT_TIMEOUT_MS" {
+			got = cfg.RunnerExportTimeout.Milliseconds()
+		}
+		if want, _ := strconv.ParseInt(tc.val, 10, 64); got != want {
+			t.Errorf("%s: got %dms, want %sms", tc.key, got, tc.val)
 		}
 	}
 }

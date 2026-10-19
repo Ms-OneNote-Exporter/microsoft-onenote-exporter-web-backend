@@ -2,6 +2,7 @@ package pool
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -88,6 +89,55 @@ func (p *Pool) buildCreateRequest(slotID, containerID, sessionGUID string, sessi
 		}
 		lbl = mergeLabels(lbl, labels.Bind(sessionGUID, sessionExpiresAt))
 		mounts = append(bound, artifactMount, tokenMount)
+	}
+
+	// The runner's environment: a fixed base, plus the two child-process timeouts
+	// **only when an operator has set them**.
+	runnerEnv := []string{
+		// Every @msout package log and HTML dump lands inside the session
+		// directory and dies with it on erase (PLAN-v2 §5.6).
+		"ONENOTE_EXPORT_LOG_DIR=/data/logs",
+		// Where the token the orchestrator presents lives. A *path*, never the
+		// value: an env var is visible in `docker inspect` and in
+		// `/proc/<pid>/environ` to anything that can read the container's
+		// config, including a container that has no business knowing it.
+		//
+		// The runner refuses to start without this. That is deliberate on its
+		// side — a default token would accept requests from anything that can
+		// reach the container, and this process holds credential bytes — and it
+		// means the mount below is not optional. See runner/tests/contract.test.ts,
+		// which is what caught this being absent.
+		"MSOUT_RUNNER_TOKEN_FILE=/run/secrets/runner_token",
+	}
+
+	// **Unset ⇒ absent, not a default.** That is the whole design of these two
+	// entries, and it is why the condition is on the config field rather than on
+	// a fallback string here.
+	//
+	// The runner already has these defaults compiled in — 300000 for the login
+	// walk and 3600000 for an export, `runner/src/config.ts` — and it is the one
+	// place that has to agree with itself across a deployment. A default here too
+	// would mean two copies of each number in two repositories, free to drift,
+	// with the runner's constant becoming unreachable code and the drift
+	// invisible until an operator noticed a timeout had quietly stopped being
+	// theirs. So a configured value is a genuine override, an unconfigured one is
+	// the runner's own, and exactly one of the two numbers exists in the system.
+	//
+	// The consequence to keep in mind: a value must be *deliberately* set to take
+	// effect, so `docker inspect` on a fresh runner showing neither name is the
+	// correct output rather than a gap in the wiring. runner_contract_test.go pins
+	// both directions.
+	if p.cfg.RunnerExportTimeout > 0 {
+		runnerEnv = append(
+			runnerEnv,
+			fmt.Sprintf("MSOUT_EXPORT_TIMEOUT_MS=%d", p.cfg.RunnerExportTimeout.Milliseconds()),
+		)
+	}
+	if p.cfg.RunnerLoginTimeout > 0 {
+		runnerEnv = append(
+			runnerEnv,
+			fmt.Sprintf("MSOUT_LOGIN_TIMEOUT_MS=%d", p.cfg.RunnerLoginTimeout.Milliseconds()),
+		)
 	}
 
 	req := dockerapi.CreateRequest{
@@ -187,22 +237,7 @@ func (p *Pool) buildCreateRequest(slotID, containerID, sessionGUID string, sessi
 				p.cfg.RunnerNetwork:        {},
 			},
 		},
-		Env: []string{
-			// Every @msout package log and HTML dump lands inside the session
-			// directory and dies with it on erase (PLAN-v2 §5.6).
-			"ONENOTE_EXPORT_LOG_DIR=/data/logs",
-			// Where the token the orchestrator presents lives. A *path*, never the
-			// value: an env var is visible in `docker inspect` and in
-			// `/proc/<pid>/environ` to anything that can read the container's
-			// config, including a container that has no business knowing it.
-			//
-			// The runner refuses to start without this. That is deliberate on its
-			// side — a default token would accept requests from anything that can
-			// reach the container, and this process holds credential bytes — and it
-			// means the mount below is not optional. See runner/tests/contract.test.ts,
-			// which is what caught this being absent.
-			"MSOUT_RUNNER_TOKEN_FILE=/run/secrets/runner_token",
-		},
+		Env:    runnerEnv,
 		Mounts: mounts,
 	}
 

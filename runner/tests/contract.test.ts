@@ -184,6 +184,51 @@ describe("unattended export flags", () => {
   });
 });
 
+describe("the child-process timeouts reach the runner under the names it reads", () => {
+  // The other end of `.env.example`'s `ORCH_RUNNER_{LOGIN,EXPORT}_TIMEOUT_MS`.
+  //
+  // Both names have been wrong once. `.env.example` said `LOGIN_TIMEOUT_MS` and
+  // `EXPORT_TIMEOUT_MS`; nothing read either; every runner sat on the runner's own
+  // compiled-in defaults while the operator believed they had configured something.
+  // The fix has three ends and this is the innermost: the orchestrator's create
+  // request names `MSOUT_LOGIN_TIMEOUT_MS` / `MSOUT_EXPORT_TIMEOUT_MS`, and **these
+  // are the strings `src/config.ts` actually reads**.
+  //
+  // Asserted by name rather than by behaviour because a rename here would be silent in
+  // the most expensive direction: the runner would fall back to its default, an
+  // operator would raise a timeout and watch nothing change, and no test anywhere
+  // would have run a child process long enough to notice.
+  it("the runner reads exactly MSOUT_EXPORT_TIMEOUT_MS and MSOUT_LOGIN_TIMEOUT_MS", () => {
+    const config = read(join(RUNNER_SRC, "config.ts"));
+    expect(config).toMatch(/intFromEnv\(\s*"MSOUT_LOGIN_TIMEOUT_MS"/);
+    expect(config).toMatch(/intFromEnv\(\s*"MSOUT_EXPORT_TIMEOUT_MS"/);
+
+    // And not the names `.env.example` used to document. A bare `MSOUT_`-prefix match
+    // would be satisfied by either spelling, so each wrong one is named explicitly.
+    expect(config).not.toContain('"LOGIN_TIMEOUT_MS"');
+    expect(config).not.toContain('"EXPORT_TIMEOUT_MS"');
+  });
+
+  it("the create request carries those exact names", () => {
+    // The other half: the orchestrator's side of the same two strings. Both sides are
+    // asserted here rather than in only one of them, because a rename on either side
+    // alone produces the same silence.
+    for (const name of ["MSOUT_LOGIN_TIMEOUT_MS", "MSOUT_EXPORT_TIMEOUT_MS"]) {
+      expect(orchestratorRunner, name).toContain(name);
+    }
+  });
+
+  it("the defaults are the ones .env.example documents", () => {
+    // `.env.example` writes these two numbers out so a reader can see what an
+    // unset value means. If a default moved, the file would be describing a
+    // configuration the stack does not run — the same "documented, but false"
+    // defect that started this, one level down and in the direction nobody notices.
+    const config = read(join(RUNNER_SRC, "config.ts"));
+    expect(config).toMatch(/MSOUT_LOGIN_TIMEOUT_MS",\s*300_000/);
+    expect(config).toMatch(/MSOUT_EXPORT_TIMEOUT_MS",\s*3_600_000/);
+  });
+});
+
 describe("nothing in the runner's own surface contradicts the orchestrator", () => {
   it("the runner never reads a session secret or the CSRF key", () => {
     // The orchestrator gives a runner exactly one secret: the bearer token it

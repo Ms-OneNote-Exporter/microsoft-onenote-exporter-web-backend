@@ -284,12 +284,31 @@ describe("replay", () => {
     expect(hub.attach(SESSION, fakeResponse(), 1).replayed).toBeNull();
   });
 
-  it("treats a resume point beyond the next id as nothing to replay", () => {
+  // B3: a resume id beyond the newest issued id gets a snapshot, not silence.
+  //
+  // This replaces "treats a resume point beyond the next id as nothing to
+  // replay", which pinned the **old** behaviour. That test was correct about
+  // the monotonic case and wrong about the foreign one: an id this session
+  // never issued belongs to another session, or to before an api restart, and
+  // answering it with silence leaves the client believing it is up to date on
+  // a session it has never seen. The api's own comment said as much and the
+  // code did the opposite.
+  it("returns null (a snapshot) for a resume id beyond the newest issued id", () => {
     const hub = newHub();
     hub.emit(SESSION, "export-started", {});
-    // Cannot normally happen for a monotonic sequence, but treating it as a
-    // full replay would be worse than treating it as up to date.
-    expect(hub.attach(SESSION, fakeResponse(), 99).replayed).toEqual([]);
+    hub.emit(SESSION, "export-progress", {});
+    // The hub has issued 1 and 2, so 99 is an id it never issued.
+    expect(hub.attach(SESSION, fakeResponse(), 99).replayed).toBeNull();
+  });
+
+  // B4: a resume id equal to the newest issued id still gets no snapshot and
+  // no events. That client genuinely **is** up to date, and silence is the
+  // right answer — the negative control for the test above.
+  it("returns [] for a resume point that is at the newest issued id", () => {
+    const hub = newHub();
+    hub.emit(SESSION, "export-started", {});
+    hub.emit(SESSION, "export-progress", {});
+    expect(hub.attach(SESSION, fakeResponse(), 2).replayed).toEqual([]);
   });
 });
 

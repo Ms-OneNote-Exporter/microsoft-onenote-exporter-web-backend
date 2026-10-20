@@ -200,22 +200,50 @@ class SessionHub {
    * miss.
    */
   replayAfter(lastEventId: number | null): SessionEvent[] | null {
+    // No resume point: a fresh client, and the honest answer is a snapshot.
     if (lastEventId === null) return null;
+
+    // Nothing buffered. Either the hub has issued no events at all, or every one
+    // of them has been evicted. Either way a resume id is one this hub cannot
+    // vouch for — it is either foreign (another session) or from before a
+    // restart — so the answer is a snapshot, never silence.
+    //
+    // This used to answer `[]` ("you are up to date") for an id at or beyond the
+    // next id to be issued, and the route turned that into **no snapshot and no
+    // events**: a client that had never seen this session was told it was
+    // current on it. A browser that reconnects after an api restart carries
+    // exactly such an id, so the tab went silent and stayed silent.
     if (this.#buffer.length === 0) {
-      // Nothing buffered. Either there is nothing to replay, or everything has
-      // been evicted. A lastEventId beyond the next id to be issued means the
-      // events are gone; anything else means the client is simply ahead, which
-      // cannot happen for a monotonic sequence and is treated as a resync.
-      return lastEventId >= this.nextId ? [] : null;
+      return null;
     }
 
     const oldest = this.#buffer[0];
     if (oldest === undefined) return [];
 
-    // Strictly greater: the client already has `lastEventId`, so replaying it
-    // would duplicate one event.
+    // The newest id this hub has issued. The buffer evicts from the front, so
+    // its last element is the most recent event.
+    const newest = this.#buffer[this.#buffer.length - 1];
+    if (newest === undefined) return [];
+
+    // A resume id **beyond** the newest issued id is one this session never
+    // issued: another session's id, or one from before a restart. The client is
+    // not up to date on this session — it knows nothing about it — so it gets a
+    // snapshot.
+    //
+    // A resume id **equal to** the newest is a different case, and the
+    // difference is the whole point: that client genuinely is up to date, and
+    // the answer is nothing at all. Treating the two the same is what made the
+    // old rule wrong in one direction and would make this one wrong in the
+    // other.
+    if (lastEventId > newest.id) return null;
+
+    // The resume point has fallen out of the buffer: there is a gap, and a gap
+    // is worse than a resync — the alternative is a client that believes it is
+    // up to date on a session it has missed events of.
     if (lastEventId < oldest.id - 1) return null;
 
+    // Strictly greater: the client already has `lastEventId`, so replaying it
+    // would duplicate one event.
     return this.#buffer.filter((event) => event.id > lastEventId);
   }
 

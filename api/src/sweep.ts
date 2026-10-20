@@ -1355,6 +1355,7 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
     if (session.state === "created" && session.created_at + TTL.unclaimedSession <= now) {
       await binder.releaseForAbsence(session);
       db.deleteSession(session.guid);
+      sse.emit(session.guid, "session-status", { state: "expired" });
       sse.drop(session.guid);
       report.unclaimedExpired++;
       log.info("session expired without a login", { session: session.guid });

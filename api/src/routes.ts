@@ -504,6 +504,14 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
     if (attached.replayed === null) {
       // A gap, or a fresh connection. Either way a snapshot is the honest
       // answer; the alternative is a client that believes it is up to date.
+      //
+      // The id is the last one the hub **issued**, not the next one it will
+      // issue. `nextId` is the id the first real event will take, so a snapshot
+      // carrying it shared an id with that event: a client that disconnected
+      // between the two resumed *past* the first real event and never saw it.
+      // `nextId - 1` is the only value a client can legitimately resume from,
+      // and it is 0 for a hub that has issued nothing.
+      const snapshotId = attached.hub.nextId - 1;
       deps.sse.sendSnapshot(
         session.guid,
         attached.subscriberId,
@@ -513,7 +521,7 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
           notebooksField(session),
           config.publicOrigin,
         ),
-        attached.hub.nextId,
+        snapshotId,
       );
     } else {
       for (const event of attached.replayed) {

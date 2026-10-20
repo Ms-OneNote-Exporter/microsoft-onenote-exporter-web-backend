@@ -1434,6 +1434,17 @@ describe("sweep", () => {
     expect(sse.stats()).toEqual({});
   });
 
+  // B6: the sweeper's unclaimed-expiry branch emits session-status {state:"expired"} before dropping the stream
+  it("emits session-status expired for unclaimed sessions", async () => {
+    const watchFrames = watch(sse, GUID);
+    seedSession(GUID, { state: "created", created_at: now - TTL.unclaimedSession - 1 });
+    await run();
+
+    const frames = watchFrames();
+    // The expired frame should be emitted before the stream is dropped
+    expect(frames).toEqual([{ type: "session-status", data: { state: "expired" } }]);
+  });
+
   it("is idempotent", async () => {
     seedSession(GUID, { state: "created", created_at: now - TTL.unclaimedSession - 1 });
     await run();

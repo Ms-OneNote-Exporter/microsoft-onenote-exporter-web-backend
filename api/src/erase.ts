@@ -159,6 +159,48 @@ export async function runErase(deps: EraseDeps, sessionId: string): Promise<Eras
     }
   };
 
+  // The row, read **before** the mark below.
+  //
+  // The mark overwrites `state`, which is the very field the skip predicate
+  // keys on, so the read has to happen first. The read has no side effects and
+  // the mark still happens before anything is destroyed, so the ordering the
+  // machine promises is unchanged.
+  const session = deps.db.getSession(sessionId);
+  const slotId = session?.runner_id ?? null;
+
+  /**
+   * Whether the runner-facing steps are vacuous.
+   *
+   * A session in state `created` never signed in, and a session that never
+   * signed in never claimed a runner: the credential route calls `beginLogin`
+   * **before** `claimForLogin` (`api/src/routes.ts`), so the row has already
+   * left `created` by the time a container exists. The vault directory — the
+   * only thing the shred step could delete — is created by the orchestrator at
+   * claim time and never before it.
+   *
+   * So for such a session there is nothing running to abort, nothing to freeze,
+   * and **no directory to shred**: the steps are not merely failing, they have
+   * nothing to do. Attempting them anyway makes the machine report a failure
+   * the user did not cause, for an erase that succeeded — the row is deleted
+   * and the cookie expired either way, so the user is told the erase failed
+   * when it did not.
+   *
+   * The two cases this must NOT skip:
+   *
+   *   - a session that signed in and whose runner was later released. Its
+   *     `runner_id` is null but its **directory still exists**, with the
+   *     Microsoft session cookies in it. The shred has to be attempted.
+   *   - a session whose row is already gone. The row says nothing, so the
+   *     directory may or may not be there — T-E1: "the directory might still
+   *     exist even though the row does not".
+   *
+   * The coupling that makes `created` exact is the `beginLogin`-before-claim
+   * order. A change that claims a runner without `beginLogin` would make this
+   * predicate wrong, and the shred would be skipped over a live directory.
+   */
+  const noRunnerToAsk =
+    session !== undefined && session.runner_id === null && session.state === "created";
+
   // 1. Mark erasing. Done first so an interruption is visible and recoverable.
   //
   // It also removes the session from the idle sweeper's view, because the sweeper
@@ -180,8 +222,6 @@ export async function runErase(deps: EraseDeps, sessionId: string): Promise<Eras
     // A closed subscriber must not stop an erase.
   }
 
-  const session = deps.db.getSession(sessionId);
-  const slotId = session?.runner_id ?? null;
   // Check if the runner's slot is dead before proceeding with erase steps
   let runnerDead = false;
   if (slotId !== null) {
@@ -232,35 +272,47 @@ export async function runErase(deps: EraseDeps, sessionId: string): Promise<Eras
   // 2. Abort any active login or export. §8.2: aborting preserves what is on
   // disk, which is then deleted by step 4 — this step exists so the abort does
   // not race the deletion.
-  try {
-    await deps.runner.abort(sessionId);
+  if (noRunnerToAsk) {
+    // No runner was ever claimed for this session, so there is nothing running
+    // to abort. Recorded rather than omitted, so the step list says the step
+    // was reached — the same convention step 6 uses.
     note("aborted");
-  } catch (error) {
-    note("aborted", error);
-    // Re-check: the runner may have died during this step.
-    if (!runnerDead && slotId !== null) {
-      try {
-        const recheck = await deps.orchestrator.stats();
-        if (recheck.ok && recheck.value.deadSlots?.includes(slotId)) {
-          runnerDead = true;
-        }
-      } catch { /* assume not dead */ }
+  } else {
+    try {
+      await deps.runner.abort(sessionId);
+      note("aborted");
+    } catch (error) {
+      note("aborted", error);
+      // Re-check: the runner may have died during this step.
+      if (!runnerDead && slotId !== null) {
+        try {
+          const recheck = await deps.orchestrator.stats();
+          if (recheck.ok && recheck.value.deadSlots?.includes(slotId)) {
+            runnerDead = true;
+          }
+        } catch { /* assume not dead */ }
+      }
     }
   }
 
   // 3. Freeze the runner, so it cannot write into the directory being deleted.
-  try {
-    await deps.runner.freeze(sessionId);
+  if (noRunnerToAsk) {
+    // Nothing is running, so there is nothing to freeze.
     note("frozen");
-  } catch (error) {
-    note("frozen", error);
-    if (!runnerDead && slotId !== null) {
-      try {
-        const recheck = await deps.orchestrator.stats();
-        if (recheck.ok && recheck.value.deadSlots?.includes(slotId)) {
-          runnerDead = true;
-        }
-      } catch { /* assume not dead */ }
+  } else {
+    try {
+      await deps.runner.freeze(sessionId);
+      note("frozen");
+    } catch (error) {
+      note("frozen", error);
+      if (!runnerDead && slotId !== null) {
+        try {
+          const recheck = await deps.orchestrator.stats();
+          if (recheck.ok && recheck.value.deadSlots?.includes(slotId)) {
+            runnerDead = true;
+          }
+        } catch { /* assume not dead */ }
+      }
     }
   }
 
@@ -270,20 +322,28 @@ export async function runErase(deps: EraseDeps, sessionId: string): Promise<Eras
   // `shred` where supported, with CoW, SSD wear levelling and overlayfs
   // understood rather than glossed over (§11). The runner knows which of those
   // apply to the host it is on; this process does not.
-  try {
-    await deps.runner.shredDirectory(sessionId);
+  if (noRunnerToAsk) {
+    // No directory was ever created for this session, so there is nothing to
+    // shred. **Not** a weakening: the step could not have succeeded either way
+    // — the runner that mounts the vault does not exist.
     note("files-removed");
     note("directory-removed");
-  } catch (error) {
-    note("files-removed", error);
-    note("directory-removed", error);
-    if (!runnerDead && slotId !== null) {
-      try {
-        const recheck = await deps.orchestrator.stats();
-        if (recheck.ok && recheck.value.deadSlots?.includes(slotId)) {
-          runnerDead = true;
-        }
-      } catch { /* assume not dead */ }
+  } else {
+    try {
+      await deps.runner.shredDirectory(sessionId);
+      note("files-removed");
+      note("directory-removed");
+    } catch (error) {
+      note("files-removed", error);
+      note("directory-removed", error);
+      if (!runnerDead && slotId !== null) {
+        try {
+          const recheck = await deps.orchestrator.stats();
+          if (recheck.ok && recheck.value.deadSlots?.includes(slotId)) {
+            runnerDead = true;
+          }
+        } catch { /* assume not dead */ }
+      }
     }
   }
 

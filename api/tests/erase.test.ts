@@ -334,6 +334,61 @@ describe("runErase", () => {
     if (outcome.ok) expect(outcome.steps).toContain("container-removed");
   });
 
+  // B1: an erase of a session with no runner bound answers ok: true, and every step is recorded
+  it("answers ok: true when there is no runner bound", async () => {
+    seedSession(GUID, "created", null);
+    const { deps, calls } = makeDeps();
+    const outcome = await runErase(deps, GUID);
+
+    expect(outcome.ok).toBe(true);
+    // Runner-facing steps should be recorded as skipped (no runner calls)
+    expect(calls).toEqual([]);
+    if (outcome.ok) {
+      expect(outcome.steps).toEqual([
+        "marked",
+        "aborted",
+        "frozen",
+        "files-removed",
+        "directory-removed",
+        "container-removed",
+        "artifact-deleted",
+        "row-deleted",
+      ]);
+    }
+  });
+
+  // B2: the machine still deletes the row when there is no runner bound.
+  //
+  // The **cookie** is the route's half, not the machine's — `expireCookieHeaders`
+  // is called by the route whether or not the machine succeeded, and it has its
+  // own describe block below. Asserting it here would test that function rather
+  // than the machine.
+  it("still deletes the row when there is no runner bound", async () => {
+    seedSession(GUID, "created", null);
+    const { deps } = makeDeps();
+    const outcome = await runErase(deps, GUID);
+
+    expect(outcome.ok).toBe(true);
+    expect(db.getSession(GUID)).toBeUndefined();
+  });
+
+  // B1b: an erase of a session with state = 'authenticated' and no runner bound
+  // still attempts the runner steps (the row exists, so a directory might exist
+  // from a previous runner binding that was released)
+  it("attempts runner steps when state is authenticated but no runner bound", async () => {
+    seedSession(GUID, "authenticated", null);
+    const { deps, calls } = makeDeps();
+    const outcome = await runErase(deps, GUID);
+
+    expect(outcome.ok).toBe(true);
+    // Runner-facing steps ARE attempted (a directory might exist)
+    expect(calls).toContain("abort");
+    expect(calls).toContain("freeze");
+    expect(calls).toContain("shredDirectory");
+    // No container to remove since no runner is bound
+    expect(calls.some((c) => c.startsWith("remove:"))).toBe(false);
+  });
+
   it("reports a container-removal failure without losing the rest", async () => {
     seedSession(GUID, "authenticated", "slot-1");
     const { deps } = makeDeps({ failAt: "remove" });

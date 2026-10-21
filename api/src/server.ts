@@ -43,6 +43,7 @@ import type { EraseDeps } from "./erase.js";
 import type { RunnerAdapter } from "./runner-adapter.js";
 import type { PoolBinder } from "./sweep.js";
 import { registerRoutes, type RouteDeps } from "./routes.js";
+import { createEraseOrdering, type EraseOrdering } from "./erase-ordering.js";
 import { authenticate, authErrorBody, authStatus, PROTOCOL_VERSION, API_BUILD } from "./auth.js";
 import {
   CSRF_HEADER,
@@ -266,6 +267,19 @@ export function buildServer(
   options: BuildServerOptions = {},
 ): FastifyInstance {
   const app = baseServer(config, deps, options);
+  // The registry that orders an erase's cookie expiry against a create that
+  // presents the erasing session's cookie. It is created **here** rather than
+  // supplied, so that an app cannot be built without the guarantee ✓ — the
+  // alternative is a required dependency that twenty test call sites would each
+  // have to remember, and one that forgets is a silent regression.
+  //
+  // The row's state is the restart-safe half: a row still in `erasing` means
+  // an erase is in flight, whoever started it.
+  const eraseOrdering = createEraseOrdering({
+    isErasing: (guid) => deps.db.getSession(guid)?.state === "erasing",
+    log: (message) => app.log.warn(message),
+  });
+
   // Assembled conditionally rather than with explicit `undefined`, because
   // exactOptionalPropertyTypes treats the two as different and RouteDeps' fields
   // are optional rather than nullable.
@@ -274,6 +288,7 @@ export function buildServer(
     orchestrator: deps.orchestrator,
     sse: deps.sse,
     limiter: deps.limiter,
+    eraseOrdering,
     // **Always** resolved, never only when the option is present.
     //
     // This was `if (options.knownProxies !== undefined)`, which meant a config

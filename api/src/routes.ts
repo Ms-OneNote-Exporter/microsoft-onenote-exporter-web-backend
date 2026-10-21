@@ -51,6 +51,9 @@ import { RunnerCallError } from "./runner-adapter-http.js";
 import type { ProxyMatcher } from "./client-ip.js";
 import { readJsonObject } from "./server.js";
 import { expireCookieHeaders, runErase, type EraseDeps } from "./erase.js";
+import type { EraseOrdering } from "./erase-ordering.js";
+import { getCookie } from "./cookies.js";
+import { SESSION_COOKIE } from "./csrf.js";
 import type { RunnerAdapter } from "./runner-adapter.js";
 import type { PoolBinder } from "./sweep.js";
 
@@ -73,6 +76,14 @@ export interface RouteDeps {
   readonly orchestrator: OrchestratorApi;
   readonly sse: SseHub;
   readonly limiter: RateLimiter;
+  /**
+   * Orders an erase's cookie expiry against a create that presents the erasing
+   * session's cookie.
+   *
+   * Required ✓ — an app that cannot order the two responses cannot be built,
+   * rather than silently losing the guarantee. See `api/src/erase-ordering.ts`.
+   */
+  readonly eraseOrdering: EraseOrdering;
   /** Matches `ServerDeps.knownProxies`. Mutable here only for the optional-wiring pattern. */
   knownProxies?: ProxyMatcher;
   eraseRunner?: EraseDeps["runner"];
@@ -346,6 +357,35 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
         // file header in cookies.ts for why: the frontend is on a different host,
         // so `document.cookie` there cannot see a cookie set by this origin.
         .send({ protocol: PROTOCOL_VERSION, csrfToken: existingToken });
+    }
+
+    // ---- the wait -----------------------------------------------------------
+    //
+    // The browser may still hold the cookie of a session that is **being
+    // erased** — the erase's response, which expires that cookie by name, has
+    // not landed yet. If this create answers first, the erase's response lands
+    // afterwards and expires the cookie **this** response just set: a session
+    // that exists in SQLite and is unreachable, with every later request
+    // answered 401.
+    //
+    // So a create that presents such a cookie waits until the erase's response
+    // has been flushed. See `api/src/erase-ordering.ts` for the race, measured.
+    //
+    // **Where this sits matters**, and it is pinned by a test:
+    //
+    //   - **after** the rate limiter's decision, so the wait does not change
+    //     what the limiter charges ✓;
+    //   - **after** the restore branch above, so a restore — which re-issues
+    //     cookies for a session that already exists — is neither charged nor
+    //     delayed ✓. A restore during an erase is answered at once, and the
+    //     erase's response then expires the cookie it set ✓, which is the
+    //     erase's intent ✓;
+    //   - **before** the row is created, so nothing is written while the erase
+    //     is still in flight ✓.
+    const cookieValue = getCookie(request.headers.cookie, SESSION_COOKIE);
+    const cookieGuid = cookieValue === undefined ? undefined : cookieValue.split(":")[0];
+    if (cookieGuid !== undefined) {
+      await deps.eraseOrdering.settle(cookieGuid);
     }
 
     const csrfKey = generateCsrfKey();
@@ -1002,6 +1042,18 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
     if (deps.eraseRunner === undefined) {
       return reply.code(501).send({ error: "erase not wired yet" });
     }
+
+    // Register the erase **before** the machine runs, so a create that arrives
+    // during the machine finds the entry and waits.
+    //
+    // The release is tied to the raw response's `finish`: the browser applies a
+    // `Set-Cookie` when it processes the response, so a create released before
+    // the erase's bytes are written could still lose the race. `close` is
+    // registered too, because a response that is aborted never finishes ✓ —
+    // and the release is idempotent ✓, so the two are safe together.
+    const releaseErase = deps.eraseOrdering.register(session.guid);
+    reply.raw.once("finish", releaseErase);
+    reply.raw.once("close", releaseErase);
 
     const outcome = await runErase(
       {

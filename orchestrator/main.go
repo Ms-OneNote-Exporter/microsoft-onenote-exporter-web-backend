@@ -155,7 +155,9 @@ func run(args []string) error {
 	if reconcileErr != nil {
 		log.Error("boot reconciliation failed, serving anyway", "error", reconcileErr)
 	} else {
-		log.Info("boot reconciliation complete", "slots", len(p.Slots()))
+		stats := p.Stats()
+		claimable := len(stats.ClaimableSlotIDs)
+		log.Info("boot reconciliation complete", "slots", len(p.Slots()), "claimable", claimable)
 	}
 
 	if err := p.EnsurePool(ctx); err != nil {

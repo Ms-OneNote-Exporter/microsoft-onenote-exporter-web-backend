@@ -259,6 +259,51 @@ export interface OrchestratorStats {
    * Slot ids, never container ids: §2.1 restricts the api from holding container
    * identities it cannot verify, and a slot name is how it asks for a slot.
    */
+
+  /**
+   * The slots a `/claim` would accept right now: `["slot-1"]`.
+   *
+   * **A read surface, like `SlotIDs`, `BoundSessions` and `DeadSlots`.** No input, no
+   * new authority, nothing for §4.4's closed set to review: a field on an answer the
+   * api already asks for every 30 seconds.
+   *
+   * It exists because the api's draw can only pick from the slots the orchestrator
+   * names in `slotIds` — a membership set that includes every slot, not just the ones
+   * that can be taken. A claim can only accept idle slots; `/stats` can now say which
+   * of them are idle, so the api draws only from the ones the orchestrator says it
+   * will accept.
+   *
+   * **The same predicate `Claim` uses** (`Slot.IsIdle`, pool.go:108) — not a second
+   * rule. A `/claim` that refuses a slot this list names is a bug in one of them.
+   *
+   * Optional because an orchestrator predating the field simply does not report it.
+   * Absent means "this orchestrator does not say which are claimable", and the api
+   * falls back to drawing from the membership set. That is today's behaviour, with no
+   * regression.
+   */
+  readonly claimableSlotIds?: readonly string[];
+
+  /**
+   * Bound slots whose container the orchestrator has seen die: `["slot-1"]`.
+   *
+   * `boundSessions` says a slot is *held*; nothing said whether the runner behind it
+   * was still there. So a session whose export died with its container kept its row,
+   * its `runner_id` and a `runners` row that all agreed the slot was fine — and
+   * `POST /api/export` refused every future export with a 409 until the 12-hour
+   * absolute cap, because the sweeper skips `exporting` sessions to protect live
+   * ones. Only the orchestrator can see the container is gone, because only it holds
+   * the Engine; only this process holds the session rows. This list is the whole of
+   * the conversation between them.
+   *
+   * Optional for the same reason `slotIds` is: a rolling deploy briefly pairs this
+   * api with an orchestrator that predates the field, and during that window the
+   * absence is treated as `[]` — "this orchestrator reports none dead", which is
+   * today's behaviour, with no regression. The field is omitted entirely when
+   * nothing is dead, so a healthy pool marshals exactly as it did before it existed.
+   *
+   * Slot ids, never container ids: §2.1 restricts the api from holding container
+   * identities it cannot verify, and a slot name is how it asks for a slot.
+   */
   readonly deadSlots?: readonly string[];
 
   /**

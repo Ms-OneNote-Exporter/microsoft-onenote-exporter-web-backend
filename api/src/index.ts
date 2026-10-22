@@ -504,6 +504,10 @@ runner = new HttpRunnerAdapter({
         });
       }
     }
+
+    // Update the pool snapshot for the claim code path. The poolBinder was just
+    // created above, so this seeds it from the boot stats before the first claim.
+    binder.poolUpdate(stats.value);
   } else {
     // The pool is left as-is. Assuming it was empty would delete every runner row
     // and every session binding on a transient network failure, which is exactly

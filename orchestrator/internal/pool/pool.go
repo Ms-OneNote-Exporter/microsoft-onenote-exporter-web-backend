@@ -310,6 +310,23 @@ type Stats struct {
 	// mac's review, and he put the alternative's failure mode better than I did.
 	SlotIDs []string `json:"slotIds"`
 
+	// ClaimableSlotIDs are the slots a `/claim` would accept right now.
+	//
+	// The membership set (`SlotIDs`) answers "which slots exist"; this answers
+	// "which of them can be given to a session". The two are different questions and
+	// the api needs both: it seeds its `runners` table from the membership, and it
+	// draws the slot it will ask for from this set.
+	//
+	// **The same predicate `Claim` uses** (`Slot.IsIdle`, pool.go:108) — not a second
+	// rule. A `/claim` that refuses a slot this list names is a bug in one of them,
+	// and the test that compares the two answers is what says so.
+	//
+	// `omitempty`, on the same terms as `BoundSessions` and `DeadSlots`: a pool with
+	// nothing claimable marshals byte-for-byte as it did before this field existed.
+	// A consumer that cannot see the field falls back to `byState` — the count of
+	// idle slots is the same fact, and it is in the same response.
+	ClaimableSlotIDs []string `json:"claimableSlotIds,omitempty"`
+
 	// BoundSessions maps slot id -> the session GUID that slot is bound to.
 	//
 	// **A read surface, not a verb.** No new verb, no new input shape, nothing for
@@ -429,9 +446,18 @@ func (p *Pool) Stats() Stats {
 	var slotAgeSec, slotRemainingSec map[string]int
 	// One number for the whole pool, read once rather than per slot.
 	budgetSec := int(p.cfg.RunnerTTL.Seconds())
+	// Identity of slots the orchestrator would accept for a claim.
+	var claimable []string
 	for _, s := range slots {
 		byState[string(s.State)]++
 		ids = append(ids, s.ID)
+		// A slot is claimable if and only if IsIdle() returns true — the same
+		// predicate Claim uses. A /claim that refuses a slot this list names is a
+		// bug in one of them, and the test that compares the two answers is what says
+		// so.
+		if s.IsIdle() {
+			claimable = append(claimable, s.ID)
+		}
 		// `StateBound && SessionGUID != ""` and not `StateBound` alone. A bound slot
 		// that has lost its GUID — mid-recycle, or adopted from labels that never
 		// carried one — contributes nothing rather than an empty string. The api
@@ -478,6 +504,7 @@ func (p *Pool) Stats() Stats {
 	// encoder rather than of this code — nothing in `Stats` enforces it, and swapping
 	// the marshaller would quietly break it.
 	sort.Strings(ids)
+	sort.Strings(claimable)
 	stats := Stats{
 		Size:             len(slots),
 		ByState:          byState,
@@ -487,6 +514,7 @@ func (p *Pool) Stats() Stats {
 		// not be able to see two different budgets.
 		RunnerTTLSeconds: budgetSec,
 		SlotIDs:          ids,
+		ClaimableSlotIDs: claimable,
 		BoundSessions:    bound,
 		// Sorted like `ids`, by the same argument and for the same reason: two calls
 		// against an unchanged pool must produce byte-identical output. Nothing in
@@ -1040,12 +1068,15 @@ func (p *Pool) EnsurePool(ctx context.Context) error {
 			if newlyRegistered[slot.ID] {
 				// A slot this call invented, which never became a container.
 				delete(p.slots, slot.ID)
+				p.log.Error("ensure pool: create failed; the invented slot was dropped",
+					"slot", slot.ID, "error", err)
 			} else {
 				// Back to vacant: the id stays reserved and the next tick retries.
 				slot.State = StateVacant
+				p.log.Error("ensure pool: create failed; the existing slot is vacant and will be retried",
+					"slot", slot.ID, "error", err)
 			}
 			p.mu.Unlock()
-			p.log.Error("ensure pool: create failed", "slot", slot.ID, "error", err)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -1518,14 +1549,53 @@ func (p *Pool) Reconcile(ctx context.Context, sessionExpired func(guid string) b
 		if bound {
 			state = StateBound
 		}
+		if !ctr.State.Running && !bound {
+			// **A stopped, unbound container is an empty slot, not a dead one.**
+			//
+			// The label was what stranded it: `refillable()` requires no container id,
+			// so a `dead` slot holding one is never filled again, and the position is
+			// lost for the life of the process — while `/stats` still advertises the
+			// slot and `/claim` refuses it.
+			//
+			// Mid-life the same dead container is harmless: nothing labels it, the
+			// slot stays `idle`, and the next claim destroys the stopped container and
+			// makes a fresh one. Only the boot label made it permanent.
+			//
+			// The container is stopped: it is dead weight in the daemon, and the slot
+			// it was occupying is empty. Remove it and let the filler make a new one.
+			//
+			// The removal is **outside** `p.mu`, as every other Docker call in this
+			// function is (pool.go:1349, 1385, 1410) — the lock is held across a
+			// network call to the Engine nowhere in this file. The slot's own fields
+			// are written **under** it, in the same block that adopts the container.
+			if err := p.docker.RemoveContainer(ctx, id); err != nil {
+				p.log.Warn("reconcile: cannot remove a dead runner", "container", id, "error", err)
+			}
+		}
+
 		if !ctr.State.Running {
-			// Adopt the identity but let EnsurePool replace a dead container.
+			// **Bound or unbound, a container that is not running is dead.**
+			//
+			// A *bound* dead container is the api's business — it is reported in
+			// `deadSlots` (pool.go:548) so the api can release the session, and that
+			// report keys off the container id (pool.go:538). Leaving the id in place
+			// for the bound case keeps the report working.
+			//
+			// An *unbound* dead container's id is cleared below, so the slot becomes
+			// an empty one the filler refills — the position is no longer lost.
 			state = StateDead
 		}
 
 		p.mu.Lock()
-		slot.ContainerID = id
-		slot.CreatedAt = createdAt
+		// The slot's container identity is adopted only when the container is
+		// kept. A stopped, unbound container was removed above (it is dead
+		// weight, and the slot is empty) — adopting its id here would
+		// overwrite the clear and strand the position again, which is the bug
+		// §0.5 characterised.
+		if !(!ctr.State.Running && !bound) {
+			slot.ContainerID = id
+			slot.CreatedAt = createdAt
+		}
 		slot.SessionGUID = guid
 		if bound {
 			slot.BoundAt = createdAt
@@ -1855,6 +1925,11 @@ func (p *Pool) replace(ctx context.Context, slot *Slot, oldContainerID string) e
 		slot.SessionGUID = ""
 		slot.BoundAt = time.Time{}
 		p.mu.Unlock()
+		// The slot is vacant, not starting: the filler retries it on its next tick
+		// (`refillable`, pool.go:133). Logged here, by the writer that did it, so
+		// the recovery is visible next to the failure that caused it.
+		p.log.Error("replace: create failed; the slot is vacant and will be retried",
+			"slot", slot.ID, "error", err)
 		return fmt.Errorf("replace: create: %w", err)
 	}
 	return nil

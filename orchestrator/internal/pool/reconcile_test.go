@@ -685,10 +685,13 @@ func TestReconcileMarksADeadRunnerDead(t *testing.T) {
 	if slots[0].State != StateDead {
 		t.Errorf("state = %q, want dead", slots[0].State)
 	}
-	// The container is left for EnsurePool to replace rather than removed here,
-	// so its exit code stays available for diagnosis.
-	if _, err := f.d.InspectContainer(t.Context(), ctr.id); err != nil {
-		t.Errorf("dead container was removed; its exit state should stay inspectable: %v", err)
+	// The stopped container is removed — it holds no session's vault (an unbound
+	// runner holds only a tmpfs), and leaving it would accumulate an Exited
+	// container per crash, which is the leak §4.3 exists to remove. The slot's
+	// identity is cleared with it, so the slot becomes an empty one the filler
+	// refills on its next tick (T-12).
+	if _, err := f.d.InspectContainer(t.Context(), ctr.id); err == nil {
+		t.Errorf("dead container was NOT removed; it should be gone: %v", err)
 	}
 }
 
@@ -801,3 +804,62 @@ func TestBootPredicateAdoptsRatherThanDeletes(t *testing.T) {
 		t.Errorf("session not adopted: %+v", slots[0])
 	}
 }
+
+// TestDeadRunnerAtBootDoesNotCostAPoolPosition verifies that a runner that
+// died before a boot does not cost a pool position. The stopped container is
+// removed by Reconcile, and the slot is left empty so EnsurePool refills it.
+func TestDeadRunnerAtBootDoesNotCostAPoolPosition(t *testing.T) {
+	f := newColdStartFixture(t, 1)
+	// Create a stopped container (not Running) at boot. This simulates a
+	// runner crashed and left Exited before the orchestrator restarts.
+	created := f.now.Add(-time.Minute)
+	// The container is created with running=false, so it is "dead" from
+	// the daemon's perspective.
+	_ = f.d.add("dead", false, runnerLabels("slot-1", false, created, time.Time{}))
+
+	if err := f.p.Reconcile(t.Context(), nothingExpired); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	// After reconcile, the slot should have ContainerID = "" (empty) rather
+	// than holding the dead container's id.
+	slots := f.p.Slots()
+	if len(slots) != 1 {
+		t.Fatalf("slot count = %d, want 1", len(slots))
+	}
+	if slots[0].ContainerID != "" {
+		t.Errorf("slot container ID = %q, want empty string (dead container removed)", slots[0].ContainerID)
+	}
+	if slots[0].State != StateDead {
+		t.Errorf("slot state = %q, want %q", slots[0].State, StateDead)
+	}
+
+	// The dead container was removed and the slot's identity cleared, so the slot
+	// is now empty — refillable() is true.
+	if slots[0].ContainerID != "" {
+		t.Errorf("slot container ID = %q, want empty string (dead container removed)", slots[0].ContainerID)
+	}
+	if !slots[0].refillable() {
+		t.Error("slot is not refillable after Reconcile; the dead container was not removed")
+	}
+
+	// And EnsurePool refills it — the pool is whole again, and the slot is idle
+	// once more, so /claim accepts it and /stats advertises it as claimable.
+	if err := f.p.EnsurePool(t.Context()); err != nil {
+		t.Fatalf("ensure pool: %v", err)
+	}
+	after := f.p.Slots()
+	if len(after) != 1 {
+		t.Fatalf("slot count = %d, want 1", len(after))
+	}
+	if after[0].ContainerID == "" {
+		t.Error("EnsurePool did not refill the slot; ContainerID is still empty")
+	}
+	if after[0].State != StateIdle {
+		t.Errorf("state = %q, want %q (idle after refill)", after[0].State, StateIdle)
+	}
+	if !after[0].IsIdle() {
+		t.Error("slot is not claimable after refill")
+	}
+}
+

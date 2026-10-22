@@ -43,6 +43,9 @@ var (
 	// ErrNotBound means a release or recycle named a slot that holds no
 	// session.
 	ErrNotBound = errors.New("pool: slot not bound")
+
+	// ErrSessionGUIDInvalid means the session GUID is not a valid lowercase UUID.
+	ErrSessionGUIDInvalid = errors.New("pool: session GUID invalid")
 )
 
 // State is a slot's lifecycle state.

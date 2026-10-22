@@ -268,6 +268,57 @@ func (p *Pool) DeleteArtifact(artifactID string) error {
 	return nil
 }
 
+// DeleteSessionDir removes a session's vault directory.
+//
+// # Why the orchestrator has this verb
+//
+// The orchestrator's `bindSession` creates `/opt/msout/data/vault/<guid>/` and
+// never removes it. The runner's `DELETE /sessions/:guid` removes only the inner
+// `<guid>/` (the runner's own root: `auth.json`, `auth-meta.json`, `out/`, `tmp/`,
+// `logs/`) and **not** the outer directory, and the api has no mount of the vault
+// at all.
+//
+// So 113 directories have accumulated on the deployed host, 43 of them holding a
+// live Microsoft session cookie (`auth.json`, written by `@msout/microsoft-webauth`
+// after a sign-in), and the erase's own wording — *"We deleted everything this
+// service stored for this session"* — is a claim the machine cannot keep.
+//
+// # Parameters
+//
+// The session GUID is validated before it is joined to the vault root, so a
+// caller cannot smuggle a path. The directory is removed entirely: `logs/` and
+// the runner's inner tree alike.
+//
+// # Idempotent
+//
+// `os.RemoveAll` returns nil for a path that does not exist, so a directory that
+// was already removed (or never created in the first place) is not an error. A
+// missing path is the outcome the erase machine wanted — "the thing I was deleting
+// is already gone" — and the verb must answer success rather than 404.
+//
+// # Check the work
+//
+// `os.RemoveAll` can fail partially, removing some subdirectories but not all. So
+// after the removal the verb **stats the path** and returns an error if it is
+// still there — otherwise a partial removal would be reported as a success and the
+// api would delete the row, and the leak would survive under a "deleted: true".
+func (p *Pool) DeleteSessionDir(sessionGUID string) error {
+	if !config.ValidGUID(sessionGUID) {
+		return ErrSessionGUIDInvalid
+	}
+	vault := filepath.Join(p.cfg.VaultRoot, sessionGUID)
+	if err := os.RemoveAll(vault); err != nil {
+		return fmt.Errorf("delete session dir %s: %w", sessionGUID, err)
+	}
+	// Check the work: if the path still exists, the removal was partial.
+	if _, err := os.Stat(vault); err == nil {
+		return fmt.Errorf("delete session dir %s: partial removal; directory still exists", sessionGUID)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("delete session dir %s: stat after removal: %w", sessionGUID, err)
+	}
+	return nil
+}
+
 // SweepStaging removes staging directories older than the cutoff.
 //
 // A runner that dies between streaming an archive and having it finalised leaves

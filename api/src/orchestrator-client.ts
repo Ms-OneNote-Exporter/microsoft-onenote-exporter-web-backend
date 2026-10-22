@@ -386,6 +386,21 @@ export interface OrchestratorApi {
    * outcome it wanted.
    */
   deleteArtifact(artifactId: string): Promise<OrchestratorResult<{ deleted: boolean }>>;
+  /**
+   * deleteSessionDir removes a session's vault directory.
+   *
+   * The tenth verb. Modelled on `/delete-artifact`: one validated GUID, joined to
+   * a root the process owns.
+   *
+   * ## Why it exists
+   *
+   * The orchestrator's `bindSession` creates `/opt/msout/data/vault/<guid>/` and
+   * nothing ever removes it. The runner's `DELETE /sessions/:guid` removes only
+   * the inner `<guid>/` and the api has no mount of the vault at all.
+   *
+   * Idempotent by contract: a not-found directory is success.
+   */
+  deleteSessionDir(sessionGuid: string): Promise<OrchestratorResult<{ deleted: boolean }>>;
 }
 
 /** Options for the client. */
@@ -617,6 +632,18 @@ export class OrchestratorClient implements OrchestratorApi {
    */
   deleteArtifact(artifactId: string): Promise<OrchestratorResult<{ deleted: boolean }>> {
     return this.#call("POST", "/delete-artifact", { artifactId });
+  }
+
+  /**
+   * deleteSessionDir removes a session's vault directory.
+   *
+   * The read budget, not `CONTAINER_VERB_TIMEOUT_MS`: the work is an
+   * `os.RemoveAll` under the vault root, sized by neither the pool nor a container.
+   * It is called from the erase machine, which is holding a session's cookie open,
+   * so it must not inherit the 75 s a container lifecycle needs.
+   */
+  deleteSessionDir(sessionGuid: string): Promise<OrchestratorResult<{ deleted: boolean }>> {
+    return this.#call("POST", "/delete-session-dir", { sessionGuid });
   }
 
   /** stats reports pool occupancy. */

@@ -1100,6 +1100,20 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
                 : `delete-artifact refused: ${result.error.kind}`,
             );
           },
+          // The session's vault directory, on the volume this process cannot see,
+          // so it is the orchestrator's to remove. Modelled on `deleteArtifact`:
+          // the orchestrator's `/delete-session-dir` verb, one validated GUID joined
+          // to its vault root. Typed as `void` because the machine has no local
+          // record to key on the answer.
+          deleteSessionDir: async (sessionGuid: string) => {
+            const result = await deps.orchestrator.deleteSessionDir(sessionGuid);
+            if (result.ok) return;
+            throw new Error(
+              result.error.kind === "unreachable"
+                ? `delete-session-dir unreachable: ${result.error.cause}`
+                : `delete-session-dir refused: ${result.error.kind}`,
+            );
+          },
           // The erase machine only needs to know whether the orchestrator is
           // reachable, so a typed failure is flattened rather than propagated —
           // the machine reports "pool stats unavailable", not a TS error.
@@ -1133,6 +1147,10 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
         // one level in.
         log: {
           warn: (message, fields) => request.log.warn(fields ?? {}, message),
+          // A success, not a failure. The orchestrator's audit line carries no
+          // guid, so this is the only place the api's journal names the session
+          // whose directory was removed.
+          info: (message, fields) => request.log.info(fields ?? {}, message),
         },
       } satisfies EraseDeps,
       session.guid,

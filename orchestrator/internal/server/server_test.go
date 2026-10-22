@@ -567,18 +567,19 @@ func TestRouteTableIsExactlyTheVerbSet(t *testing.T) {
 	table := srv.routeTable()
 
 	want := map[string][]string{
-		"/claim":    {http.MethodPost},
-		"/release":  {http.MethodPost},
-		"/recycle":  {http.MethodPost},
-		"/remove":   {http.MethodPost},
-		"/stat":     {http.MethodPost},
-		"/stats":    {http.MethodGet},
-		"/healthz":  {http.MethodGet},
-		"/finalize": {http.MethodPost},
-		// The ninth verb, and the one this test exists to make deliberate. It removes
-		// an artifact the api owns and nothing else — no slot, no vault, no container
-		// — so it is enumerated here like every other path rather than added quietly.
+		"/claim":           {http.MethodPost},
+		"/release":         {http.MethodPost},
+		"/recycle":         {http.MethodPost},
+		"/remove":          {http.MethodPost},
+		"/stat":            {http.MethodPost},
+		"/stats":           {http.MethodGet},
+		"/healthz":         {http.MethodGet},
+		"/finalize":        {http.MethodPost},
 		"/delete-artifact": {http.MethodPost},
+		// The tenth verb, and the one this test exists to make deliberate. It removes
+		// a session's vault directory and nothing else — no slot, no artifact, no container
+		// — so it is enumerated here like every other path rather than added quietly.
+		"/delete-session-dir": {http.MethodPost},
 	}
 
 	if len(table) != len(want) {
@@ -624,6 +625,10 @@ func TestRequestSchemasHoldOnlyIdentifiers(t *testing.T) {
 		// marker, so it is a claim about an export rather than a pointer to one.
 		// Nothing about the filesystem comes from it — no path, no size.
 		{"finalizeRequest", finalizeRequest{}, []string{"artifactId", "sessionGuid", "partial"}},
+		// The deletion verb's schema is asserted as narrowly as the others, and for
+		// a sharper reason: it is the only verb whose work is destructive. One field,
+		// an identifier — so a caller cannot name a path, a slot or a session.
+		{"deleteSessionDirRequest", deleteSessionDirRequest{}, []string{"sessionGuid"}},
 	}
 	for _, tc := range cases {
 		got := jsonFieldNames(tc.value)
@@ -870,5 +875,162 @@ func TestDeleteArtifactRemovesOnlyTheNamedArtifact(t *testing.T) {
 	}
 	if rec := do(t, h, http.MethodPost, "/stat", deleteBody(otherID)); !strings.Contains(rec.Body.String(), `"exists":true`) {
 		t.Errorf("deleting one artifact removed another: %s", rec.Body.String())
+	}
+}
+
+// ---- POST /delete-session-dir -----------------------------------------------
+//
+// The tenth verb. One validated GUID, joined to the vault root. Idempotent — a
+// missing directory is success. Checks its own work — partial removal is failure.
+
+func deleteSessionDirBody(guid string) []byte {
+	b, _ := json.Marshal(map[string]any{"sessionGuid": guid})
+	return b
+}
+
+// O1: the verb removes the session's directory, recursively.
+func TestDeleteSessionDirRemovesTheDirectory(t *testing.T) {
+	_, h, cfg := newTestServer(t)
+
+	// Create the directory the way bindSession does — with the runner's inner tree.
+	guid := "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+	vaultDir := filepath.Join(cfg.VaultRoot, guid)
+	innerDir := filepath.Join(vaultDir, guid)
+	if err := os.MkdirAll(innerDir, 0o700); err != nil {
+		t.Fatalf("create test directory: %v", err)
+	}
+	// Put something in the inner dir so recursive removal matters.
+	if err := os.WriteFile(filepath.Join(innerDir, "auth.json"), []byte(`{"token":"secret"}`), 0o600); err != nil {
+		t.Fatalf("create test file: %v", err)
+	}
+	// And the orchestrator's logs beside it.
+	logDir := filepath.Join(vaultDir, "logs")
+	if err := os.MkdirAll(logDir, 0o700); err != nil {
+		t.Fatalf("create logs dir: %v", err)
+	}
+
+	// Before: directories exist.
+	if _, err := os.Stat(vaultDir); err != nil {
+		t.Fatalf("before delete, vault dir missing: %v", err)
+	}
+
+	rec := do(t, h, http.MethodPost, "/delete-session-dir", deleteSessionDirBody(guid))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "deleted") {
+		t.Errorf("body = %s, want it to report what it did", rec.Body.String())
+	}
+
+	// After: everything is gone.
+	if _, err := os.Stat(vaultDir); !os.IsNotExist(err) {
+		t.Errorf("vault dir still exists: %v", err)
+	}
+}
+
+// O2: a malformed guid is refused with a 400, including `../escaped` and a
+// non-uuid.
+func TestDeleteSessionDirRejectsBadGUIDs(t *testing.T) {
+	_, h, _ := newTestServer(t)
+
+	for _, bad := range []string{"short", "not-a-guid", "3F2504E0-4F89-11D3-9A0C-0305E82C3301", "../escaped", ".."} {
+		rec := do(t, h, http.MethodPost, "/delete-session-dir", deleteSessionDirBody(bad))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("guid %q: status = %d, want 400: %s", bad, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// O3: removing a directory that does not exist is a success.
+func TestDeleteSessionDirAnswers200ForADirectoryThatIsAlreadyGone(t *testing.T) {
+	_, h, _ := newTestServer(t)
+	guid := "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+
+	rec := do(t, h, http.MethodPost, "/delete-session-dir", deleteSessionDirBody(guid))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete of missing dir = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// O4: the route table is exactly the verb set (the new path included).
+func TestDeleteSessionDirIsInRouteTable(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	table := srv.routeTable()
+
+	wantMethods, ok := table["/delete-session-dir"]
+	if !ok {
+		t.Fatalf("/delete-session-dir missing from route table")
+	}
+	if _, ok := wantMethods[http.MethodPost]; !ok {
+		t.Errorf("/delete-session-dir missing POST method")
+	}
+
+	// Also asserted over HTTP, so a handler that exists but is not in the table is
+	// unreachable code a reader would believe in.
+	rec := do(t, srv.Handler(), http.MethodGet, "/delete-session-dir", nil)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET /delete-session-dir = %d, want 405", rec.Code)
+	}
+	if rec.Header().Get("Allow") == "" {
+		t.Error("GET /delete-session-dir: Allow header missing")
+	}
+}
+
+// O5: the verb reports a partial removal as a failure.
+func TestDeleteSessionDirReportsPartialRemovalAsFailure(t *testing.T) {
+	_, h, cfg := newTestServer(t)
+
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: the permission bits this test relies on are ignored")
+	}
+	guid := "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+	vaultDir := filepath.Join(cfg.VaultRoot, guid)
+	innerDir := filepath.Join(vaultDir, guid)
+	if err := os.MkdirAll(innerDir, 0o700); err != nil {
+		t.Fatalf("create test directory: %v", err)
+	}
+	// A subdirectory with no write permission **and something inside it**. An
+	// empty read-only directory is still removable — unlinking it needs the
+	// *parent's* write permission — so the removal would succeed and the test
+	// would prove nothing. A file inside a directory the remover cannot write
+	// to is what makes the removal genuinely partial: the file cannot be
+	// unlinked, and the directory is still there afterwards.
+	roDir := filepath.Join(innerDir, "readonly")
+	if err := os.MkdirAll(roDir, 0o700); err != nil {
+		t.Fatalf("create readonly dir: %v", err)
+	}
+	// The file is written **before** the directory is made read-only: once the
+	// mode is 0500 there is no write permission left to create it with.
+	if err := os.WriteFile(filepath.Join(roDir, "auth.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatalf("create the file inside it: %v", err)
+	}
+	if err := os.Chmod(roDir, 0o500); err != nil {
+		t.Fatalf("make the directory read-only: %v", err)
+	}
+	// Restore the permission before the test ends. `t.TempDir`'s own cleanup is
+	// a `RemoveAll`, and it would fail on the directory this test made
+	// read-only — a failure in the cleanup fails the test, and it would be a
+	// failure of the harness rather than of the code.
+	t.Cleanup(func() {
+		_ = os.Chmod(roDir, 0o700)
+	})
+	// The removable sibling: it IS removed, which is what makes the outcome
+	// partial rather than a total failure.
+	removable := filepath.Join(innerDir, "removable")
+	if err := os.MkdirAll(removable, 0o700); err != nil {
+		t.Fatalf("create removable dir: %v", err)
+	}
+
+	rec := do(t, h, http.MethodPost, "/delete-session-dir", deleteSessionDirBody(guid))
+	// The removal will fail because of the unreadable directory.
+	// The exact status depends on whether we can remove what we can, but the check
+	// in DeleteSessionDir will make it a non-200 because the directory still exists.
+	if rec.Code == http.StatusOK {
+		t.Errorf("status = %d, want non-200 (partial removal detected): %s", rec.Code, rec.Body.String())
+	}
+
+	// The directory itself should still exist (partial removal).
+	if _, err := os.Stat(vaultDir); os.IsNotExist(err) {
+		t.Errorf("directory was fully removed when it should still exist (partial)")
 	}
 }

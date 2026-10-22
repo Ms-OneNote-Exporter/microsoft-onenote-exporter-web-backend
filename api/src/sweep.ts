@@ -1343,6 +1343,20 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
     // is gone regardless of what else is true of it.
     if (session.expires_at <= now) {
       await binder.releaseForAbsence(session);
+      // Best-effort: remove the session's vault directory. Logged on success (because
+      // the orchestrator's audit line carries no guid), never thrown (the sweep's
+      // tick must not fail).
+      try {
+        await options.orchestrator.deleteSessionDir(session.guid);
+        log.info("session directory deleted", { session: session.guid });
+      } catch (error) {
+        // A failed deletion is logged, so it shows up in the sweep log, but the
+        // sweep tick must not fail. The sweeper's retry record will re-try.
+        log.warn("session directory deletion failed, left to next sweep", {
+          session: session.guid,
+          error: String(error),
+        });
+      }
       db.deleteSession(session.guid);
       sse.emit(session.guid, "session-status", { state: "expired" });
       sse.drop(session.guid);
@@ -1354,6 +1368,18 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
     // A session with no login started holds nothing. §2.1: 10 minutes.
     if (session.state === "created" && session.created_at + TTL.unclaimedSession <= now) {
       await binder.releaseForAbsence(session);
+      // Best-effort: remove the session's vault directory. Logged on success (because
+      // the orchestrator's audit line carries no guid), never thrown (the sweep's
+      // tick must not fail).
+      try {
+        await options.orchestrator.deleteSessionDir(session.guid);
+        log.info("session directory deleted", { session: session.guid });
+      } catch (error) {
+        log.warn("session directory deletion failed, left to next sweep", {
+          session: session.guid,
+          error: String(error),
+        });
+      }
       db.deleteSession(session.guid);
       sse.emit(session.guid, "session-status", { state: "expired" });
       sse.drop(session.guid);

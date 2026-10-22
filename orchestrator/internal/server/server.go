@@ -108,17 +108,18 @@ func (s *Server) Handler() http.Handler {
 // what lets a test also check that no path acquired a second method.
 func (s *Server) routeTable() map[string]map[string]struct{} {
 	table := map[string]map[string]struct{}{
-		"/claim":    {http.MethodPost: {}},
-		"/release":  {http.MethodPost: {}},
-		"/recycle":  {http.MethodPost: {}},
-		"/remove":   {http.MethodPost: {}},
-		"/stat":     {http.MethodPost: {}},
-		"/stats":    {http.MethodGet: {}},
-		"/healthz":  {http.MethodGet: {}},
-		"/finalize": {http.MethodPost: {}},
-		// The ninth verb. See `handleDeleteArtifact` for why this surface — which
-		// PLAN-v3 §2.1 called "five verbs and a health check" — needs one more.
+		"/claim":           {http.MethodPost: {}},
+		"/release":         {http.MethodPost: {}},
+		"/recycle":         {http.MethodPost: {}},
+		"/remove":          {http.MethodPost: {}},
+		"/stat":            {http.MethodPost: {}},
+		"/stats":           {http.MethodGet: {}},
+		"/healthz":         {http.MethodGet: {}},
+		"/finalize":        {http.MethodPost: {}},
 		"/delete-artifact": {http.MethodPost: {}},
+		// The tenth verb: remove a session's vault directory. Modelled on
+		// `/delete-artifact`: one validated GUID, joined to a root the process owns.
+		"/delete-session-dir": {http.MethodPost: {}},
 	}
 	return table
 }
@@ -152,6 +153,9 @@ func (s *Server) routes() http.Handler {
 		},
 		"/delete-artifact": {
 			http.MethodPost: s.handleDeleteArtifact,
+		},
+		"/delete-session-dir": {
+			http.MethodPost: s.handleDeleteSessionDir,
 		},
 		"/stats": {
 			http.MethodGet: s.handleStats,
@@ -493,6 +497,43 @@ func (s *Server) handleDeleteArtifact(c *call) (any, error) {
 		// Anything else is the filesystem refusing, which is a 500 and an operator's
 		// problem. Not 404: an artifact that does not exist is a **success**, and
 		// saying otherwise would make every repeated erase look like a failure.
+		return nil, err
+	}
+	return map[string]any{"deleted": true}, nil
+}
+
+// deleteSessionDirRequest is the input schema for the delete-session-dir verb.
+//
+// One identifier, like `deleteArtifactRequest`. It carries no session and no path:
+// the GUID selects a directory this process already owns, and the caller cannot
+// name anything else — `ValidGUID` below is the whole of the enforcement.
+type deleteSessionDirRequest struct {
+	SessionGuid string `json:"sessionGuid"`
+}
+
+// handleDeleteSessionDir removes a session's vault directory.
+//
+// # Why the orchestrator surface has a tenth verb
+//
+// The orchestrator's `bindSession` creates `/opt/msout/data/vault/<guid>/` and
+// nothing ever removes it. The runner's `DELETE /sessions/:guid` removes only the
+// inner `<guid>/` and the api has no mount of the vault at all.
+//
+// So the deletion must be done by the orchestrator, and the verb's shape is exactly
+// the ninth verb's: one validated GUID, joined to a root the process owns.
+func (s *Server) handleDeleteSessionDir(c *call) (any, error) {
+	var req deleteSessionDirRequest
+	if err := c.decode(&req); err != nil {
+		return nil, badRequest("malformed delete-session-dir request", err)
+	}
+	if !config.ValidGUID(req.SessionGuid) {
+		return nil, badRequest("sessionGuid must be a lowercase uuid", nil)
+	}
+
+	if err := s.pool.DeleteSessionDir(req.SessionGuid); err != nil {
+		if errors.Is(err, pool.ErrSessionGUIDInvalid) {
+			return nil, badRequest("sessionGuid must be a lowercase uuid", nil)
+		}
 		return nil, err
 	}
 	return map[string]any{"deleted": true}, nil

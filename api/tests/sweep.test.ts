@@ -106,6 +106,8 @@ function orchestratorStub(opts: {
   const released: string[] = [];
   /** The slot ids `/claim` was actually asked for, in order. */
   const claimAttempts: string[] = [];
+  /** The sessions whose vault directory the sweeper asked the orchestrator to remove. */
+  const deletedSessionDirs: string[] = [];
   let lastClaimBody: string | undefined;
   const client = new OrchestratorClient({
     baseUrl: "http://127.0.0.1:1",
@@ -168,6 +170,14 @@ function orchestratorStub(opts: {
         if (opts.release === "conflict") return new Response("{}", { status: 409 });
         throw new Error("ECONNREFUSED");
       }
+      if (path === "/delete-session-dir") {
+        // Recorded from the **body**: "the verb was called" and "the verb was
+        // called for *that* session" are different assertions, and the whole
+        // point of the verb is the session it names.
+        const body = JSON.parse(decodeBody(init?.body) ?? "{}") as { sessionGuid?: string };
+        if (typeof body.sessionGuid === "string") deletedSessionDirs.push(body.sessionGuid);
+        return new Response(JSON.stringify({ deleted: true }));
+      }
       if (path === "/stats") {
         if (opts.stats === "ok") {
           return new Response(
@@ -225,7 +235,7 @@ function orchestratorStub(opts: {
       return new Response("{}", { status: 404 });
     }) as typeof fetch,
   });
-  return { client, calls, released, claimAttempts };
+  return { client, calls, released, claimAttempts, deletedSessionDirs };
 }
 
 /** `fetch` bodies arrive as bytes here, so a stub has to decode before parsing. */
@@ -3066,5 +3076,73 @@ describe("sweep exportsDispossessed", () => {
     expect(JSON.parse(session.export_state!).error).toBe(
       "the runner disappeared before this export finished",
     );
+  });
+});
+
+/**
+ * The session's vault directory, removed when the session is gone.
+ *
+ * The orchestrator creates `/opt/msout/data/vault/<guid>/` at claim time and
+ * nothing else removes it, so the api — which has no mount of the vault at all —
+ * asks the orchestrator when the session's **row** is deleted. The row's
+ * deletion is the signal that the session is gone; a release is not, because a
+ * released session can come back and re-use its directory.
+ */
+describe("sweep removes the session's vault directory", () => {
+  const GUID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+
+  /** A sweep whose orchestrator records the directory removals it was asked for. */
+  const runWith = async (opts: Parameters<typeof orchestratorStub>[0] = {}) => {
+    const stub = orchestratorStub(opts);
+    const binder = new PoolBinder(options(stub.client));
+    const report = await sweep(options(stub.client), binder);
+    return { report, deleted: stub.deletedSessionDirs };
+  };
+
+  it("asks the orchestrator to remove it when the row is deleted at the absolute cap", async () => {
+    seedSession(GUID, {
+      state: "authenticated",
+      auth_state: "valid",
+      expires_at: now - 1,
+    });
+
+    const { report, deleted } = await runWith();
+
+    expect(report.absoluteExpired).toBe(1);
+    expect(db.getSession(GUID)).toBeUndefined();
+    expect(deleted).toEqual([GUID]);
+  });
+
+  it("asks the orchestrator to remove it when the row is deleted unclaimed", async () => {
+    seedSession(GUID, { state: "created", created_at: now - TTL.unclaimedSession - 1 });
+
+    const { report, deleted } = await runWith();
+
+    expect(report.unclaimedExpired).toBe(1);
+    expect(deleted).toEqual([GUID]);
+  });
+
+  it("does NOT remove it when the session is merely released and can come back", async () => {
+    // The idle branch releases the runner and **keeps the row**: the user may
+    // return within the session's remaining life and re-use their vault. The
+    // directory has to survive that, or the session comes back to nothing.
+    // A runner to release: the counter only increments when the release
+    // succeeds, so without one the branch would be vacuous.
+    seedRunners(1);
+    seedSession(GUID, {
+      state: "authenticated",
+      auth_state: "valid",
+      runner_id: "slot-1",
+      idle_expires_at: now - 1,
+      expires_at: now + 3_600_000,
+    });
+
+    const { report, deleted } = await runWith({ release: "ok" });
+
+    expect(report.idleReleased).toBe(1);
+    // The row is still there — the session is not gone.
+    expect(db.getSession(GUID)).toBeDefined();
+    // And so is its directory.
+    expect(deleted).toEqual([]);
   });
 });

@@ -36,6 +36,7 @@ export type EraseStep =
   | "directory-removed"
   | "container-removed"
   | "artifact-deleted"
+  | "session-dir-deleted"
   | "row-deleted";
 
 /** What erase did, or where it stopped. */
@@ -98,6 +99,18 @@ export interface EraserOrchestrator {
    * in the one vocabulary this machine already logs.
    */
   deleteArtifact(artifactId: string): Promise<void>;
+  /**
+   * Removes a session's vault directory.
+   *
+   * Modelled on `deleteArtifact`: the orchestrator's `/delete-session-dir` verb,
+   * one validated GUID joined to its vault root. The directory being removed is the
+   * one created by `bindSession`, not the runner's inner tree (that's shredded by
+   * the runner first), and not the artifact tree (that's deleted by `deleteArtifact`).
+   *
+   * A `void` because there is no row to keep, and a throw is logged but not fatal
+   * to the row deletion that follows.
+   */
+  deleteSessionDir(sessionGuid: string): Promise<void>;
   /** Reports pool occupancy, used to reclaim the slot. */
   stats(): Promise<{ ok: boolean; value: { size: number; deadSlots?: readonly string[] } }>;
 }
@@ -118,7 +131,18 @@ export interface EraseDeps {
   readonly orchestrator: EraserOrchestrator;
   readonly runner: RunnerControl;
   readonly sse: SseHub;
-  readonly log?: { warn: (msg: string, fields?: Record<string, unknown>) => void };
+  /**
+   * The machine's diagnostics.
+   *
+   * `warn` is the failure log — it exists because a failed erase answers 500
+   * with `failedAt` and **nothing in any log** (the silent-erase bug). `info`
+   * is optional and is used for the **success** of a step whose only other
+   * trace is the orchestrator's audit line, which carries no guid.
+   */
+  readonly log?: {
+    warn: (msg: string, fields?: Record<string, unknown>) => void;
+    info?: (msg: string, fields?: Record<string, unknown>) => void;
+  };
 }
 
 /**
@@ -328,6 +352,7 @@ export async function runErase(deps: EraseDeps, sessionId: string): Promise<Eras
     // — the runner that mounts the vault does not exist.
     note("files-removed");
     note("directory-removed");
+    // The session-dir-deleted step is handled by the separate block below.
   } else {
     try {
       await deps.runner.shredDirectory(sessionId);
@@ -437,6 +462,57 @@ export async function runErase(deps: EraseDeps, sessionId: string): Promise<Eras
         } catch { /* assume not dead */ }
       }
     }
+  }
+
+  // 6c. Remove the session's vault directory.
+  //
+  // ## Why this step was missing
+  //
+  // Steps 4-5 above (shredDirectory) delete the runner's inner tree (`auth.json`,
+  // `auth-meta.json`, `out/`, `tmp/`, `logs/`), but the orchestrator's `bindSession`
+  // creates the outer `/opt/msout/data/vault/<guid>/` and nothing ever removes it.
+  // The api has no mount of the vault at all, so the only place this work can be
+  // done is with the orchestrator's `/delete-session-dir` verb.
+  //
+  // ## Failure
+  //
+  // Best-effort: logged but not fatal to the row that follows. A partial removal
+  // would be re-logged by the sweep, and the row still needs to be deleted because
+  // the retry record is what the sweep uses to re-try.
+  //
+  // ## Where it sits
+  //
+  // After container removal (so the container's mount doesn't break) and before
+  // row deletion (so the retry record can key on the result). The same reasoning
+  // as artifact deletion, except here the orchestrator owns the vault root.
+  // Note: this calls `deps.orchestrator.deleteSessionDir(sessionId)` which validates
+  // the GUID and joins it to the orchestrator's vault root.
+  // When noRunnerToAsk is true, no vault directory was ever created, so skip the call.
+  if (!noRunnerToAsk) {
+    try {
+      await deps.orchestrator.deleteSessionDir(sessionId);
+      // `info`, not `warn`: this is a success. The orchestrator's audit line
+      // carries only method, path, status, durationMs and remote — no guid — so
+      // without a line here the proof cannot join "the verb fired" to "this
+      // session's directory".
+      deps.log?.info?.("session directory deleted", { session: sessionId });
+      note("session-dir-deleted");
+    } catch (error) {
+      note("session-dir-deleted", error);
+      // If the runner died during the erase, these failures are expected.
+      if (!runnerDead && slotId !== null) {
+        try {
+          const recheck = await deps.orchestrator.stats();
+          if (recheck.ok && recheck.value.deadSlots?.includes(slotId)) {
+            runnerDead = true;
+          }
+        } catch { /* assume not dead */ }
+      }
+    }
+  } else {
+    // No runner was ever bound, so no vault directory was ever created by the
+    // orchestrator. Nothing to delete, but record the step for the retry record.
+    note("session-dir-deleted");
   }
 
   // 7. Delete the row. Last, so an interruption above leaves a recoverable

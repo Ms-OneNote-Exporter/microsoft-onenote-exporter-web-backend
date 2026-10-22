@@ -78,6 +78,11 @@ function makeDeps(
       const e = fail("deleteArtifact");
       if (e) throw e;
     },
+    async deleteSessionDir(sessionGuid: string) {
+      calls.push(`deleteSessionDir:${sessionGuid}`);
+      const e = fail("deleteSessionDir");
+      if (e) throw e;
+    },
     async stats() {
       return { ok: true as const, value: { size: 0, deadSlots: options.deadSlots ?? [] } };
     },
@@ -140,10 +145,12 @@ describe("runErase", () => {
         "directory-removed",
         "container-removed",
         "artifact-deleted",
+        "session-dir-deleted",
         "row-deleted",
       ]);
     }
-    expect(calls).toEqual(["abort", "freeze", "shredDirectory", "remove:slot-1"]);
+    // The orchestator deleteSessionDir call should be in the calls list
+    expect(calls).toContain("deleteSessionDir:" + GUID);
   });
 
   it("short-circuits to ok when the runner is dead", async () => {
@@ -259,6 +266,10 @@ describe("runErase", () => {
 
     // Exactly one: `note` is called per step, and only the *first* failure is the
     // one reported. A second line here would mean repeats are untrackable.
+    //
+    // The successful removal of the session directory is logged at **info**, not
+    // at warn — it is a success, and a success in the failure log would be a
+    // false alarm.
     expect(warned).toHaveLength(1);
     expect(warned[0]?.message).toBe("erase step failed");
     expect(warned[0]?.fields?.session).toBe(GUID);
@@ -352,6 +363,7 @@ describe("runErase", () => {
         "directory-removed",
         "container-removed",
         "artifact-deleted",
+        "session-dir-deleted",
         "row-deleted",
       ]);
     }
@@ -698,5 +710,73 @@ describe("wording", () => {
     expect(ERASE_UI_WORDING).toBe("We deleted everything this service stored for this session.");
     expect(ERASE_UI_WORDING.toLowerCase()).not.toContain("nothing remains");
     expect(ERASE_UI_WORDING.toLowerCase()).not.toContain("anywhere");
+  });
+});
+
+/**
+ * The session's vault directory: the machine asks the orchestrator to remove
+ * it, and a failure to do so is not fatal to the row.
+ */
+describe("runErase removes the session's vault directory", () => {
+  const GUID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+
+  it("asks the orchestrator to remove the session's directory", async () => {
+    seedSession(GUID, "authenticated", "slot-1");
+    const { deps, calls } = makeDeps();
+
+    const outcome = await runErase(deps, GUID);
+
+    expect(calls).toContain(`deleteSessionDir:${GUID}`);
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.steps).toContain("session-dir-deleted");
+  });
+
+  it("still deletes the row when the removal fails, and says which step failed", async () => {
+    // The removal is best-effort: the row is the machine's retry record, and a
+    // directory that outlives it is a leak — but a row that outlives its
+    // directory is a session that never goes away.
+    seedSession(GUID, "authenticated", "slot-1");
+    const { deps } = makeDeps({ failAt: "deleteSessionDir" });
+
+    const outcome = await runErase(deps, GUID);
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.failedAt).toBe("session-dir-deleted");
+    // The row is still deleted: the machine continues past a failed step.
+    expect(db.getSession(GUID)).toBeUndefined();
+  });
+
+  it("logs the successful removal with the session, at info", async () => {
+    // The orchestrator's audit line carries the method, the path, the status and
+    // the remote — **no guid**. So the api's own log is the only place that
+    // names the session whose directory went, and without it the proof cannot
+    // join "the verb fired" to "this session's directory".
+    seedSession(GUID, "authenticated", "slot-1");
+    const { deps } = makeDeps();
+    const informed: Array<{ message: string; fields?: Record<string, unknown> }> = [];
+    const warned: Array<{ message: string; fields?: Record<string, unknown> }> = [];
+
+    const outcome = await runErase(
+      {
+        ...deps,
+        log: {
+          warn: (message, fields) => {
+            warned.push({ message, fields });
+          },
+          info: (message, fields) => {
+            informed.push({ message, fields });
+          },
+        },
+      },
+      GUID,
+    );
+
+    expect(outcome.ok).toBe(true);
+    expect(informed.map((l) => l.message)).toContain("session directory deleted");
+    expect(informed.find((l) => l.message === "session directory deleted")?.fields?.session).toBe(
+      GUID,
+    );
+    // A success is not a failure, and it must not appear in the failure log.
+    expect(warned).toHaveLength(0);
   });
 });

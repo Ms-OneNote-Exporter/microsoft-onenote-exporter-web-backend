@@ -415,4 +415,12 @@ export class FakeOrchestrator {
   now(): number {
     return this.#now();
   }
+
+  async deleteSessionDir(_sessionGuid: string): Promise<OrchestratorResult<{ deleted: boolean }>> {
+    // The vault directory is not modelled in the fake — it's a real filesystem
+    // concept, and this mock's job is to stand in for the orchestrator's API
+    // without actually touching the filesystem. So this always returns success.
+    // An erase that calls this will record the step as done.
+    return { ok: true, value: { deleted: true } };
+  }
 }

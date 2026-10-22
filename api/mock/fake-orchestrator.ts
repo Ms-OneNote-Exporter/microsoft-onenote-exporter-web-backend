@@ -382,6 +382,24 @@ export class FakeOrchestrator {
       slotAgeSec[slot.slotId] = ageSec;
       slotRemainingSec[slot.slotId] = Math.max(0, RUNNER_TTL_SECONDS - ageSec);
     }
+    // The slots the orchestrator would accept for a claim are exactly the idle ones.
+    // The real orchestrator uses `Slot.IsIdle()`, which returns true only for
+    // `StateIdle`. This mock reports `idle` for slots that have no container but
+    // have a timestamp, and `vacant` for slots that have neither (see the comment
+    // above where `byState` is built). So the claimable set is exactly the slots
+    // with state `idle` in our model.
+    const claimableSlotIds: string[] = [];
+    for (const slot of this.#slots.values()) {
+      // The same logic the real `Stats` uses: a slot with `createdAtMs === null`
+      // is vacant (no container), otherwise if `sessionGuid === null` it's idle.
+      // Only idle slots are claimable.
+      if (slot.createdAtMs !== null && slot.sessionGuid === null) {
+        claimableSlotIds.push(slot.slotId);
+      }
+    }
+    // Sort to match the real response byte for byte.
+    claimableSlotIds.sort();
+
     return {
       ok: true,
       value: {
@@ -391,6 +409,12 @@ export class FakeOrchestrator {
         // The real orchestrator exposes these now, and the api seeds its pool from
         // them. Sorted so the fake matches the real response byte for byte.
         slotIds: this.slotIds().sort(),
+        // The claimable set is exactly the idle slots, as the real orchestrator
+        // publishes (see pool.go:428-434). Sorted like `slotIds` above.
+        // **Omitted, not empty**, when nothing is claimable — same rule as `slotIds`:
+        // `omitempty` drops an absent key, and a fake that always sends the key would
+        // teach the api to read an all-idle pool differently from a real one.
+        ...(claimableSlotIds.length === 0 ? {} : { claimableSlotIds }),
         // **Omitted, not empty**, when nothing is bound — the real `Stats` carries
         // `omitempty`, and a fake that always sends the key would teach the api to
         // read an all-idle pool differently from a real one. Conditional spread

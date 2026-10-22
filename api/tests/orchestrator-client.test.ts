@@ -10,7 +10,7 @@ import {
 // re-derived as a local `!== undefined` so the literal below is checked against the
 // answer the sweeper will actually read — two copies of "what an absent key means" in one
 // repository is how the two drift.
-import { poolBindsNobody } from "../src/sweep.js";
+import { poolBindsNobody, poolClaimable, poolIdleCount } from "../src/sweep.js";
 
 /**
  * These tests pin the signing scheme against literal vectors produced by the Go
@@ -510,6 +510,96 @@ describe("OrchestratorClient", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(poolBindsNobody(result.value.byState)).toBeUndefined();
+  });
+
+  // The both-ends pin for `claimableSlotIds`, the other half of which is
+  // `orchestrator/internal/pool`'s `Stats` method which populates it.
+  //
+  // The two components share no code and this field crosses an HTTP boundary, so
+  // the name is a contract that only a literal on both sides can hold. If either
+  // side renames it, the api's draw will not exclude non-claimable slots, and
+  // logins will fail on a slot the orchestrator refuses.
+  it("reads claimableSlotIds off the literal key the orchestrator marshals", async () => {
+    const body = JSON.stringify({
+      size: 3,
+      byState: { idle: 1, bound: 2 },
+      runnerTtlSeconds: 300,
+      slotIds: ["slot-1", "slot-2", "slot-3"],
+      claimableSlotIds: ["slot-1"],
+    });
+    // Asserted on the wire, before the client is involved at all.
+    expect("claimableSlotIds" in (JSON.parse(body) as Record<string, unknown>)).toBe(true);
+
+    const c = client(stubFetch(200, body));
+    const result = await c.stats();
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.claimableSlotIds).toEqual(["slot-1"]);
+  });
+
+  // The rolling deploy backwards: an orchestrator predating the field omits it
+  // entirely (`omitempty`), and that must read as "this orchestrator does not say"
+  // rather than as an empty set.
+  it("reads an orchestrator that omits claimableSlotIds as not saying, not as empty", async () => {
+    const c = client(
+      stubFetch(
+        200,
+        JSON.stringify({ size: 2, byState: { idle: 2 }, runnerTtlSeconds: 300, slotIds: ["slot-1"] }),
+      ),
+    );
+
+    const result = await c.stats();
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.claimableSlotIds).toBeUndefined();
+  });
+
+  // A pool where no slots are claimable should still omit the key rather than
+  // sending an empty list, to match the real orchestrator's marshaling behavior.
+  it("reads a pool with no claimable slots as omitting the key", async () => {
+    const c = client(
+      stubFetch(
+        200,
+        JSON.stringify({ size: 2, byState: { bound: 2 }, runnerTtlSeconds: 300, slotIds: ["slot-1", "slot-2"] }),
+      ),
+    );
+
+    const result = await c.stats();
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // The key should be absent, not an empty array.
+    expect("claimableSlotIds" in result.value).toBe(false);
+  });
+});
+
+describe("poolClaimable vocabulary refusal", () => {
+  // T-9: poolClaimable refuses an unfamiliar byState vocabulary.
+  it("returns undefined for an unknown state name", () => {
+    const result = poolClaimable({ "frob": 2 }, undefined);
+    expect(result).toBeUndefined();
+  });
+
+  it("returns undefined when byState is undefined", () => {
+    const result = poolClaimable(undefined, undefined);
+    expect(result).toBeUndefined();
+  });
+
+  it("returns the claimable set when the vocabulary is known", () => {
+    const result = poolClaimable({ idle: 1, bound: 1 }, ["slot-1"]);
+    expect(result).toEqual(new Set(["slot-1"]));
+  });
+
+  it("returns an empty set when no slots are claimable", () => {
+    const result = poolClaimable({ bound: 2 }, undefined);
+    expect(result).toEqual(new Set());
+  });
+
+  it("returns undefined when some are claimable but ids are missing", () => {
+    const result = poolClaimable({ idle: 1 }, undefined);
+    expect(result).toBeUndefined();
   });
 });
 

@@ -85,6 +85,11 @@ function orchestratorStub(opts: {
    * reachable, and that case is honest to report as exhaustion.
    */
   stubborn?: boolean;
+  /**
+   * The slots the orchestrator reports as claimable. When omitted, the stub
+   * omits the field entirely (rolling-deploy shape).
+   */
+  claimableSlots?: readonly string[];
 }): OrchestratorClient {
   return new OrchestratorClient({
     baseUrl: "http://orchestrator:9100",
@@ -98,6 +103,9 @@ function orchestratorStub(opts: {
             byState: Object.fromEntries(opts.liveSlots.map((s) => [s, 1])),
             runnerTtlSeconds: 300,
             slotIds: opts.liveSlots,
+            ...(opts.claimableSlots === undefined
+              ? {}
+              : { claimableSlotIds: opts.claimableSlots }),
           }),
           { status: 200, headers: { "content-type": "application/json" } },
         );
@@ -386,5 +394,51 @@ describe("a healthy pool is not disturbed", () => {
     // call, not two. A second one would be the retry path running on a claim that
     // needed no retry.
     expect(statsCalls).toHaveLength(1);
+  });
+});
+describe("a pool with a non-claimable slot", () => {
+  // T-6: a login against a pool with a non-claimable slot never names that slot
+  // to /claim. The orchestrator reports slot-1 as claimable and slot-2 as not.
+  // The api seeds its pool snapshot from the orchestrator's /stats, and the draw
+  // excludes slot-2. Asking forty times over is how the property is asked when
+  // it cannot be assumed.
+  it("never offers the non-claimable slot", async () => {
+    db.registerRunner("slot-1", "", "idle");
+    db.registerRunner("slot-2", "", "idle");
+    const claimAttempts: string[] = [];
+    const client = orchestratorStub({
+      liveSlots: ["slot-1", "slot-2"],
+      claimAttempts,
+      claimableSlots: ["slot-1"],
+    });
+    const b = new PoolBinder({
+      db,
+      orchestrator: client,
+      sse: { emit: () => {}, drop: () => {} } as never,
+      log: {
+        info: (m: string, f?: Record<string, unknown>) =>
+          logs.push({ level: "info", message: m, fields: f ?? {} }),
+        warn: (m: string, f?: Record<string, unknown>) =>
+          logs.push({ level: "warn", message: m, fields: f ?? {} }),
+      },
+      now: () => Date.now(),
+    });
+    const stats = await client.stats();
+    if (stats.ok) b.poolUpdate(stats.value);
+
+    for (let i = 0; i < 40; i++) {
+      const sessionGuid = `session-${i}`;
+      db.createSession({
+        guid: sessionGuid,
+        secretHash: SECRET,
+        csrfKey: "C".repeat(43),
+        now: Date.now(),
+        expiresAt: EXPIRES.getTime(),
+      });
+      await b.claimForLogin(db.getSession(sessionGuid)!);
+    }
+
+    // slot-2 is never offered, because the orchestrator said it is not claimable.
+    expect(claimAttempts.filter((s) => s === "slot-2")).toEqual([]);
   });
 });

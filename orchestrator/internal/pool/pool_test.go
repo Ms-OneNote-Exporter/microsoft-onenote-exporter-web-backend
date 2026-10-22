@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -1107,6 +1109,82 @@ func TestStatsShape(t *testing.T) {
 	}
 	if s.RunnerTTLSeconds != 300 {
 		t.Errorf("runnerTtlSeconds = %d, want 300", s.RunnerTTLSeconds)
+	}
+	// ClaimableSlotIDs should be exactly the idle slots, and they should be sorted.
+	if len(s.ClaimableSlotIDs) != 1 || s.ClaimableSlotIDs[0] != "slot-1" {
+		t.Errorf("ClaimableSlotIDs = %v, want [slot-1]", s.ClaimableSlotIDs)
+	}
+}
+
+// TestStatsClaimableIsExactlyClaimable verifies that Stats.ClaimableSlotIDs is
+// exactly the set of slots that Claim would accept.
+func TestStatsClaimableIsExactlyClaimable(t *testing.T) {
+	cfg := testConfig(t, 6)
+	p := New(cfg, nil, discardLog())
+	p.slots["slot-1"] = &Slot{ID: "slot-1", State: StateIdle}
+	p.slots["slot-2"] = &Slot{ID: "slot-2", State: StateBound}
+	p.slots["slot-3"] = &Slot{ID: "slot-3", State: StateStarting}
+	p.slots["slot-4"] = &Slot{ID: "slot-4", State: StateDraining}
+	p.slots["slot-5"] = &Slot{ID: "slot-5", State: StateVacant}
+	p.slots["slot-6"] = &Slot{ID: "slot-6", State: StateDead}
+
+	stats := p.Stats()
+	claimableFromStats := make(map[string]bool)
+	for _, id := range stats.ClaimableSlotIDs {
+		claimableFromStats[id] = true
+	}
+
+	// Ask Claim about each slot and compare against Stats.
+	// We can't actually call Claim on most states (it would fail), so we
+	// use IsIdle() which is the same predicate Stats uses.
+	for id, slot := range p.slots {
+		wantClaimable := slot.IsIdle()
+		gotClaimable := claimableFromStats[id]
+		if wantClaimable != gotClaimable {
+			t.Errorf("slot %q: IsIdle()=%t but Stats.ClaimableSlotIDs reports %t", id, wantClaimable, gotClaimable)
+		}
+	}
+
+	// Also verify the claimable set is sorted.
+	sorted := make([]string, len(stats.ClaimableSlotIDs))
+	copy(sorted, stats.ClaimableSlotIDs)
+	sort.Strings(sorted)
+	for i, id := range stats.ClaimableSlotIDs {
+		if id != sorted[i] {
+			t.Errorf("ClaimableSlotIDs not sorted: index %d has %q, want %q", i, id, sorted[i])
+		}
+	}
+}
+
+// TestStatsClaimableOmittedWhenEmpty verifies that ClaimableSlotIDs is omitted
+// when there are no claimable slots.
+func TestStatsClaimableOmittedWhenEmpty(t *testing.T) {
+	cfg := testConfig(t, 2)
+	p := New(cfg, nil, discardLog())
+	p.slots["slot-1"] = &Slot{ID: "slot-1", State: StateBound}
+	p.slots["slot-2"] = &Slot{ID: "slot-2", State: StateBound}
+
+	stats := p.Stats()
+
+	// Check that ClaimableSlotIDs is nil (not an empty slice) so it's omitted by omitempty.
+	if stats.ClaimableSlotIDs != nil {
+		t.Errorf("ClaimableSlotIDs should be nil when empty, got %v", stats.ClaimableSlotIDs)
+	}
+}
+
+// TestStatsClaimableSorted verifies that ClaimableSlotIDs is sorted.
+func TestStatsClaimableSorted(t *testing.T) {
+	cfg := testConfig(t, 3)
+	p := New(cfg, nil, discardLog())
+	p.slots["slot-3"] = &Slot{ID: "slot-3", State: StateIdle}
+	p.slots["slot-1"] = &Slot{ID: "slot-1", State: StateIdle}
+	p.slots["slot-2"] = &Slot{ID: "slot-2", State: StateIdle}
+
+	stats := p.Stats()
+
+	expected := []string{"slot-1", "slot-2", "slot-3"}
+	if !reflect.DeepEqual(stats.ClaimableSlotIDs, expected) {
+		t.Errorf("ClaimableSlotIDs = %v, want %v", stats.ClaimableSlotIDs, expected)
 	}
 }
 

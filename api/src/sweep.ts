@@ -339,6 +339,60 @@ export function poolBindsNobody(
 }
 
 /**
+ * poolIdleCount returns the count of idle slots, or `undefined` if the vocabulary
+ * is unknown.
+ *
+ * **The same vocabulary refusal as `poolBindsNobody`.** An unfamiliar state name
+ * yields `undefined`, not a fabricated zero — the reason `poolBindsNobody` gives:
+ * an unrecognised word may be the one that used to mean "bound" — and "the thing I
+ * am looking for is not in this response" has to mean *cannot ask* rather than
+ * *nothing is bound*. The same argument protects "idle".
+ */
+export function poolIdleCount(
+  byState: Record<string, number> | undefined,
+): number | undefined {
+  if (byState === undefined) return undefined;
+  for (const name of Object.keys(byState)) {
+    if (!POOL_STATE_NAMES.has(name)) return undefined;
+  }
+  return byState.idle ?? 0;
+}
+
+/**
+ * poolClaimable returns the claimable slots from the orchestrator's response, or
+ * `undefined` if the response does not say enough.
+ *
+ * **The same vocabulary refusal as `poolBindsNobody`.** An unfamiliar state name
+ * yields `undefined`, not a fabricated count — the reason `poolBindsNobody` gives:
+ * an unrecognised word may be the one that used to mean "bound" — and "the thing I
+ * am looking for is not in this response" has to mean *cannot ask* rather than
+ * *nothing is bound*.
+ *
+ * **Two ways to know.** The orchestrator may report:
+ *
+ *   - a non-empty `claimableSlotIds` list — the exact set, known precisely
+ *   - `byState.idle` without `claimableSlotIds` — an upper bound on the set, which
+ *     is all that can be known without the ids
+ *
+ * A caller that receives `undefined` from this function falls back to the old
+ * behaviour: draw from the membership set and let the orchestrator refuse the ones
+ * it cannot serve. A rolling deploy of an orchestrator that predates the field
+ * leaves the api in that mode, and a rolling deploy of an api that predates it
+ * ignores the field.
+ */
+export function poolClaimable(
+  byState: Record<string, number> | undefined,
+  claimableSlotIds: readonly string[] | undefined,
+): ReadonlySet<string> | undefined {
+  if (claimableSlotIds !== undefined) return new Set(claimableSlotIds);
+  // No ids: the orchestrator does not report them. The count still does.
+  const idle = poolIdleCount(byState);
+  if (idle === undefined) return undefined; // cannot ask
+  if (idle > 0) return undefined; // some are claimable; which ones is unknown
+  return new Set<string>(); // none are claimable
+}
+
+/**
  * PoolBinder owns the binding between a session and a runner slot.
  *
  * The atomic claim is in SQLite, not here: `db.claimRunner` takes the write lock
@@ -376,6 +430,15 @@ export class PoolBinder {
   readonly #orchestrator: OrchestratorApi;
   readonly #log: SweeperLog;
   readonly #now: () => number;
+
+  /**
+   * The pool as the orchestrator last described it: its membership, and the
+   * subset of it a `/claim` would accept.
+   *
+   * `undefined` means "the orchestrator has not said" — the rolling-deploy case,
+   * and the case where the last `/stats` failed. It is never read as "none".
+   */
+  #pool: { membership: ReadonlySet<string>; claimable: ReadonlySet<string> | undefined } | undefined;
 
   constructor(options: SweeperOptions) {
     this.#db = options.db;
@@ -470,7 +533,8 @@ export class PoolBinder {
     // the draw further, or the retry could bounce between two bad rows.
     const excluded = new Set<string>();
     for (let attempt = 1; ; attempt++) {
-      const result = await this.#claimOnce(session, mode, excluded);
+      const now = this.#now();
+      const result = await this.#claimOnce(session, mode, excluded, now);
       if (result.ok) return result;
       if (result.reason !== "slot-conflict") return result;
       if (attempt >= CLAIM_ATTEMPTS) {
@@ -488,20 +552,30 @@ export class PoolBinder {
       // Re-learning re-adds the refused slot, and `excluded` is what keeps that from
       // mattering: the row comes back, but the next draw cannot be it. `syncPool` is
       // unchanged, deliberately — it reports the orchestrator's membership, and
-      // membership is exactly the thing that is correct here.
+      // membership is exactly the thing that is correct here. The pool snapshot is
+      // also updated so `#notClaimable()` has the latest view.
       const stats = await this.#orchestrator.stats();
-      if (!stats.ok || stats.value.slotIds === undefined) {
-        // No membership to learn from. Retrying would only re-pick the same rows.
-        return result;
-      }
-      const learned = syncPool(this.#db, stats.value.slotIds);
-      if (learned.added > 0) {
-        this.#log.info("pool slots re-learned after a refused claim", {
-          session: session.guid,
-          added: learned.added,
-          total: learned.total,
-          attempt,
-        });
+      if (stats.ok && stats.value.slotIds !== undefined) {
+        const learned = syncPool(this.#db, stats.value.slotIds);
+        const membership = new Set<string>(stats.value.slotIds);
+        const claimable = poolClaimable(stats.value.byState, stats.value.claimableSlotIds);
+        this.#pool = { membership, claimable };
+        if (learned.added > 0) {
+          this.#log.info("pool slots re-learned after a refused claim", {
+            session: session.guid,
+            added: learned.added,
+            total: learned.total,
+            attempt,
+          });
+        }
+        // Recompute `skip` now that the pool snapshot has been refreshed, so
+        // the re-learning's claim excludes the newly-learned non-claimable slots.
+        // Do NOT claim here. The re-learning branch's job is to update the membership
+        // (so syncPool puts refused rows back) and the pool snapshot (so #notClaimable()
+        // has the latest view). The actual draw happens in #claimOnce on the next
+        // iteration, which excludes the refused slots via `excluded` and the
+        // non-claimable ones via #notClaimable(). Claiming here would short-circuit
+        // the retry loop and skip the "giving up" path.
       }
     }
   }
@@ -521,13 +595,23 @@ export class PoolBinder {
     session: SessionRow,
     mode: ClaimMode,
     excluded: Set<string>,
+    now: number,
   ): Promise<ClaimResult> {
-    const now = this.#now();
-    // `claimRunner` takes a list, and one is taken here rather than at each call
-    // site because both claims below read the same set: the only thing that writes
-    // to it is `#finishClaim`'s conflict branch, which is downstream of the second
-    // claim and returns from it.
-    const skip: readonly string[] = [...excluded];
+    // The exclusion list is the union of the per-session refusal set (`excluded`) and
+    // the pool view (`#notClaimable()`). `drawEmptiedByExclusions` sees only
+    // `excluded`, so it never reports "every slot was refused" for a pool whose
+    // claimable set is smaller than its membership.
+    //
+    // Recomputed here, not passed in, so it is always fresh: the pool snapshot may
+    // have been updated between the moment the caller computed it and this call.
+    const skip: readonly string[] = [...excluded, ...this.#notClaimable()];
+
+    // One log line per draw, so the mechanism is observable on the deployed host.
+    const notClaimable = this.#notClaimable();
+    this.#log.info("claim: slots the orchestrator will not serve", {
+      session: session.guid,
+      notClaimable: notClaimable.length,
+    });
 
     if (!this.#db.claimRunner(session.guid, skip)) {
       // Pool exhaustion. §2.6: the caller shows the earliest of
@@ -1193,6 +1277,42 @@ export class PoolBinder {
     });
     return true;
   }
+
+  /**
+   * poolUpdate stores the pool snapshot from the orchestrator's response.
+   *
+   * This is the one place where the pool snapshot can be set from outside the
+   * PoolBinder: at boot, before any claim has been made (index.ts calls it from
+   * the boot reconciliation), and from the sweep tick (sweep.ts). The first claim
+   * then has an up-to-date view of the claimable set.
+   */
+  poolUpdate(stats: OrchestratorStats): void {
+    if (stats.slotIds === undefined) return;
+    const membership = new Set<string>(stats.slotIds);
+    const claimable = poolClaimable(stats.byState, stats.claimableSlotIds);
+    this.#pool = { membership, claimable };
+  }
+
+  /**
+   * #notClaimable returns the slots the orchestrator will not serve right now.
+   *
+   * The orchestrator reports its membership (`slotIds`) and its claimable set
+   * (`claimableSlotIds`). The slots it will not serve are membership minus the
+   * claimable set — which is exactly the slots it knows about that are not idle.
+   *
+   * **When the orchestrator does not report the claimable set** (rolling deploy of
+   * an orchestrator that predates the field), this falls back to returning an empty
+   * list — the old behaviour, with no regression.
+   */
+  #notClaimable(): readonly string[] {
+    const pool = this.#pool;
+    if (pool === undefined || pool.claimable === undefined) return [];
+    const out: string[] = [];
+    for (const id of pool.membership) {
+      if (!pool.claimable.has(id)) out.push(id);
+    }
+    return out;
+  }
 }
 
 /**
@@ -1249,6 +1369,16 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
   // shrunk leaves rows behind — which is what §2.5's reconciler is for, and it
   // means a slot released mid-session is not deleted out from under it.
   const stats = await options.orchestrator.stats();
+  // **Update the pool snapshot for the claim code path.** The claim path's ` PoolBinder`
+  // learns from both this tick (the rolling-deploy case) and its own failure branch
+  // (a slot was refused), so the hot path gains no extra round trip and a stale
+  // snapshot is corrected by the first failed attempt.
+  //
+  // The membership is `slotIds`, and the claimable set is whatever `claimableSlotIds`
+  // says — or `undefined` if the orchestrator does not report it.
+  if (stats.ok && stats.value.slotIds !== undefined) {
+    binder.poolUpdate(stats.value);
+  }
   // **Which slots the orchestrator has seen lose their runner**, taken from the
   // snapshot this tick already has rather than from a second `/stats`. One opinion
   // per tick: a second call would be a second opinion taken after the session loop,

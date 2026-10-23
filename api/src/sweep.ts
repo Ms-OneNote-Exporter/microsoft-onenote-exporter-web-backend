@@ -39,6 +39,19 @@ export const TTL = {
 } as const;
 
 /**
+ * How long an in-flight export may go without publishing **any** frame — including
+ * the runner's 15 s heartbeat re-publish — before it is treated as stuck.
+ *
+ * Derived from the heartbeat cadence rather than from section length: the heartbeat
+ * keeps `progressAt` fresh every 15 s for any live walk, so a threshold of 5
+ * minutes is ~20 missed heartbeats. That tolerates a reconnect/backoff window
+ * (max ~30 s) without false-positiving a live export, and it is independent of
+ * how long a single section takes — which is the unknown the issue withheld the
+ * number over. See issue #70.
+ */
+export const EXPORT_STUCK_THRESHOLD_MS = 5 * 60 * 1000;
+
+/**
  * Which kind of binding a claim is performing.
  *
  * Both take an idle slot and bind it to a session; they differ **only** in what they
@@ -202,6 +215,21 @@ export interface SweepReport {
    * nothing was missing, one thing was simply no longer true.
    */
   exportsDispossessed: number;
+  /**
+   * Exports ended because their runner was **alive but stopped progressing**, and whose
+   * state was reset.
+   *
+   * Tier 2 of the export-state class. The other three shapes (`exportsStranded`,
+   * `exportsRunnerDied`, `exportsDispossessed`) all have a container that is gone or a
+   * slot that is unbound. This one has a runner that answers `/healthz` and is still
+   * bound to the session, but has stopped publishing any frame — heartbeat included —
+   * for longer than `EXPORT_STUCK_THRESHOLD_MS`. A hung walk, or the PR #67 residual.
+   *
+   * Counted separately because the evidence is different (staleness of a persisted
+   * `progressAt`, not container death or slot unbinding), and an operator seeing
+   * "one stranded export" must know whether the runner is alive.
+   */
+  exportsStuck: number;
   /**
    * Runners released because the session's login was refused.
    *
@@ -1345,6 +1373,7 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
     exportsStranded: 0,
     exportsRunnerDied: 0,
     exportsDispossessed: 0,
+  exportsStuck: 0,
     authFailedReleased: 0,
     orphanSlotsReleased: 0,
     phantomRowsCleaned: 0,
@@ -1787,6 +1816,69 @@ export async function sweep(options: SweeperOptions, binder: PoolBinder): Promis
         sse.emit(session.guid, "session-status", { state: "authenticated" });
       }
       continue;
+    }
+
+    // **Tier 2 — a runner that is alive but stopped progressing.**
+    //
+    // Branches A/B/C above all need a container that is gone or a slot that is
+    // unbound. This one is the remaining shape: the runner answers `/healthz`,
+    // the slot is still bound to this session, and yet the walk has stopped
+    // publishing — including its 15 s heartbeat re-publish — for longer than
+    // `EXPORT_STUCK_THRESHOLD_MS`. A hung walk, or the PR #67 residual throw.
+    //
+    // The signal is staleness of a persisted `progressAt`, which is bumped on
+    // every received frame (counts or heartbeat). It is independent of section
+    // length because the heartbeat keeps it fresh for any live walk, so the
+    // threshold is a multiple of the heartbeat cadence rather than a guess at
+    // how long a section takes. See issue #70.
+    //
+    // **Guards, each load-bearing:**
+    //   - `runner_id !== null` and the slot present in `boundSessions` (or we
+    //     cannot confirm it is still ours) — stands down on an all-idle pool
+    //     and on a rolling deploy, the same shape branch C does.
+    //   - `!deadSlots.includes(...)` — branch B owns dead containers.
+    //   - `progressAt` present and parseable — an old row without it stands
+    //     down rather than stranding a live export.
+    if (
+      session.state === "exporting" &&
+      session.runner_id !== null &&
+      !deadSlots.includes(session.runner_id) &&
+      boundSessions !== undefined &&
+      session.runner_id in boundSessions
+    ) {
+      let progressAt: number | null = null;
+      if (session.export_state !== null) {
+        try {
+          const parsed = JSON.parse(session.export_state) as { progressAt?: unknown };
+          if (typeof parsed.progressAt === "number" && Number.isFinite(parsed.progressAt)) {
+            progressAt = parsed.progressAt;
+          }
+        } catch {
+          progressAt = null;
+        }
+      }
+      if (progressAt !== null && now - progressAt > EXPORT_STUCK_THRESHOLD_MS) {
+        if (!(await binder.releaseForDeadRunner(session))) {
+          continue;
+        }
+        db.clearSessionRunner(session.guid, session.runner_id);
+        const changed = db.markExportStranded({
+          guid: session.guid,
+          now,
+          idleExpiresAt: now + TTL.authenticatedIdle,
+          error: "the export stopped making progress",
+        });
+        if (changed) {
+          report.exportsStuck++;
+          log.warn("export reset; its runner stopped progressing", {
+            session: session.guid,
+            slot: session.runner_id,
+            staleMs: now - progressAt,
+          });
+          sse.emit(session.guid, "session-status", { state: "authenticated" });
+        }
+        continue;
+      }
     }
 
     // **A running export is not an idle session.**

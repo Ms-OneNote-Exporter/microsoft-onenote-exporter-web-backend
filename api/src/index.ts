@@ -171,10 +171,8 @@ export interface ExportProgressWriter {
  * rather than an oversight.
  */
 export function createExportProgressWriter(
-  write: (
-    guid: string,
-    progress: { pages: number; sections: number; assets: number },
-  ) => number,
+  writeCounts: (guid: string, progress: { pages: number; sections: number; assets: number }) => number,
+  touch: (guid: string, progressAt: number) => number,
   now: () => number = Date.now,
 ): ExportProgressWriter {
   const last = new Map<string, ProgressWrite>();
@@ -200,14 +198,26 @@ export function createExportProgressWriter(
       // therefore skip a genuine new section and leave the card showing the
       // older walk's totals.
       if (progress.pages <= previous.counts.pages) {
-        // Deliberately **not** updating `previous.at`. Refreshing the timestamp
-        // would make a stream of stale frames hold the throttle open for ever
-        // and starve the one frame that does carry news.
+        // Not a new count — but the runner is still alive and publishing
+        // (heartbeat or replay), so bump the liveness timestamp. This is the
+        // Tier 2 signal: a stuck runner stops publishing entirely. The counts
+        // are left untouched, so a replay cannot move the card backwards.
+        // Deliberately **not** updating `previous.at` here is wrong for liveness
+        // (it would starve the touch), so `previous.at` moves with the touch;
+        // `previous.counts` does not.
+        const touched = touch(sessionId, at);
+        if (touched === 0) {
+          forget(sessionId);
+          return;
+        }
+        last.set(sessionId, { at, counts: previous.counts });
         return;
       }
     }
 
-    const changed = write(sessionId, progress);
+    const changed = writeCounts(sessionId, progress);
+    // Liveness moves with every frame we act on, counts or not.
+    touch(sessionId, at);
     if (changed === 0) {
       // The row says this export is over — done, partial, aborted, stranded, or
       // erased. See the header: this is the only place that has to know, and it
@@ -367,6 +377,7 @@ export async function boot(
  */
 const progressWriter = createExportProgressWriter(
   (guid, progress) => db.updateExportProgress(guid, progress),
+  (guid, progressAt) => db.touchExportProgress(guid, progressAt),
 );
 
   // The route to a runner container, and the address of each session's runner.
@@ -644,13 +655,15 @@ async function main(): Promise<void> {
           report.orphanSlotsReleased > 0 ||
           report.phantomRowsCleaned > 0 ||
           report.exportsRunnerDied > 0 ||
-          report.exportsDispossessed > 0
+          report.exportsDispossessed > 0 ||
+          report.exportsStuck > 0
         ) {
           booted.log.info("sweep reclaimed orphan bindings", {
             slotsReleased: report.orphanSlotsReleased,
             rowsCleaned: report.phantomRowsCleaned,
             exportsRunnerDied: report.exportsRunnerDied,
             exportsDispossessed: report.exportsDispossessed,
+            exportsStuck: report.exportsStuck,
           });
         }
         if (report.pendingErases > 0) {

@@ -1394,6 +1394,7 @@ describe("an export's live counts are handed on, not just published", () => {
         writes.push(progress);
         return 1;
       },
+      (_guid, _at) => 1,
       () => (clock += 2_000), // comfortably past the one-second rate limit
     );
     const adapter = adapterFor(runner, { onExportProgress: writer.onExportProgress });
@@ -1449,6 +1450,7 @@ describe("an export's live counts are handed on, not just published", () => {
         writes.push(progress.pages);
         return 1;
       },
+      (_guid, _at) => 1,
       // Frozen: every frame arrives in the same millisecond, so only the rate
       // limit can be what is doing the skipping.
       () => 5_000,
@@ -1488,6 +1490,7 @@ describe("an export's live counts are handed on, not just published", () => {
         writes.push(progress.pages);
         return 1;
       },
+      (_guid, _at) => 1,
       () => (clock += 2_000),
     );
     const adapter = adapterFor(runner, { onExportProgress: writer.onExportProgress });
@@ -1531,6 +1534,7 @@ describe("an export's live counts are handed on, not just published", () => {
         writes.push(progress.pages);
         return 1;
       },
+      (_guid, _at) => 1,
       () => 1_000,
     );
 

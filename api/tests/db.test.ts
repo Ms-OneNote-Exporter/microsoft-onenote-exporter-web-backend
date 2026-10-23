@@ -1119,7 +1119,7 @@ describe("updateExportProgress", () => {
   it("writes the counts and reports one row changed", () => {
     seedRunning();
 
-    const changed = db.updateExportProgress(GUID, { pages: 29, sections: 1, assets: 8 });
+    const changed = db.updateExportProgress(GUID, { pages: 29, sections: 1, assets: 8 }, 1000);
 
     expect(changed).toBe(1);
     const parsed = JSON.parse(db.getSession(GUID)!.export_state!);
@@ -1135,7 +1135,7 @@ describe("updateExportProgress", () => {
     // zeros this method exists to replace.
     seedRunning();
 
-    db.updateExportProgress(GUID, { pages: 29, sections: 1, assets: 8 });
+    db.updateExportProgress(GUID, { pages: 29, sections: 1, assets: 8 }, 1000);
 
     const raw = JSON.parse(db.getSession(GUID)!.export_state!) as { progress: unknown };
     expect(typeof raw.progress).toBe("object");
@@ -1153,7 +1153,7 @@ describe("updateExportProgress", () => {
       GUID,
     );
 
-    db.updateExportProgress(GUID, { pages: 12, sections: 3, assets: 40 });
+    db.updateExportProgress(GUID, { pages: 12, sections: 3, assets: 40 }, 1000);
 
     const row = db.getSession(GUID)!;
     const parsed = JSON.parse(row.export_state!);
@@ -1174,7 +1174,7 @@ describe("updateExportProgress", () => {
     // would drop the first counts of every export.
     seedRunning("queued");
 
-    expect(db.updateExportProgress(GUID, { pages: 1, sections: 1, assets: 1 })).toBe(1);
+    expect(db.updateExportProgress(GUID, { pages: 1, sections: 1, assets: 1 }, 1000)).toBe(1);
     expect(JSON.parse(db.getSession(GUID)!.export_state!).progress).toEqual({
       pages: 1,
       sections: 1,
@@ -1203,7 +1203,7 @@ describe("updateExportProgress", () => {
         guid,
       );
 
-      const changed = db.updateExportProgress(guid, { pages: 3, sections: 1, assets: 1 });
+      const changed = db.updateExportProgress(guid, { pages: 3, sections: 1, assets: 1 }, 1000);
 
       expect(changed, terminal).toBe(0);
       expect(JSON.parse(db.getSession(guid)!.export_state!).progress, terminal).toEqual({
@@ -1221,7 +1221,7 @@ describe("updateExportProgress", () => {
     // The change count is the *only* signal the wiring gets that this session's
     // export is over, so a vanished row has to read the same way as a finished
     // one: zero.
-    expect(db.updateExportProgress(GUID, { pages: 29, sections: 1, assets: 8 })).toBe(0);
+    expect(db.updateExportProgress(GUID, { pages: 29, sections: 1, assets: 8 }, 1000)).toBe(0);
   });
 
   it("writes nothing for a null progress", () => {
@@ -1254,9 +1254,9 @@ describe("updateExportProgress", () => {
       );
 
       expect(() =>
-        db.updateExportProgress(guid, { pages: 1, sections: 1, assets: 1 }),
+        db.updateExportProgress(guid, { pages: 1, sections: 1, assets: 1 }, 1000),
       ).not.toThrow();
-      expect(db.updateExportProgress(guid, { pages: 1, sections: 1, assets: 1 })).toBe(0);
+      expect(db.updateExportProgress(guid, { pages: 1, sections: 1, assets: 1 }, 1000)).toBe(0);
     }
   });
 });

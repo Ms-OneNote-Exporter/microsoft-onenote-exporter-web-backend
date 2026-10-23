@@ -730,17 +730,43 @@ export class Db {
   updateExportProgress(
     guid: string,
     progress: { pages: number; sections: number; assets: number } | null,
+    progressAt: number = Date.now(),
   ): number {
+    // `null` means "unknown" — the guard from the original contract. A frame
+    // carrying null counts never overwrites good ones; the abort path nulls
+    // `progress` via its own SQL, not through here. Touch-only liveness bumps
+    // go through `touchExportProgress` below.
     if (progress === null) return 0;
     return this.run(
-      // `json(...)` rather than the bare parameter — see the note above. Without
-      // it the counts are stored as a JSON *string* and nothing reads them.
       `UPDATE sessions
-          SET export_state = json_set(export_state, '$.progress', json(?))
+          SET export_state = json_set(export_state, '$.progress', json(?), '$.progressAt', ?)
         WHERE guid = ?
           AND json_valid(export_state)
           AND json_extract(export_state, '$.state') IN ('queued', 'running')`,
       JSON.stringify(progress),
+      progressAt,
+      guid,
+    );
+  }
+
+  /**
+   * touchExportProgress bumps the liveness timestamp without touching the counts.
+   *
+   * The runner's heartbeat re-publishes the last known totals every 15 s and the
+   * api's monotonic writer skips those (counts did not advance), so without this
+   * the persisted `progressAt` would only move at section boundaries — and Tier 2
+   * would inherit the very unknown (section length) it exists to remove. This is
+   * the write a heartbeat produces: "we heard from the runner now", counts
+   * untouched.
+   */
+  touchExportProgress(guid: string, progressAt: number = Date.now()): number {
+    return this.run(
+      `UPDATE sessions
+          SET export_state = json_set(export_state, '$.progressAt', ?)
+        WHERE guid = ?
+          AND json_valid(export_state)
+          AND json_extract(export_state, '$.state') IN ('queued', 'running')`,
+      progressAt,
       guid,
     );
   }

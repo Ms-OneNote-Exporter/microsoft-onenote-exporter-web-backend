@@ -1269,6 +1269,13 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
         { session: session.guid, failure: failure.kind, status: failure.status },
         "notebook listing did not start",
       );
+      if (failure.kind === "no_auth") {
+        deps.db.run(
+          `UPDATE sessions SET auth_state = 'expired' WHERE guid = ?`,
+          session.guid,
+        );
+        deps.sse.emit(session.guid, "auth-expired", {});
+      }
       deps.sse.emit(session.guid, "error", {
         message: "notebook listing failed",
         reason: failure.kind,
@@ -1514,6 +1521,13 @@ export function registerRoutes(app: FastifyInstance, config: ApiConfig, deps: Ro
         //   no_auth → 409, **not** retryable: the runner lost its cookie jar, and
         //             repeating cannot help until the user signs in again
         const failure = runnerFailure(error);
+        if (failure.kind === "no_auth") {
+          deps.db.run(
+            `UPDATE sessions SET auth_state = 'expired' WHERE guid = ?`,
+            session.guid,
+          );
+          deps.sse.emit(session.guid, "auth-expired", {});
+        }
         return reply.code(failure.status).send({
           error: failure.message,
           reason: failure.kind,

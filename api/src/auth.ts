@@ -14,6 +14,7 @@
  */
 
 import type { AuthState, Db, SessionRow, SessionState } from "./db.js";
+import { idleExpiresAt } from "./sweep.js";
 import {
   deriveCsrfToken,
   isValidGuid,
@@ -316,7 +317,8 @@ export function buildSnapshot(
       state: session.state === "erased" ? "erasing" : session.state,
       createdAt: iso(session.created_at),
       expiresAt: iso(session.expires_at),
-      idleExpiresAt: session.idle_expires_at === null ? null : iso(session.idle_expires_at),
+      idleExpiresAt:
+        idleExpiresAt(session, now) === null ? null : iso(idleExpiresAt(session, now)!),
     },
     auth: {
       state: session.auth_state,

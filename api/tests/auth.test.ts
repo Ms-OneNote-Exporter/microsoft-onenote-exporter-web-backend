@@ -233,7 +233,6 @@ describe("buildSnapshot", () => {
 
   it("uses null rather than omitting an optional leaf", () => {
     const snapshot = buildSnapshot(seed(GUID), NOW, notebooks);
-    expect(snapshot.session.idleExpiresAt).toBeNull();
     expect(snapshot.auth.lastCheckedAt).toBeNull();
     expect(snapshot.export.id).toBeNull();
     expect(snapshot.export.progress).toBeNull();
@@ -244,7 +243,11 @@ describe("buildSnapshot", () => {
 
   it("reports idleExpiresAt when a login is in flight", () => {
     const snapshot = buildSnapshot(
-      seed(GUID, { idle_expires_at: NOW + 900_000 }),
+      seed(GUID, {
+        state: "authenticating",
+        auth_state: "authenticating",
+        last_activity_at: NOW,
+      }),
       NOW,
       notebooks,
       PUBLIC_ORIGIN,

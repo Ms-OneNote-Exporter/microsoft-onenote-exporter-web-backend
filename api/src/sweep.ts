@@ -296,6 +296,8 @@ export function idleExpiresAt(session: SessionRow, now: number): number | null {
     case "erasing":
     case "erased":
       return null;
+    default:
+      return null;
   }
 }
 
